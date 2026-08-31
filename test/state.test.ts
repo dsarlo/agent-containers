@@ -71,6 +71,28 @@ test('lock publication durably syncs the owner, staging directory, and locks dir
   assert.deepEqual(steps, ['owner-file-synced', 'staging-directory-synced', 'published', 'locks-directory-synced']);
 });
 
+test('a fully fresh state root and locks directory are created and synced progressively before lock publication', async () => {
+  const temporaryRoot = await mkdtemp(join(tmpdir(), 'agent-containers-fresh-state-'));
+  const stateDir = join(temporaryRoot, 'state', 'agent-containers');
+  const steps: string[] = [];
+  await withWorkspaceLock(stateDir, 'safe', async () => undefined, {
+    onStateDirectoryDurability: (step) => {
+      steps.push(`${step.kind}:${step.path === temporaryRoot ? '.' : step.path.slice(temporaryRoot.length + 1)}`);
+    },
+  });
+  assert.deepEqual(steps, [
+    'created:state',
+    'directory-synced:state',
+    'parent-directory-synced:.',
+    'created:state/agent-containers',
+    'directory-synced:state/agent-containers',
+    'parent-directory-synced:state',
+    'created:state/agent-containers/locks',
+    'directory-synced:state/agent-containers/locks',
+    'parent-directory-synced:state/agent-containers',
+  ]);
+});
+
 test('an injected abort keeps the lifecycle lock until its active child is reaped', async () => {
   const stateDir = await mkdtemp(join(tmpdir(), 'agent-containers-abort-lock-'));
   const abort = new AbortController();
@@ -131,7 +153,16 @@ test('unlock preserves malformed published lifecycle locks and directs verified 
   await writeFile(join(lockPath, 'owner.json'), '{not-json');
   await assert.rejects(
     () => releaseStaleWorkspaceLock(stateDir, 'safe', () => false),
-    /malformed.*manual filesystem repair/i,
+    (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.equal(
+        error.message.includes(`perform manual filesystem repair: remove ${lockPath}, then retry the original lifecycle operation.`),
+        true,
+        'manual deletion is the repair and the user must retry the lifecycle operation that was blocked',
+      );
+      assert.doesNotMatch(error.message, /retry agent-containers unlock safe --yes/i);
+      return true;
+    },
   );
   assert.equal((await lstat(lockPath)).isDirectory(), true, 'unlock never deletes a published lock whose owner cannot be identified');
 });

@@ -65,7 +65,7 @@ export async function recordManualRecovery(stateDir: string, name: string, input
   if (!isManualRecovery(recovery)) throw new Error('Refusing to save invalid manual recovery state.');
   const path = manualRecoveryPath(stateDir, name);
   const directory = join(stateDir, 'locks');
-  await mkdir(directory, { recursive: true, mode: 0o700 });
+  await ensureDurableDirectory(directory);
   const temporaryPath = join(directory, `.${validateWorkspaceName(name)}.${randomUUID()}.manual-recovery.tmp`);
   await durableReplace(temporaryPath, path, directory, `${JSON.stringify(recovery, null, 2)}\n`);
 }
@@ -123,7 +123,7 @@ export async function saveMetadata(stateDir: string, metadata: WorkspaceMetadata
   if (!isAgentContainersWorkspace(metadata)) throw new Error('Refusing to save invalid Agent Containers workspace metadata.');
   const path = metadataPath(stateDir, metadata.name);
   const directory = join(stateDir, 'workspaces');
-  await mkdir(directory, { recursive: true });
+  await ensureDurableDirectory(directory);
   const temporaryPath = join(directory, `.${metadata.name}.${randomUUID()}.tmp`);
   await durableReplace(temporaryPath, path, directory, `${JSON.stringify(metadata, null, 2)}\n`);
 }
@@ -192,19 +192,25 @@ export interface WorkspaceLockOptions {
   allowManualRecovery?: boolean;
   /** Test seam called after each completed crash-durability publication boundary. */
   onLockPublication?: (step: LockPublicationStep) => void | Promise<void>;
+  /** Test seam for progressively durable state-directory creation. */
+  onStateDirectoryDurability?: (step: StateDirectoryDurabilityStep) => void | Promise<void>;
 }
 
 export type LockPublicationStep = 'owner-file-synced' | 'staging-directory-synced' | 'published' | 'locks-directory-synced';
+export interface StateDirectoryDurabilityStep {
+  kind: 'created' | 'directory-synced' | 'parent-directory-synced';
+  path: string;
+}
 
 export async function withWorkspaceLock<T>(stateDir: string, name: string, action: (signal: AbortSignal) => Promise<T>, options: number | WorkspaceLockOptions = 30_000): Promise<T> {
-  const { timeoutMs, abortSignal, allowManualRecovery, onLockPublication } = typeof options === 'number'
-    ? { timeoutMs: options, abortSignal: undefined, allowManualRecovery: false, onLockPublication: undefined }
-    : { timeoutMs: options.timeoutMs ?? 30_000, abortSignal: options.abortSignal, allowManualRecovery: options.allowManualRecovery ?? false, onLockPublication: options.onLockPublication };
+  const { timeoutMs, abortSignal, allowManualRecovery, onLockPublication, onStateDirectoryDurability } = typeof options === 'number'
+    ? { timeoutMs: options, abortSignal: undefined, allowManualRecovery: false, onLockPublication: undefined, onStateDirectoryDurability: undefined }
+    : { timeoutMs: options.timeoutMs ?? 30_000, abortSignal: options.abortSignal, allowManualRecovery: options.allowManualRecovery ?? false, onLockPublication: options.onLockPublication, onStateDirectoryDurability: options.onStateDirectoryDurability };
   const lockName = validateWorkspaceName(name);
   const locksDir = join(stateDir, 'locks');
   const lockPath = join(locksDir, `${lockName}.lock`);
   const recoveryPath = join(locksDir, `${lockName}.recovery`);
-  await mkdir(locksDir, { recursive: true, mode: 0o700 });
+  await ensureDurableDirectory(locksDir, onStateDirectoryDurability);
   const deadline = Date.now() + timeoutMs;
   while (true) {
     await waitForRecoveryToFinish(recoveryPath, deadline, name);
@@ -248,7 +254,7 @@ export async function releaseStaleWorkspaceLock(stateDir: string, name: string, 
   const locksDir = join(stateDir, 'locks');
   const lockPath = join(locksDir, `${lockName}.lock`);
   const recoveryPath = join(locksDir, `${lockName}.recovery`);
-  await mkdir(locksDir, { recursive: true, mode: 0o700 });
+  await ensureDurableDirectory(locksDir);
   if (await loadManualRecovery(stateDir, lockName)) throw manualRecoveryError(name);
   await acquireRecoveryLock(recoveryPath, locksDir, lockName, Date.now() + timeoutMs, name, isPidAlive);
   try {
@@ -346,6 +352,50 @@ async function acquireOwnedDirectory(path: string, locksDir: string, temporarySt
   }
 }
 
+async function ensureDurableDirectory(directory: string, onDurabilityStep?: (step: StateDirectoryDurabilityStep) => void | Promise<void>): Promise<void> {
+  assertDirectoryFsyncSupported();
+  const missing: string[] = [];
+  let current = resolve(directory);
+  while (true) {
+    let entry;
+    try {
+      entry = await lstat(current);
+    } catch (error: unknown) {
+      if (!isNodeError(error, 'ENOENT')) throw error;
+      const parent = dirname(current);
+      if (parent === current) throw new Error(`Unable to find an existing parent for state directory: ${directory}`, { cause: error });
+      missing.push(current);
+      current = parent;
+      continue;
+    }
+    if (!entry.isDirectory()) throw new Error(`State directory path is not a directory: ${current}`);
+    break;
+  }
+  for (const createdDirectory of missing.reverse()) {
+    const parent = dirname(createdDirectory);
+    let created = false;
+    try {
+      await mkdir(createdDirectory, { recursive: false, mode: 0o700 });
+      created = true;
+    } catch (error: unknown) {
+      if (!isNodeError(error, 'EEXIST')) throw error;
+      const entry = await lstat(createdDirectory);
+      if (!entry.isDirectory()) throw new Error(`State directory path is not a directory: ${createdDirectory}`, { cause: error });
+    }
+    if (created) await onDurabilityStep?.({ kind: 'created', path: createdDirectory });
+    await syncDirectory(createdDirectory);
+    await onDurabilityStep?.({ kind: 'directory-synced', path: createdDirectory });
+    await syncDirectory(parent);
+    await onDurabilityStep?.({ kind: 'parent-directory-synced', path: parent });
+  }
+}
+
+function assertDirectoryFsyncSupported(): void {
+  if (process.platform === 'win32') {
+    throw new Error('Agent Containers cannot safely create durable state directories on Windows because directory fsync is unavailable.');
+  }
+}
+
 async function syncDirectory(directory: string): Promise<void> {
   const handle = await open(directory, 'r');
   try {
@@ -386,7 +436,7 @@ function lockTimeout(name: string, cause?: unknown): Error {
 }
 
 function malformedLockError(name: string, lockPath: string, cause?: unknown): Error {
-  return new Error(`Lifecycle lock for workspace "${name}" has malformed owner metadata. Agent Containers cannot identify a PID and will not remove it. After independently verifying no Agent Containers process can still own the workspace, perform manual filesystem repair: remove ${lockPath}, then retry agent-containers unlock ${name} --yes.`, cause === undefined ? undefined : { cause });
+  return new Error(`Lifecycle lock for workspace "${name}" has malformed owner metadata. Agent Containers cannot identify a PID and will not remove it. After independently verifying no Agent Containers process can still own the workspace, perform manual filesystem repair: remove ${lockPath}, then retry the original lifecycle operation.`, cause === undefined ? undefined : { cause });
 }
 
 function delay(): Promise<void> {

@@ -4,7 +4,7 @@ description: Use Agent Containers safely for isolated coding work.
 version: 0.1.0
 author: Daniel Sarlo (dsarlo), Hermes Agent
 license: MIT
-platforms: [linux, macos, windows]
+platforms: [linux, macos]
 metadata:
   hermes:
     tags: [coding-agents, git-worktrees, devcontainers, isolation]
@@ -86,7 +86,7 @@ ac remove <task-name> --yes
 - `run` and `exec` are lifecycle commands and may initialize or reuse the task container. They are not read-only commands.
 - The worktree remains writable by the agent. Isolation protects the source checkout, not the task workspace from the command being run.
 - `status` reads local metadata; it does not prove that Docker resources are healthy or that an in-container command has stopped.
-- A malformed published lifecycle lock is deliberately not auto-unlocked because ownership cannot be proven. Follow the CLI/README manual-recovery contract after independently confirming no Agent Containers process owns that workspace.
+- A malformed published lifecycle lock is deliberately not auto-unlocked because ownership cannot be proven. After independently confirming no Agent Containers process owns that workspace, remove `<state-dir>/locks/<task-name>.lock` manually and retry the original lifecycle operation; do not run `ac unlock` after the deletion because no lock remains for it to release.
 
 ## Verification
 
