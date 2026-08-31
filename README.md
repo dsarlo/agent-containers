@@ -1,122 +1,94 @@
-# Arachne
+# Agent Containers
 
-[![CI](https://github.com/dsarlo/arachne/actions/workflows/ci.yml/badge.svg)](https://github.com/dsarlo/arachne/actions/workflows/ci.yml)
+[![CI](https://github.com/dsarlo/agent-containers/actions/workflows/ci.yml/badge.svg)](https://github.com/dsarlo/agent-containers/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-Arachne gives every coding task its own Git worktree and Dev Container runtime. It is deliberately agent-harness-agnostic: use it with Claude Code, Codex, OpenCode, a shell script, or plain test commands.
+Agent Containers gives every coding task an isolated Git worktree and Dev Container runtime. It is deliberately agent-harness-agnostic: use it with Claude Code, Codex, OpenCode, a shell script, or plain test commands.
 
-## Why Arachne?
+## Status
 
-Agents and parallel human work both need isolation. Arachne creates a branch named `arachne/<name>`, checks it out in a separate worktree, records only the minimum local metadata needed to find it again, and delegates the runtime to the [Dev Containers CLI](https://github.com/devcontainers/cli). The original checkout remains your source checkout; Arachne never runs agent text through a shell.
+**v0.1 is source-installable but is not published to npm and no release has been published.** The package metadata reserves `@dsarlo/agent-containers`; do not expect `npm install @dsarlo/agent-containers` to work until a public package is announced.
 
 ## Prerequisites
 
 - Node.js 20.19 or newer
-- Git with `git worktree add --relative-paths` support (run `git worktree add -h` and confirm the flag is listed)
+- Git whose `git worktree add -h` lists `--relative-paths` or `--[no-]relative-paths`
 - Docker and the Dev Containers CLI (`npm install -g @devcontainers/cli`) for `exec` and `run`
-- A repository with a Dev Container configuration for container execution
+- A repository with a simple image-based Dev Container configuration
 
-## Installation
-
-The npm package name is reserved as `@dsarlo/arachne`, but the first public npm release has not been published yet. Install from the public source repository:
+## Install from source
 
 ```sh
-git clone https://github.com/dsarlo/arachne.git
-cd arachne
+git clone https://github.com/dsarlo/agent-containers.git
+cd agent-containers
 npm ci
 npm run build
 npm link
 ```
 
-The executable remains `arachne`.
+The provided executable names are `agent-containers` and the short alias `ac`.
 
-## Quick Start
+## Quick start
 
 Run these from a Git repository:
 
 ```sh
-arachne init
-# Edit .arachne.yml if your default branch or Dev Container path differs.
-arachne validate
-arachne create search-page
-arachne run search-page -- npm test
-arachne status search-page
-arachne remove search-page --yes
+ac init
+# Edit .agent-containers.yml if your default branch or Dev Container path differs.
+ac validate
+ac create search-page
+ac run search-page -- npm test
+ac status search-page
+ac remove search-page --yes
 ```
 
-`create` creates a new branch and worktree but does not modify tracked files in the source checkout. `run` first starts the worktree's Dev Container, then executes the argument vector in it.
+`create` creates `agent-containers/<name>` and an isolated worktree without modifying tracked files in the source checkout. `run` starts the worktree's Dev Container and executes the argument vector in it.
 
 ## Configuration
 
-`arachne init` writes a commented `.arachne.yml`. All path values are relative to the source repository unless absolute.
+`ac init` writes a commented `.agent-containers.yml`. All path values are relative to the source repository unless absolute.
 
 ```yaml
-# Arachne configuration, schema version 1
+# Agent Containers workspace configuration, schema version 1
 version: 1
-
 workspace:
-  worktreeRoot: ../.arachne-worktrees
+  worktreeRoot: ../.agent-containers-worktrees
   baseBranch: main
-
 environment:
   devcontainerPath: .devcontainer/devcontainer.json
-
 commands:
   test: npm test
   lint: npm run lint
-  start: npm run dev
 ```
 
-The effective defaults are `version: 1`, `workspace.worktreeRoot: ../.arachne-worktrees`, `workspace.baseBranch: main`, and `environment.devcontainerPath: .devcontainer/devcontainer.json`. `commands` is optional and is descriptive metadata for repository users and agents; Arachne does not evaluate command strings from it. See [the full configuration reference](docs/configuration.md).
+The defaults are `version: 1`, `workspace.worktreeRoot: ../.agent-containers-worktrees`, `workspace.baseBranch: main`, and `environment.devcontainerPath: .devcontainer/devcontainer.json`. `commands` is descriptive only; Agent Containers never evaluates these command strings. See the [configuration reference](docs/configuration.md).
 
-## Lifecycle Commands
+## Lifecycle commands
 
 ```text
-arachne init [--force]
-arachne validate [--config path]
-arachne create <name> [--base branch]
-arachne exec <name> -- <command...>
-arachne run <name> -- <agent command...>
-arachne status [name]
-arachne remove <name> --yes [--skip-container-cleanup]
+agent-containers init [--force]
+agent-containers validate [--config path]
+agent-containers create <name> [--base branch]
+agent-containers exec <name> -- <command...>
+agent-containers run <name> -- <agent command...>
+agent-containers status [name]
+agent-containers remove <name> --yes [--skip-container-cleanup]
 ```
 
-- `init` refuses to overwrite an existing configuration unless `--force` is explicit.
-- `validate` reports configuration errors before workspace creation.
-- `create` accepts lowercase names with numbers and single hyphens, rejects unsafe paths, and refuses workspace, path, and branch collisions.
-- `exec` and `run` are equivalent. They pass each argument directly to the Dev Containers CLI, without shell interpolation, and inherit the invoking terminal's stdin/stdout/stderr so interactive agent harnesses work normally.
-- `status` reads local Arachne metadata and remains useful when Docker or `devcontainer` is unavailable.
-- `remove` requires `--yes`; it verifies the exact recorded Git worktree and branch, then verifies the recorded Dev Container workspace label before cleanup. It retains metadata if any required cleanup fails. `--skip-container-cleanup` is an explicit recovery option when the recorded container cannot be contacted.
+- `init --force` atomically replaces only the configuration path; it refuses symlinks and cannot overwrite a hard-link peer.
+- `exec` and `run` pass each argument directly to Dev Containers without host-shell interpolation and inherit the invoking terminal for interactive tools.
+- `status` reads local metadata and works without Docker or Dev Containers.
+- `remove` requires `--yes`, verifies recorded resource identity and ownership, and checkpoints completed cleanup stages for safe retries.
 
-## Harness Examples
+## v0.1 limitations and recovery
 
-All examples are identical at the isolation boundary. The executable after `--` is your choice.
+To preserve isolated-worktree cleanup, v0.1 rejects Dev Container configurations containing `dockerComposeFile`, `workspaceMount`, or `workspaceFolder`. Use a simple image-based `devcontainer.json` or run those configurations without Agent Containers.
 
-```sh
-# Claude Code
-arachne run auth-flow -- claude "Implement the approved auth-flow plan"
+Metadata is stored in `$XDG_STATE_HOME/agent-containers` (or `~/.local/state/agent-containers`). If a cleanup command fails, metadata remains so retrying `ac remove <name> --yes` is safe. If Docker cannot reach a recorded container that you deliberately handled, retry with `--skip-container-cleanup`. If the branch is unmerged, merge it into its recorded base before removal. If state storage fails after `create`, recover the intact worktree with `git worktree list` and its recorded `agent-containers/<name>` branch.
 
-# Codex
-arachne run auth-flow -- codex exec "Implement the approved auth-flow plan"
+Agent Containers validates names, uses argument arrays for Git, Docker, and Dev Containers, and never sends agent command text to a host shell. It is not a sandbox: review target Dev Container settings before running untrusted code. It does not add credentials, Docker socket mounts, or host-home mounts, but it also cannot constrain mounts, capabilities, features, network access, Git, Docker, or the agent executable declared by a target repository.
 
-# OpenCode
-arachne run auth-flow -- opencode run "Implement the approved auth-flow plan"
-
-# No agent: run the project's tests
-arachne exec auth-flow -- npm test
-```
-
-## Security Model And Limits
-
-Arachne validates workspace names, uses argument arrays for Git, Docker, and Dev Containers commands, and never sends command text to a host shell. It writes workspace metadata under the current user's state directory (`$XDG_STATE_HOME/arachne` or `~/.local/state/arachne`).
-
-Arachne does not add credentials, Docker socket mounts, or host-home mounts. The Dev Container configuration belongs to the target repository and can still declare mounts, capabilities, features, or network access; review it before running untrusted code. Arachne does not sandbox Git, Docker, Dev Containers, or the agent executable itself.
-
-## Cleanup
-
-Use `arachne remove <name> --yes` to stop the recorded container, remove the recorded Git worktree, delete its merged branch, and remove local metadata. If Docker is unavailable for a recorded container, cleanup fails safely and leaves metadata in place; use `--skip-container-cleanup` only when the container has already been handled deliberately. If Git refuses to delete an unmerged branch, Arachne leaves metadata in place.
-
-## Development
+## Development and contributing
 
 ```sh
 npm ci
@@ -126,11 +98,7 @@ npm test
 npm run build
 ```
 
-Tests use Node's built-in test runner. Unit tests inject the process runner and do not invoke Git or Docker. Disposable Git and Dev Container integration tests skip with an explicit reason when required local tooling is unavailable. See [Dev Container worktree requirements](docs/devcontainer-worktrees.md).
-
-## Contributing
-
-See [CONTRIBUTING.md](CONTRIBUTING.md), [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md), and [SECURITY.md](SECURITY.md). Changes are recorded in [CHANGELOG.md](CHANGELOG.md).
+Tests use Node's built-in runner. Docker/Dev Containers integration is a separate live check and is skipped locally when its prerequisites are unavailable. See [Dev Container worktree requirements](docs/devcontainer-worktrees.md), [CONTRIBUTING.md](CONTRIBUTING.md), [SECURITY.md](SECURITY.md), and [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 

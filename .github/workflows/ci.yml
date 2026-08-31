@@ -29,4 +29,22 @@ jobs:
       - run: npm run build
       - run: mkdir .pack && npm pack --pack-destination .pack
       - run: npm install --prefix .packed-install .pack/*.tgz
-      - run: mkdir .packed-invoke && (cd .packed-invoke && ../.packed-install/node_modules/.bin/arachne init)
+      - run: mkdir .packed-invoke && (cd .packed-invoke && git init -b main && ../.packed-install/node_modules/.bin/ac init && ../.packed-install/node_modules/.bin/agent-containers validate)
+
+  live-devcontainer:
+    name: Live Dev Containers lifecycle
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20.19.0
+          cache: npm
+      - run: npm ci
+      - run: npm install --global @devcontainers/cli@0.89.0
+      - name: Require Docker, Dev Containers, and relative linked-worktree support
+        run: |
+          docker version
+          devcontainer --version
+          git worktree add -h 2>&1 | grep -Eq -- '(^|[[:space:]])--(\[no-\])?relative-paths([[:space:]]|$)'
+      - run: npm run test:integration

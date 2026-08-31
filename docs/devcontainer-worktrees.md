@@ -1,23 +1,23 @@
-# Dev Container Worktrees
+# Dev Container worktrees
 
-Arachne uses `git worktree add --relative-paths` when the installed Git supports it, then passes `--mount-git-worktree-common-dir` to `devcontainer up`. The Dev Containers CLI requires both conditions for Git operations in a linked worktree to see the shared Git directory.
+Agent Containers uses `git worktree add --relative-paths` and passes `--mount-git-worktree-common-dir` to `devcontainer up` so Git inside a linked worktree can reach the shared Git directory.
 
 ## Prerequisites
 
-- Git must list `--relative-paths` in `git worktree add -h`. Arachne refuses to create a workspace when the flag is absent, because a normal linked worktree cannot safely expose its shared Git directory inside the Dev Container.
-- Install Docker and a Dev Containers CLI version that accepts `devcontainer up --mount-git-worktree-common-dir`.
-- The Dev Container must mount the source checkout and its worktree-common Git directory from paths Docker can access. Remote Docker daemons and Docker Desktop file-sharing policies may need additional host path sharing.
+- `git worktree add -h` must list `--relative-paths` or `--[no-]relative-paths`.
+- Docker and a Dev Containers CLI that accepts `devcontainer up --mount-git-worktree-common-dir` are required.
+- Docker must be able to access the source checkout and the worktree-common Git directory. Remote daemons and Docker Desktop may require additional path sharing.
 
-## Docker Compose Limitation
+## v0.1 limitation
 
-The Dev Containers CLI supplies this mount to the Compose service selected by `service`. Other services in the same Compose project do not automatically receive the worktree-common Git directory. Configure an equivalent bind mount on any additional service that needs to run Git in the linked worktree.
+Compose configurations and custom workspace mounts/folders are rejected: `dockerComposeFile`, `workspaceMount`, and `workspaceFolder` are not supported. Use a simple image-based configuration for Agent Containers v0.1.
 
-## Verification
+## Verify
 
-After `arachne create example`, run:
+After `ac create example`, run:
 
 ```sh
-arachne exec example -- git rev-parse --git-common-dir
+ac exec example -- git rev-parse --git-common-dir
 ```
 
-The command should print a reachable Git common-directory path from inside the container. Arachne's disposable integration test performs this check when Docker, the Dev Containers CLI, and relative-worktree Git support are present.
+The command should print a reachable common Git directory. The dedicated live CI job runs this production lifecycle path when Docker, Dev Containers, and compatible Git are present.

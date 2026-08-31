@@ -1,22 +1,26 @@
 import { join, resolve } from 'node:path';
 import { initConfig, loadConfig } from './config.js';
-import { defaultStateDir, deleteMetadata, listMetadata, loadMetadata, saveMetadata } from './state.js';
+import { defaultStateDir, deleteMetadata, listMetadata, loadMetadata, saveMetadata, withWorkspaceLock } from './state.js';
 import { execWorkspace } from './runtime.js';
-import { createWorkspace, nodeProcessRunner, removeWorkspace } from './workspaces.js';
+import { createWorkspace, findGitRoot, nodeProcessRunner, removeWorkspace } from './workspaces.js';
 
 export async function runCli(args: string[], cwd = process.cwd(), write: (message: string) => void = console.log): Promise<number> {
   try {
     const [command, ...rest] = args;
     const stateDir = defaultStateDir();
     switch (command) {
-      case 'init':
+      case 'init': {
         ensureOnly(rest, ['--force']);
-        await initConfig(cwd, rest.includes('--force'));
-        write(`Wrote ${join(cwd, '.arachne.yml')}`);
+        const root = await findGitRoot(cwd, nodeProcessRunner);
+        await initConfig(root, rest.includes('--force'));
+        write(`Wrote ${join(root, '.agent-containers.yml')}`);
         return 0;
+      }
       case 'validate': {
-        const configPath = optionValue(rest, '--config') ?? join(cwd, '.arachne.yml');
         ensureOptions(rest, ['--config']);
+        const explicitConfig = optionValue(rest, '--config');
+        const root = explicitConfig ? cwd : await findGitRoot(cwd, nodeProcessRunner);
+        const configPath = explicitConfig ?? join(root, '.agent-containers.yml');
         await loadConfig(resolve(cwd, configPath));
         write(`Configuration is valid: ${resolve(cwd, configPath)}`);
         return 0;
@@ -24,35 +28,42 @@ export async function runCli(args: string[], cwd = process.cwd(), write: (messag
       case 'create': {
         const name = requiredPositional(rest, 'workspace name');
         ensureOptions(rest.slice(1), ['--base']);
-        const config = await loadConfig(join(cwd, '.arachne.yml'));
-        const workspace = await createWorkspace({ cwd, name, config, stateDir, runner: nodeProcessRunner, baseBranch: optionValue(rest.slice(1), '--base') });
-        write(`Created ${workspace.name} at ${workspace.worktree}`);
-        return 0;
+        return withWorkspaceLock(stateDir, name, async () => {
+          const root = await findGitRoot(cwd, nodeProcessRunner);
+          const config = await loadConfig(join(root, '.agent-containers.yml'));
+          const workspace = await createWorkspace({ cwd, name, config, stateDir, runner: nodeProcessRunner, baseBranch: optionValue(rest.slice(1), '--base') });
+          write(`Created ${workspace.name} at ${workspace.worktree}`);
+          return 0;
+        });
       }
       case 'exec':
       case 'run': {
         const separator = rest.indexOf('--');
-        if (separator !== 1) throw new UsageError(`Usage: arachne ${command} <name> -- <command...>`);
+        if (separator !== 1) throw new UsageError(`Usage: agent-containers ${command} <name> -- <command...>`);
         const name = rest[0];
-        const metadata = await loadMetadata(stateDir, name);
-        if (!metadata) throw new Error(`No Arachne workspace named "${name}".`);
-        await execWorkspace(metadata, rest.slice(separator + 1), nodeProcessRunner, (next) => saveMetadata(stateDir, next));
+        await withWorkspaceLock(stateDir, name, async () => {
+          const metadata = await loadMetadata(stateDir, name);
+          if (!metadata) throw new Error(`No Agent Containers workspace named "${name}".`);
+          await execWorkspace(metadata, rest.slice(separator + 1), nodeProcessRunner, (next) => saveMetadata(stateDir, next));
+        });
         return 0;
       }
       case 'status': {
-        if (rest.length > 1) throw new UsageError('Usage: arachne status [name]');
+        if (rest.length > 1) throw new UsageError('Usage: agent-containers status [name]');
         const entries = rest[0] ? [await loadMetadata(stateDir, rest[0])] : await listMetadata(stateDir);
-        if (entries.some((entry) => !entry)) throw new Error(`No Arachne workspace named "${rest[0]}".`);
+        if (entries.some((entry) => !entry)) throw new Error(`No Agent Containers workspace named "${rest[0]}".`);
         write(JSON.stringify(entries, null, 2));
         return 0;
       }
       case 'remove': {
         const name = requiredPositional(rest, 'workspace name');
         ensureOnly(rest.slice(1), ['--yes', '--skip-container-cleanup']);
-        if (!rest.includes('--yes')) throw new UsageError('Usage: arachne remove <name> --yes [--skip-container-cleanup]');
-        const metadata = await loadMetadata(stateDir, name);
-        if (!metadata) throw new Error(`No Arachne workspace named "${name}".`);
-        await removeWorkspace(metadata, { confirmed: true, skipContainerCleanup: rest.includes('--skip-container-cleanup') }, nodeProcessRunner, (next) => saveMetadata(stateDir, next), () => deleteMetadata(stateDir, name));
+        if (!rest.includes('--yes')) throw new UsageError('Usage: agent-containers remove <name> --yes [--skip-container-cleanup]');
+        await withWorkspaceLock(stateDir, name, async () => {
+          const metadata = await loadMetadata(stateDir, name);
+          if (!metadata) throw new Error(`No Agent Containers workspace named "${name}".`);
+          await removeWorkspace(metadata, { confirmed: true, skipContainerCleanup: rest.includes('--skip-container-cleanup') }, nodeProcessRunner, (next) => saveMetadata(stateDir, next), () => deleteMetadata(stateDir, name));
+        });
         write(`Removed ${name}`);
         return 0;
       }
@@ -60,7 +71,7 @@ export async function runCli(args: string[], cwd = process.cwd(), write: (messag
         throw new UsageError(usage());
     }
   } catch (error: unknown) {
-    write(`arachne: ${error instanceof Error ? error.message : String(error)}`);
+    write(`agent-containers: ${error instanceof Error ? error.message : String(error)}`);
     return error instanceof UsageError ? 2 : exitCodeForError(error) ?? 1;
   }
 }
@@ -97,5 +108,5 @@ function ensureOptions(args: string[], allowed: string[]): void {
 }
 
 function usage(): string {
-  return 'Usage: arachne <init|validate|create|exec|run|status|remove> [options]';
+  return 'Usage: agent-containers <init|validate|create|exec|run|status|remove> [options]';
 }

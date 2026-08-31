@@ -22,7 +22,7 @@ export interface WorkspaceMetadata {
 }
 
 export function defaultStateDir(environment: NodeJS.ProcessEnv = process.env): string {
-  return join(environment.XDG_STATE_HOME || join(homedir(), '.local', 'state'), 'arachne');
+  return join(environment.XDG_STATE_HOME || join(homedir(), '.local', 'state'), 'agent-containers');
 }
 
 export function metadataPath(stateDir: string, name: string): string {
@@ -35,7 +35,7 @@ export async function loadMetadata(stateDir: string, name: string): Promise<Work
     if (typeof metadata === 'object' && metadata !== null && 'name' in metadata && metadata.name !== name) {
       throw new Error(`Metadata filename ${name} does not match metadata.name.`);
     }
-    if (!isArachneWorkspace(metadata)) throw new Error(`Metadata for ${name} is not a valid Arachne workspace.`);
+    if (!isAgentContainersWorkspace(metadata)) throw new Error(`Metadata for ${name} is not a valid Agent Containers workspace.`);
     return metadata;
   } catch (error: unknown) {
     if (typeof error === 'object' && error !== null && 'code' in error && error.code === 'ENOENT') return undefined;
@@ -44,7 +44,7 @@ export async function loadMetadata(stateDir: string, name: string): Promise<Work
 }
 
 export async function saveMetadata(stateDir: string, metadata: WorkspaceMetadata): Promise<void> {
-  if (!isArachneWorkspace(metadata)) throw new Error('Refusing to save invalid Arachne workspace metadata.');
+  if (!isAgentContainersWorkspace(metadata)) throw new Error('Refusing to save invalid Agent Containers workspace metadata.');
   const path = metadataPath(stateDir, metadata.name);
   const directory = join(stateDir, 'workspaces');
   await mkdir(directory, { recursive: true });
@@ -73,11 +73,11 @@ export async function listMetadata(stateDir: string): Promise<WorkspaceMetadata[
   }
 }
 
-export function isArachneWorkspace(metadata: unknown): metadata is WorkspaceMetadata {
+export function isAgentContainersWorkspace(metadata: unknown): metadata is WorkspaceMetadata {
   return typeof metadata === 'object' && metadata !== null &&
     'version' in metadata && metadata.version === 1 &&
     'name' in metadata && typeof metadata.name === 'string' && isValidWorkspaceName(metadata.name) &&
-    'branch' in metadata && metadata.branch === `arachne/${metadata.name}` &&
+    'branch' in metadata && metadata.branch === `agent-containers/${metadata.name}` &&
     'worktree' in metadata && isCanonicalPath(metadata.worktree) &&
     'repoRoot' in metadata && isCanonicalPath(metadata.repoRoot) &&
     'baseBranch' in metadata && typeof metadata.baseBranch === 'string' &&
@@ -94,4 +94,34 @@ function isCanonicalPath(value: unknown): value is string {
 function isCleanupState(value: unknown): boolean {
   return typeof value === 'object' && value !== null && Object.entries(value).every(([key, completed]) =>
     ['container', 'worktree', 'branch'].includes(key) && typeof completed === 'boolean');
+}
+
+/**
+ * Serialize all destructive lifecycle work for one workspace across processes.
+ * The lock is an atomically-created directory; it is deliberately never broken
+ * automatically because stealing a live lock could resurrect deleted metadata.
+ */
+export async function withWorkspaceLock<T>(stateDir: string, name: string, action: () => Promise<T>, timeoutMs = 30_000): Promise<T> {
+  const lockPath = join(stateDir, 'locks', `${validateWorkspaceName(name)}.lock`);
+  await mkdir(join(stateDir, 'locks'), { recursive: true, mode: 0o700 });
+  const deadline = Date.now() + timeoutMs;
+  while (true) {
+    try {
+      await mkdir(lockPath, { recursive: false, mode: 0o700 });
+      break;
+    } catch (error: unknown) {
+      if (!isNodeError(error, 'EEXIST')) throw error;
+      if (Date.now() >= deadline) throw new Error(`Timed out waiting for lifecycle lock for workspace "${name}". A previous Agent Containers command may still be running.`, { cause: error });
+      await new Promise<void>((resolveDelay) => setTimeout(resolveDelay, 25));
+    }
+  }
+  try {
+    return await action();
+  } finally {
+    await rm(lockPath, { recursive: true, force: true });
+  }
+}
+
+function isNodeError(error: unknown, code: string): error is NodeJS.ErrnoException {
+  return typeof error === 'object' && error !== null && 'code' in error && error.code === code;
 }

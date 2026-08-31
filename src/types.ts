@@ -1,4 +1,4 @@
-export interface ArachneConfig {
+export interface AgentContainersConfig {
   version: 1;
   workspace: {
     worktreeRoot: string;

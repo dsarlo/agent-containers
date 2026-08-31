@@ -1,16 +1,17 @@
-import { constants } from 'node:fs';
-import { lstat, open, readFile, writeFile } from 'node:fs/promises';
+import { lstat, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
+import { basename, dirname, join } from 'node:path';
 import { parse } from 'yaml';
-import type { ArachneConfig } from './types.js';
+import type { AgentContainersConfig } from './types.js';
 
-export const CONFIG_OUTLINE = `# Arachne workspace configuration (schema version 1).
+export const CONFIG_OUTLINE = `# Agent Containers workspace configuration (schema version 1).
 # All paths are relative to the source repository unless absolute.
 version: 1
 
 workspace:
   # Directory containing isolated Git worktrees.
-  worktreeRoot: ../.arachne-worktrees
-  # Branch used when arachne create is not passed --base.
+  worktreeRoot: ../.agent-containers-worktrees
+  # Branch used when agent-containers create is not passed --base.
   baseBranch: main
 
 environment:
@@ -24,15 +25,15 @@ environment:
 #   start: npm run dev
 `;
 
-const defaults: ArachneConfig = {
+const defaults: AgentContainersConfig = {
   version: 1,
-  workspace: { worktreeRoot: '../.arachne-worktrees', baseBranch: 'main' },
+  workspace: { worktreeRoot: '../.agent-containers-worktrees', baseBranch: 'main' },
   environment: { devcontainerPath: '.devcontainer/devcontainer.json' },
   commands: {},
 };
 
 export async function initConfig(directory: string, force = false): Promise<void> {
-  const path = `${directory}/.arachne.yml`;
+  const path = `${directory}/.agent-containers.yml`;
   try {
     const stats = await lstat(path);
     if (stats.isSymbolicLink()) throw new Error(`${path} is a symlink; refusing to overwrite it.`);
@@ -41,11 +42,13 @@ export async function initConfig(directory: string, force = false): Promise<void
     if (!isNodeError(error, 'ENOENT')) throw error;
   }
   if (force) {
-    const file = await open(path, constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | constants.O_NOFOLLOW, 0o600);
+    const temporaryPath = join(dirname(path), `.${basename(path)}.${randomUUID()}.tmp`);
     try {
-      await file.writeFile(CONFIG_OUTLINE, 'utf8');
-    } finally {
-      await file.close();
+      await writeFile(temporaryPath, CONFIG_OUTLINE, { encoding: 'utf8', flag: 'wx', mode: 0o600 });
+      await rename(temporaryPath, path);
+    } catch (error: unknown) {
+      await rm(temporaryPath, { force: true });
+      throw error;
     }
   } else {
     try {
@@ -57,23 +60,26 @@ export async function initConfig(directory: string, force = false): Promise<void
   }
 }
 
-export async function loadConfig(path: string): Promise<ArachneConfig> {
+export async function loadConfig(path: string): Promise<AgentContainersConfig> {
   let raw: unknown;
   try {
     raw = parse(await readFile(path, 'utf8'));
   } catch (error: unknown) {
-    if (isNodeError(error, 'ENOENT')) throw new Error(`Configuration not found at ${path}; run arachne init first.`, { cause: error });
+    if (isNodeError(error, 'ENOENT')) throw new Error(`Configuration not found at ${path}; run agent-containers init first.`, { cause: error });
     throw new Error(`Could not read configuration at ${path}: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
   }
   if (!isRecord(raw)) throw new Error('Invalid configuration: root must be an object');
   const input = raw;
+  rejectUnknownKeys(input, ['version', 'workspace', 'environment', 'commands'], 'root');
   if (input.workspace !== undefined && !isRecord(input.workspace)) throw new Error('Invalid configuration: workspace must be an object');
   if (input.environment !== undefined && !isRecord(input.environment)) throw new Error('Invalid configuration: environment must be an object');
   if (input.commands !== undefined && !isRecord(input.commands)) throw new Error('Invalid configuration: commands must be an object');
   const workspace = input.workspace ?? {};
   const environment = input.environment ?? {};
   const commands = input.commands ?? {};
-  const config: ArachneConfig = {
+  rejectUnknownKeys(workspace, ['worktreeRoot', 'baseBranch'], 'workspace');
+  rejectUnknownKeys(environment, ['devcontainerPath'], 'environment');
+  const config: AgentContainersConfig = {
     version: input.version === undefined ? defaults.version : input.version as 1,
     workspace: {
       worktreeRoot: workspace.worktreeRoot === undefined ? defaults.workspace.worktreeRoot : workspace.worktreeRoot as string,
@@ -89,7 +95,7 @@ export async function loadConfig(path: string): Promise<ArachneConfig> {
   return config;
 }
 
-function validateConfig(config: ArachneConfig): string[] {
+function validateConfig(config: AgentContainersConfig): string[] {
   const errors: string[] = [];
   if (config.version !== 1) errors.push('version must be 1');
   if (!nonEmptyString(config.workspace.worktreeRoot)) errors.push('workspace.worktreeRoot must be a non-empty string');
@@ -107,6 +113,11 @@ function nonEmptyString(value: unknown): value is string {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function rejectUnknownKeys(input: Record<string, unknown>, allowed: string[], section: string): void {
+  const unknown = Object.keys(input).filter((key) => !allowed.includes(key));
+  if (unknown.length > 0) throw new Error(`Invalid configuration: ${section} contains unknown key${unknown.length === 1 ? '' : 's'} ${unknown.join(', ')}`);
 }
 
 function isNodeError(error: unknown, code: string): error is NodeJS.ErrnoException {

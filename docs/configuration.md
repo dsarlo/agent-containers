@@ -1,54 +1,34 @@
-# Configuration Reference
+# Configuration reference
 
-Arachne reads `.arachne.yml` from the current repository for `create`. Use `arachne validate` before creating workspaces. A different file can be checked with `arachne validate --config path`.
+Agent Containers reads `.agent-containers.yml` from the current repository for `create`. Use `agent-containers validate` before creating workspaces; `agent-containers validate --config path` checks another file.
 
 ```yaml
 version: 1
 workspace:
-  worktreeRoot: ../.arachne-worktrees
+  worktreeRoot: ../.agent-containers-worktrees
   baseBranch: main
 environment:
   devcontainerPath: .devcontainer/devcontainer.json
 commands:
   test: npm test
-  lint: npm run lint
-  start: npm run dev
 ```
-
-## Fields
 
 | Field | Required | Default | Description |
 | --- | --- | --- | --- |
-| `version` | No | `1` | Configuration schema version. Only version `1` is accepted. |
-| `workspace.worktreeRoot` | No | `../.arachne-worktrees` | Parent directory for named worktrees. Relative paths resolve from the source Git root. |
-| `workspace.baseBranch` | No | `main` | Branch or revision used by `arachne create` unless `--base` is supplied. |
+| `version` | No | `1` | Only version `1` is accepted. |
+| `workspace.worktreeRoot` | No | `../.agent-containers-worktrees` | Parent for named worktrees; relative paths resolve from the Git root. |
+| `workspace.baseBranch` | No | `main` | Base used by `agent-containers create` unless `--base` is supplied. |
 | `environment.devcontainerPath` | No | `.devcontainer/devcontainer.json` | Dev Container configuration path, relative to each worktree unless absolute. |
-| `commands` | No | `{}` | Optional map of named, non-empty command strings such as `test`, `lint`, and `start`. It is documentation for consumers, not executable Arachne configuration. |
+| `commands` | No | `{}` | Optional named, non-empty strings for people and agents to discover; never executed by Agent Containers. |
 
-Defaults are merged before validation. Supplying a field with an empty value or wrong type is an error; omitting it uses the listed default. The configuration root and supplied `workspace`, `environment`, and `commands` sections must be mappings, not lists, strings, or null.
+Defaults are merged before validation. Supplied empty values, wrong types, unknown keys, or non-mapping root/section values are errors.
 
-## Paths
+## v0.1 Dev Container compatibility
 
-`worktreeRoot` is resolved relative to the Git root discovered by `create`. `devcontainerPath` is resolved relative to the selected worktree during `exec` and `run`. Absolute paths are accepted when an organization uses a named worktree root outside the source checkout.
+The referenced JSON/JSONC configuration must not define `dockerComposeFile`, `workspaceMount`, or `workspaceFolder`. These modes are intentionally unsupported in v0.1 because Agent Containers needs to control the worktree folder and mount for safe lifecycle cleanup. Comments and comment-like text inside JSON strings are accepted.
 
-## Examples
-
-For a repository whose default branch is `develop` and whose configuration lives at `.devcontainer/devcontainer.json`:
-
-```yaml
-version: 1
-workspace:
-  worktreeRoot: ../team-worktrees
-  baseBranch: develop
-environment:
-  devcontainerPath: .devcontainer/devcontainer.json
-commands:
-  test: pnpm test
-  lint: pnpm lint
-```
-
-Create from a one-off base without changing the file:
+Example one-off base:
 
 ```sh
-arachne create release-check --base release/next
+ac create release-check --base release/next
 ```

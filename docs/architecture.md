@@ -1,21 +1,21 @@
 # Architecture
 
-Arachne has a deliberately small boundary surface:
+Agent Containers has a deliberately small boundary surface:
 
-1. The CLI loads and validates `.arachne.yml`.
-2. `create` discovers the current Git root, validates a workspace name, and invokes `git worktree add --relative-paths -b arachne/<name> <path> <base>` when Git supports relative worktree pointers.
-3. A metadata record is atomically written to the user's local state directory under `workspaces/<name>.json`; a failed write triggers best-effort worktree and branch rollback.
-4. `exec` and `run` resolve that record, call `devcontainer up --mount-git-worktree-common-dir`, require a `containerId` in the terminal JSON record, persist it, and call `devcontainer exec` with that ID and the original command argument array.
-5. `status` reads metadata only. `remove --yes` verifies the recorded Git worktree/branch and Dev Container workspace label before cleanup, recording completed stages atomically so normal cleanup retries are safe.
+1. The CLI loads and validates `.agent-containers.yml`.
+2. `create` discovers the Git root, validates a workspace name, and runs `git worktree add --relative-paths -b agent-containers/<name> <path> <base>`.
+3. Metadata is atomically written beneath the user-local `agent-containers` state directory.
+4. `exec` and `run` reject unsupported v0.1 Dev Container modes, run `devcontainer up --mount-git-worktree-common-dir`, require a terminal JSON `containerId`, save it, then call `devcontainer exec` with the original argument array.
+5. `remove --yes` validates exact recorded worktree, branch, and container ownership; it checkpoints each completed destructive stage. A retry reconciles already-absent recorded resources instead of resurrecting stale metadata.
 
-## Process Boundary
+## Process boundary
 
-The core receives a `ProcessRunner` interface. Production uses Node's `spawn` with `shell: false`; tests replace it with an in-memory recorder. This makes command construction testable without Git, Docker, or Dev Containers.
+Production uses Node `spawn` with `shell: false`. Captured stdout/stderr are bounded (with the terminal output retained) so Dev Containers terminal JSON parsing remains functional without unbounded memory growth. Interactive execution inherits stdio.
 
-## Metadata Boundary
+## Metadata and lifecycle boundary
 
-Metadata stores the name, canonical Git root/worktree paths, branch, base branch, Dev Container path, creation time, optional primary container ID, and completed cleanup stages. A name must pass the same strict validation before it is used to construct a metadata path, and the filename must match it. Removal additionally validates the branch convention `arachne/<name>` and never accepts arbitrary worktree metadata.
+Metadata records the name, canonical Git paths, `agent-containers/<name>` branch, base branch, Dev Container path, creation time, optional container ID, and cleanup checkpoints. Workspace lifecycle operations use a per-name atomically-created lock. A contender waits rather than concurrently saving stale metadata after another lifecycle operation has removed it; a lock is never automatically stolen.
 
-## Non-Goals
+## Non-goals
 
-Arachne is not an agent scheduler, an authorization layer, or a container sandbox. It does not inspect agent output, choose an agent, alter repository Dev Container security settings, or mount Docker sockets, credentials, or host homes. Those concerns stay with the operator and target repository.
+Agent Containers is not an agent scheduler, authorization layer, or container sandbox. It does not inspect agent output, select an agent, alter target Dev Container security settings, or mount Docker sockets, credentials, or host homes.

@@ -1,13 +1,13 @@
 import assert from 'node:assert/strict';
-import { lstat, mkdtemp, readFile, symlink, writeFile } from 'node:fs/promises';
+import { lstat, link, mkdtemp, readFile, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { CONFIG_OUTLINE, initConfig, loadConfig } from '../src/config.js';
 
 test('initConfig writes the public config outline and refuses overwrite by default', async () => {
-  const directory = await mkdtemp(join(tmpdir(), 'arachne-config-'));
-  const path = join(directory, '.arachne.yml');
+  const directory = await mkdtemp(join(tmpdir(), 'agent-containers-config-'));
+  const path = join(directory, '.agent-containers.yml');
 
   await initConfig(directory);
   assert.equal(await readFile(path, 'utf8'), CONFIG_OUTLINE);
@@ -18,12 +18,12 @@ test('initConfig writes the public config outline and refuses overwrite by defau
 });
 
 test('loadConfig applies documented defaults and validates useful errors', async () => {
-  const directory = await mkdtemp(join(tmpdir(), 'arachne-config-'));
-  const path = join(directory, 'arachne.yml');
+  const directory = await mkdtemp(join(tmpdir(), 'agent-containers-config-'));
+  const path = join(directory, 'config.yml');
   await writeFile(path, 'version: 1\n');
 
   const config = await loadConfig(path);
-  assert.equal(config.workspace.worktreeRoot, '../.arachne-worktrees');
+  assert.equal(config.workspace.worktreeRoot, '../.agent-containers-worktrees');
   assert.equal(config.workspace.baseBranch, 'main');
   assert.equal(config.environment.devcontainerPath, '.devcontainer/devcontainer.json');
 
@@ -32,9 +32,9 @@ test('loadConfig applies documented defaults and validates useful errors', async
 });
 
 test('initConfig never overwrites a symlink, including with --force', async (t) => {
-  const directory = await mkdtemp(join(tmpdir(), 'arachne-config-'));
+  const directory = await mkdtemp(join(tmpdir(), 'agent-containers-config-'));
   const external = join(directory, 'external.yml');
-  const path = join(directory, '.arachne.yml');
+  const path = join(directory, '.agent-containers.yml');
   await writeFile(external, 'external contents\n');
   try {
     await symlink(external, path);
@@ -50,11 +50,39 @@ test('initConfig never overwrites a symlink, including with --force', async (t) 
   assert.equal((await lstat(path)).isSymbolicLink(), true);
 });
 
+test('initConfig force-replaces only its own hard link', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'agent-containers-config-'));
+  const external = join(directory, 'external.yml');
+  const path = join(directory, '.agent-containers.yml');
+  await writeFile(external, 'external contents\n');
+  await link(external, path);
+
+  await initConfig(directory, true);
+
+  assert.equal(await readFile(external, 'utf8'), 'external contents\n');
+  assert.equal(await readFile(path, 'utf8'), CONFIG_OUTLINE);
+});
+
 test('loadConfig rejects wrong-shaped roots and sections instead of defaulting them', async () => {
-  const directory = await mkdtemp(join(tmpdir(), 'arachne-config-'));
-  const path = join(directory, 'arachne.yml');
+  const directory = await mkdtemp(join(tmpdir(), 'agent-containers-config-'));
+  const path = join(directory, 'config.yml');
   for (const source of ['[]\n', 'workspace: []\n', 'environment: null\n', 'commands: []\n']) {
     await writeFile(path, source);
     await assert.rejects(() => loadConfig(path), /must be an object/);
   }
+});
+
+test('loadConfig rejects unknown schema keys while allowing arbitrary command names', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'agent-containers-config-'));
+  const path = join(directory, 'config.yml');
+  for (const source of [
+    'versoin: 1\n',
+    'workspace:\n  baseBrnch: main\n',
+    'environment:\n  devcontainerPth: x\n',
+  ]) {
+    await writeFile(path, source);
+    await assert.rejects(() => loadConfig(path), /unknown key/);
+  }
+  await writeFile(path, 'commands:\n  any-user-defined-name: npm test\n');
+  assert.equal((await loadConfig(path)).commands['any-user-defined-name'], 'npm test');
 });
