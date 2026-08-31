@@ -2,7 +2,7 @@ import { readFile } from 'node:fs/promises';
 import { parse, type ParseError } from 'jsonc-parser';
 import { resolve } from 'node:path';
 import type { ProcessResult, ProcessRunner, ProcessRunOptions } from './types.js';
-import { clearManualRecovery, recordManualRecovery, withWorkspaceLock, type WorkspaceMetadata } from './state.js';
+import { clearManualRecovery, loadMetadata, recordManualRecovery, saveMetadata, withWorkspaceLock, type WorkspaceMetadata } from './state.js';
 
 export type { ProcessRunner } from './types.js';
 
@@ -30,6 +30,24 @@ export async function execWorkspaceLifecycle(metadata: WorkspaceMetadata, comman
     (recovery) => recordManualRecovery(stateDir, metadata.name, recovery),
     () => clearManualRecovery(stateDir, metadata.name),
   ));
+}
+
+/** Load the current workspace record only after acquiring its lifecycle lock. */
+export async function execNamedWorkspaceLifecycle(name: string, command: string[], runner: ProcessRunner, stateDir: string, readConfig: (path: string) => Promise<string> = (path) => readFile(path, 'utf8')): Promise<ProcessResult> {
+  return withWorkspaceLock(stateDir, name, async (signal) => {
+    const metadata = await loadMetadata(stateDir, name);
+    if (!metadata) throw new Error(`No Agent Containers workspace named "${name}".`);
+    return execWorkspace(
+      metadata,
+      command,
+      runner,
+      (next) => saveMetadata(stateDir, next),
+      readConfig,
+      signal,
+      (recovery) => recordManualRecovery(stateDir, metadata.name, recovery),
+      () => clearManualRecovery(stateDir, metadata.name),
+    );
+  });
 }
 
 export async function execWorkspace(metadata: WorkspaceMetadata, command: string[], runner: ProcessRunner, save: (metadata: WorkspaceMetadata) => Promise<void>, readConfig: (path: string) => Promise<string> = (path) => readFile(path, 'utf8'), signal?: AbortSignal, recordRecovery: RecoveryRecorder = missingRecoveryRecorder, clearRecovery: RecoveryClearer = missingRecoveryClearer): Promise<ProcessResult> {

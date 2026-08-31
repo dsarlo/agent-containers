@@ -28,6 +28,10 @@ npm link
 
 The provided executable names are `agent-containers` and the short alias `ac`.
 
+## Agent skill
+
+The package also includes an agent-facing usage skill at [`skills/agent-containers/SKILL.md`](skills/agent-containers/SKILL.md). Agents can load or copy that definition to follow the supported lifecycle, isolation, and recovery contract rather than inferring command behavior.
+
 ## Quick start
 
 Run these from a Git repository:
@@ -82,7 +86,8 @@ agent-containers remove <name> --yes [--skip-container-cleanup]
 - `recover <name> --yes --remote-command-stopped` is an explicit operator acknowledgement, not remote cleanup: first inspect the container (and its logs/processes) yourself and stop or wait for the in-container command as appropriate; then use this command to clear the block. It neither stops nor removes a container. `unlock` never clears manual recovery, even after the original PID has died.
 - If `devcontainer up` is interrupted, exits nonzero, throws, or lacks a trustworthy terminal container ID, Agent Containers runs `docker ps --all --quiet --filter label=devcontainer.local_folder=<recorded-worktree>` and independently verifies each candidate's exact label. It records one exact match as the workspace container, but **every** untrustworthy-start result—including zero matches, multiple candidates, or Docker inspection failure—blocks for manual recovery because provisioning may still continue. It never deletes a discovered resource.
 - `status` reads local metadata and works without Docker or Dev Containers.
-- `unlock <name> --yes` releases only a normal lock whose recorded local owner PID has exited; it refuses active or malformed locks. Use it after a machine crash or force-kill, never for a command that may still be running.
+- Lifecycle-lock publication fsyncs the owner record and staging directory before its atomic rename, then fsyncs the lock directory. Lock, recovery-marker, and metadata removals are followed by a parent-directory fsync so a completed lifecycle does not rely on an unpersisted directory entry.
+- `unlock <name> --yes` releases only a normal lock whose complete, valid owner record names a local PID that has exited. It refuses active locks. It also deliberately preserves a malformed published lock: its owner identity cannot be reconstructed safely, so `unlock` cannot prove it abandoned. After independently verifying no Agent Containers process can still own the workspace, repair it manually by removing `<state-dir>/locks/<name>.lock` (where `<state-dir>` is `$XDG_STATE_HOME/agent-containers` or `~/.local/state/agent-containers`), then retry `unlock`. Never delete a malformed lock merely because it is old.
 - `remove` requires `--yes`, verifies recorded resource identity and ownership, and checkpoints completed cleanup stages for safe retries.
 
 ## v0.1 limitations and recovery

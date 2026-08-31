@@ -1,6 +1,6 @@
-import { lstat, mkdir, open, readdir, readFile, rename, rm, writeFile, type FileHandle } from 'node:fs/promises';
+import { lstat, mkdir, open, readdir, readFile, rename, rm, type FileHandle } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { isAbsolute, join, resolve } from 'node:path';
+import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { isValidWorkspaceName, validateWorkspaceName } from './names.js';
 
@@ -79,12 +79,7 @@ async function durableReplace(temporaryPath: string, path: string, directory: st
     await file.close();
     file = undefined;
     await rename(temporaryPath, path);
-    const parent = await open(directory, 'r');
-    try {
-      await parent.sync();
-    } finally {
-      await parent.close();
-    }
+    await syncDirectory(directory);
   } catch (error) {
     await file?.close();
     await rm(temporaryPath, { force: true });
@@ -107,7 +102,7 @@ export async function loadManualRecovery(stateDir: string, name: string): Promis
 export async function clearManualRecovery(stateDir: string, name: string): Promise<void> {
   const recovery = await loadManualRecovery(stateDir, name);
   if (!recovery) throw new Error(`No manual recovery block exists for workspace "${name}".`);
-  await rm(manualRecoveryPath(stateDir, name), { force: false });
+  await durableRemove(manualRecoveryPath(stateDir, name), join(stateDir, 'locks'), false);
 }
 
 export async function loadMetadata(stateDir: string, name: string): Promise<WorkspaceMetadata | undefined> {
@@ -134,7 +129,7 @@ export async function saveMetadata(stateDir: string, metadata: WorkspaceMetadata
 }
 
 export async function deleteMetadata(stateDir: string, name: string): Promise<void> {
-  await rm(metadataPath(stateDir, name), { force: true });
+  await durableRemove(metadataPath(stateDir, name), join(stateDir, 'workspaces'), true);
 }
 
 export async function listMetadata(stateDir: string): Promise<WorkspaceMetadata[]> {
@@ -195,12 +190,16 @@ export interface WorkspaceLockOptions {
   abortSignal?: AbortSignal;
   /** Allows only the recovery acknowledgement to acquire a guarded lifecycle lock. */
   allowManualRecovery?: boolean;
+  /** Test seam called after each completed crash-durability publication boundary. */
+  onLockPublication?: (step: LockPublicationStep) => void | Promise<void>;
 }
 
+export type LockPublicationStep = 'owner-file-synced' | 'staging-directory-synced' | 'published' | 'locks-directory-synced';
+
 export async function withWorkspaceLock<T>(stateDir: string, name: string, action: (signal: AbortSignal) => Promise<T>, options: number | WorkspaceLockOptions = 30_000): Promise<T> {
-  const { timeoutMs, abortSignal, allowManualRecovery } = typeof options === 'number'
-    ? { timeoutMs: options, abortSignal: undefined, allowManualRecovery: false }
-    : { timeoutMs: options.timeoutMs ?? 30_000, abortSignal: options.abortSignal, allowManualRecovery: options.allowManualRecovery ?? false };
+  const { timeoutMs, abortSignal, allowManualRecovery, onLockPublication } = typeof options === 'number'
+    ? { timeoutMs: options, abortSignal: undefined, allowManualRecovery: false, onLockPublication: undefined }
+    : { timeoutMs: options.timeoutMs ?? 30_000, abortSignal: options.abortSignal, allowManualRecovery: options.allowManualRecovery ?? false, onLockPublication: options.onLockPublication };
   const lockName = validateWorkspaceName(name);
   const locksDir = join(stateDir, 'locks');
   const lockPath = join(locksDir, `${lockName}.lock`);
@@ -209,12 +208,12 @@ export async function withWorkspaceLock<T>(stateDir: string, name: string, actio
   const deadline = Date.now() + timeoutMs;
   while (true) {
     await waitForRecoveryToFinish(recoveryPath, deadline, name);
-    if (await acquireOwnedDirectory(lockPath, locksDir, lockName, deadline, name)) break;
+    if (await acquireOwnedDirectory(lockPath, locksDir, lockName, deadline, name, onLockPublication)) break;
   }
   try {
     if (!allowManualRecovery && await loadManualRecovery(stateDir, lockName)) throw manualRecoveryError(name);
   } catch (error) {
-    await rm(lockPath, { recursive: true, force: true });
+    await durableRemove(lockPath, locksDir, true);
     throw error;
   }
   const cancellation = new AbortController();
@@ -238,7 +237,7 @@ export async function withWorkspaceLock<T>(stateDir: string, name: string, actio
     process.off('SIGINT', onInterrupt);
     process.off('SIGTERM', onTerminate);
     abortSignal?.removeEventListener('abort', cancel);
-    await rm(lockPath, { recursive: true, force: true });
+    await durableRemove(lockPath, locksDir, true);
     if (receivedSignal) process.kill(process.pid, receivedSignal);
   }
 }
@@ -258,18 +257,18 @@ export async function releaseStaleWorkspaceLock(stateDir: string, name: string, 
       owner = JSON.parse(await readFile(join(lockPath, 'owner.json'), 'utf8'));
     } catch (error: unknown) {
       if (isNodeError(error, 'ENOENT')) throw new Error(`No recoverable lifecycle lock exists for workspace "${name}". Refusing to remove a lock without owner metadata.`, { cause: error });
-      throw error;
+      throw malformedLockError(name, lockPath, error);
     }
     if (!isLockOwner(owner)) {
-      throw new Error(`Lifecycle lock for workspace "${name}" has invalid owner metadata; refusing unsafe removal.`);
+      throw malformedLockError(name, lockPath);
     }
     if (isPidAlive(owner.pid)) throw new Error(`Lifecycle lock for workspace "${name}" is owned by active PID ${owner.pid}; refusing to interrupt it.`);
     await hooks.beforeRemoval?.();
     const reclaimedPath = join(locksDir, `.${lockName}.${owner.token}.reclaimed`);
-    await rename(lockPath, reclaimedPath);
-    await rm(reclaimedPath, { recursive: true, force: false });
+    await durableRename(lockPath, reclaimedPath, locksDir);
+    await durableRemove(reclaimedPath, locksDir, false);
   } finally {
-    await rm(recoveryPath, { recursive: true, force: true });
+    await durableRemove(recoveryPath, locksDir, true);
   }
 }
 
@@ -285,8 +284,8 @@ async function waitForRecoveryToFinish(recoveryPath: string, deadline: number, n
     if (owner && !localPidIsAlive(owner.pid)) {
       const abandonedPath = `${recoveryPath}.${owner.token}.abandoned`;
       try {
-        await rename(recoveryPath, abandonedPath);
-        await rm(abandonedPath, { recursive: true, force: false });
+        await durableRename(recoveryPath, abandonedPath, dirname(recoveryPath));
+        await durableRemove(abandonedPath, dirname(recoveryPath), false);
         return;
       } catch (error: unknown) {
         if (!isNodeError(error, 'ENOENT')) throw error;
@@ -310,29 +309,60 @@ async function reclaimDeadPublishedLock(path: string, isPidAlive: (pid: number) 
   if (!owner || isPidAlive(owner.pid)) return;
   const abandonedPath = `${path}.${owner.token}.abandoned`;
   try {
-    await rename(path, abandonedPath);
-    await rm(abandonedPath, { recursive: true, force: false });
+    await durableRename(path, abandonedPath, dirname(path));
+    await durableRemove(abandonedPath, dirname(path), false);
   } catch (error: unknown) {
     if (!isNodeError(error, 'ENOENT')) throw error;
   }
 }
 
 /** Build owner metadata off-path, then atomically publish the directory. */
-async function acquireOwnedDirectory(path: string, locksDir: string, temporaryStem: string, deadline: number, name: string): Promise<boolean> {
+async function acquireOwnedDirectory(path: string, locksDir: string, temporaryStem: string, deadline: number, name: string, onLockPublication?: (step: LockPublicationStep) => void | Promise<void>): Promise<boolean> {
   const temporaryPath = join(locksDir, `.${temporaryStem}.${randomUUID()}.pending`);
+  let ownerFile: FileHandle | undefined;
   try {
     await mkdir(temporaryPath, { recursive: false, mode: 0o700 });
     const owner: LockOwner = { pid: process.pid, token: randomUUID(), createdAt: new Date().toISOString() };
-    await writeFile(join(temporaryPath, 'owner.json'), `${JSON.stringify(owner)}\n`, { encoding: 'utf8', flag: 'wx', mode: 0o600 });
+    ownerFile = await open(join(temporaryPath, 'owner.json'), 'wx', 0o600);
+    await ownerFile.writeFile(`${JSON.stringify(owner)}\n`, 'utf8');
+    await ownerFile.sync();
+    await ownerFile.close();
+    ownerFile = undefined;
+    await onLockPublication?.('owner-file-synced');
+    await syncDirectory(temporaryPath);
+    await onLockPublication?.('staging-directory-synced');
     await rename(temporaryPath, path);
+    await onLockPublication?.('published');
+    await syncDirectory(locksDir);
+    await onLockPublication?.('locks-directory-synced');
     return true;
   } catch (error: unknown) {
+    await ownerFile?.close();
     await rm(temporaryPath, { recursive: true, force: true });
     if (!isNodeError(error, 'EEXIST') && !isNodeError(error, 'ENOTEMPTY')) throw error;
     if (Date.now() >= deadline) throw lockTimeout(name, error);
     await delay();
     return false;
   }
+}
+
+async function syncDirectory(directory: string): Promise<void> {
+  const handle = await open(directory, 'r');
+  try {
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+}
+
+async function durableRename(source: string, destination: string, directory: string): Promise<void> {
+  await rename(source, destination);
+  await syncDirectory(directory);
+}
+
+async function durableRemove(path: string, directory: string, force: boolean): Promise<void> {
+  await rm(path, { recursive: true, force });
+  await syncDirectory(directory);
 }
 
 async function readLockOwner(path: string): Promise<LockOwner | undefined> {
@@ -353,6 +383,10 @@ function abortError(): Error {
 
 function lockTimeout(name: string, cause?: unknown): Error {
   return new Error(`Timed out waiting for lifecycle lock for workspace "${name}". A previous Agent Containers command may still be running.`, cause === undefined ? undefined : { cause });
+}
+
+function malformedLockError(name: string, lockPath: string, cause?: unknown): Error {
+  return new Error(`Lifecycle lock for workspace "${name}" has malformed owner metadata. Agent Containers cannot identify a PID and will not remove it. After independently verifying no Agent Containers process can still own the workspace, perform manual filesystem repair: remove ${lockPath}, then retry agent-containers unlock ${name} --yes.`, cause === undefined ? undefined : { cause });
 }
 
 function delay(): Promise<void> {

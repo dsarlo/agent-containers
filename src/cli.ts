@@ -1,7 +1,7 @@
 import { join, resolve } from 'node:path';
 import { initConfig, loadConfig } from './config.js';
 import { clearManualRecovery, defaultStateDir, deleteMetadata, listMetadata, loadMetadata, releaseStaleWorkspaceLock, saveMetadata, withWorkspaceLock } from './state.js';
-import { execWorkspaceLifecycle } from './runtime.js';
+import { execNamedWorkspaceLifecycle } from './runtime.js';
 import { createWorkspace, findGitRoot, nodeProcessRunner, removeWorkspace } from './workspaces.js';
 
 export async function runCli(args: string[], cwd = process.cwd(), write: (message: string) => void = console.log): Promise<number> {
@@ -45,9 +45,7 @@ export async function runCli(args: string[], cwd = process.cwd(), write: (messag
         const separator = rest.indexOf('--');
         if (separator !== 1) throw new UsageError(`Usage: agent-containers ${command} <name> -- <command...>`);
         const name = rest[0];
-        const metadata = await loadMetadata(stateDir, name);
-        if (!metadata) throw new Error(`No Agent Containers workspace named "${name}".`);
-        await execWorkspaceLifecycle(metadata, rest.slice(separator + 1), nodeProcessRunner, (next) => saveMetadata(stateDir, next), stateDir);
+        await execNamedWorkspaceLifecycle(name, rest.slice(separator + 1), nodeProcessRunner, stateDir);
         return 0;
       }
       case 'recover': {

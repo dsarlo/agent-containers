@@ -1,10 +1,10 @@
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import * as state from '../src/state.js';
-import { loadMetadata, releaseStaleWorkspaceLock, saveMetadata, withWorkspaceLock, type WorkspaceMetadata } from '../src/state.js';
+import { loadMetadata, releaseStaleWorkspaceLock, saveMetadata, withWorkspaceLock, type WorkspaceLockOptions, type WorkspaceMetadata } from '../src/state.js';
 import type { ProcessRunner } from '../src/types.js';
 
 const metadata: WorkspaceMetadata = { version: 1, name: 'safe', repoRoot: '/repo', worktree: '/repo/worktrees/safe', branch: 'agent-containers/safe', baseRef: 'refs/heads/main', devcontainerPath: '.devcontainer/devcontainer.json', createdAt: '2026-01-01T00:00:00.000Z' };
@@ -61,6 +61,16 @@ test('withWorkspaceLock serializes same-name lifecycle operations across contend
   assert.deepEqual(events, ['first-start', 'first-end', 'second']);
 });
 
+test('lock publication durably syncs the owner, staging directory, and locks directory in order', async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), 'agent-containers-lock-durability-'));
+  const steps: string[] = [];
+  const options: WorkspaceLockOptions = {
+    onLockPublication: (step: string) => { steps.push(step); },
+  };
+  await withWorkspaceLock(stateDir, 'safe', async () => undefined, options);
+  assert.deepEqual(steps, ['owner-file-synced', 'staging-directory-synced', 'published', 'locks-directory-synced']);
+});
+
 test('an injected abort keeps the lifecycle lock until its active child is reaped', async () => {
   const stateDir = await mkdtemp(join(tmpdir(), 'agent-containers-abort-lock-'));
   const abort = new AbortController();
@@ -112,6 +122,18 @@ test('stale lock recovery refuses an active owner and releases a proven-dead own
   let acquired = false;
   await withWorkspaceLock(stateDir, 'safe', async () => { acquired = true; });
   assert.equal(acquired, true);
+});
+
+test('unlock preserves malformed published lifecycle locks and directs verified manual filesystem repair', async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), 'agent-containers-malformed-lock-'));
+  const lockPath = join(stateDir, 'locks', 'safe.lock');
+  await mkdir(lockPath, { recursive: true });
+  await writeFile(join(lockPath, 'owner.json'), '{not-json');
+  await assert.rejects(
+    () => releaseStaleWorkspaceLock(stateDir, 'safe', () => false),
+    /malformed.*manual filesystem repair/i,
+  );
+  assert.equal((await lstat(lockPath)).isDirectory(), true, 'unlock never deletes a published lock whose owner cannot be identified');
 });
 
 test('stale lock recovery serializes validation and removal with a new lifecycle acquisition', async () => {

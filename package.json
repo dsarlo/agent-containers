@@ -31,7 +31,8 @@
   "files": [
     "dist/src",
     "*.md",
-    "docs"
+    "docs",
+    "skills"
   ],
   "scripts": {
     "build": "node scripts/build.mjs",

@@ -3,8 +3,8 @@ import { mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
-import { execWorkspace, execWorkspaceLifecycle, type ProcessRunner } from '../src/runtime.js';
-import { clearManualRecovery, loadManualRecovery, recordManualRecovery, withWorkspaceLock, type WorkspaceMetadata } from '../src/state.js';
+import { execNamedWorkspaceLifecycle, execWorkspace, execWorkspaceLifecycle, type ProcessRunner } from '../src/runtime.js';
+import { clearManualRecovery, deleteMetadata, loadManualRecovery, recordManualRecovery, saveMetadata, withWorkspaceLock, type WorkspaceMetadata } from '../src/state.js';
 
 const noOpRecovery = async (): Promise<void> => undefined;
 
@@ -98,6 +98,30 @@ test('execWorkspaceLifecycle supplies durable recovery callbacks under the works
   await execWorkspaceLifecycle(metadata, ['true'], runner, async () => undefined, stateDir, async () => '{}');
   assert.equal(await loadManualRecovery(stateDir, metadata.name), undefined);
   await withWorkspaceLock(stateDir, metadata.name, async () => undefined);
+});
+
+test('named lifecycle execution loads metadata only after a concurrent remove releases the workspace lock', async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), 'agent-containers-named-lifecycle-race-'));
+  await saveMetadata(stateDir, metadata);
+  let allowRemoveToFinish!: () => void;
+  const removeMayFinish = new Promise<void>((resolveRemove) => { allowRemoveToFinish = resolveRemove; });
+  let metadataDeleted!: () => void;
+  const metadataIsDeleted = new Promise<void>((resolveDeleted) => { metadataDeleted = resolveDeleted; });
+  const remove = withWorkspaceLock(stateDir, metadata.name, async () => {
+    await deleteMetadata(stateDir, metadata.name);
+    metadataDeleted();
+    await removeMayFinish;
+  });
+  await metadataIsDeleted;
+  const calls: string[] = [];
+  const runner: ProcessRunner = { async run(command) { calls.push(command); return { code: 0, stdout: '', stderr: '' }; } };
+  const executing = execNamedWorkspaceLifecycle(metadata.name, ['true'], runner, stateDir, async () => '{}');
+  await new Promise((resolve) => setTimeout(resolve, 35));
+  assert.deepEqual(calls, [], 'execution cannot reach Dev Containers while remove owns the lifecycle lock');
+  allowRemoveToFinish();
+  await remove;
+  await assert.rejects(() => executing, /No Agent Containers workspace named "safe-name"/);
+  assert.deepEqual(calls, [], 'execution must not resurrect deleted metadata or run Dev Containers');
 });
 
 test('a recovery writer failure during interruption leaves the durable pre-dispatch guard blocking lifecycle release', async () => {
