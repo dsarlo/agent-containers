@@ -71,6 +71,7 @@ agent-containers validate [--config path]
 agent-containers create <name> [--base branch]
 agent-containers exec <name> -- <command...>
 agent-containers run <name> -- <agent command...>
+agent-containers unlock <name> --yes
 agent-containers status [name]
 agent-containers remove <name> --yes [--skip-container-cleanup]
 ```
@@ -78,6 +79,7 @@ agent-containers remove <name> --yes [--skip-container-cleanup]
 - `init --force` atomically replaces only the configuration path; it refuses symlinks and cannot overwrite a hard-link peer.
 - `exec` and `run` pass each argument directly to Dev Containers without host-shell interpolation and inherit the invoking terminal for interactive tools.
 - `status` reads local metadata and works without Docker or Dev Containers.
+- `unlock <name> --yes` releases only a lock whose recorded local owner PID has exited; it refuses active or malformed locks. Use it after a machine crash or force-kill, never for a command that may still be running.
 - `remove` requires `--yes`, verifies recorded resource identity and ownership, and checkpoints completed cleanup stages for safe retries.
 
 ## v0.1 limitations and recovery

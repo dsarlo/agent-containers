@@ -18,9 +18,18 @@ export async function execWorkspace(metadata: WorkspaceMetadata, command: string
   try {
     await save({ ...metadata, containerId });
   } catch (error: unknown) {
-    const cleanup = await runner.run('docker', ['rm', '-f', containerId]);
     const detail = error instanceof Error ? error.message : String(error);
-    if (cleanup.code !== 0) throw new Error(`Could not persist container metadata (${detail}) and could not remove untracked container ${containerId}: ${cleanup.stderr.trim() || cleanup.stdout.trim() || `exit code ${cleanup.code}`}.`, { cause: error });
+    let cleanup: ProcessResult;
+    try {
+      cleanup = await runner.run('docker', ['rm', '-f', containerId]);
+    } catch (cleanupError: unknown) {
+      const cleanupDetail = cleanupError instanceof Error ? cleanupError.message : String(cleanupError);
+      throw new Error(`Could not persist container metadata (${detail}) and could not remove untracked container ${containerId}: ${cleanupDetail}.`, { cause: cleanupError });
+    }
+    if (cleanup.code !== 0) {
+      const cleanupDetail = cleanup.stderr.trim() || cleanup.stdout.trim() || `exit code ${cleanup.code}`;
+      throw new Error(`Could not persist container metadata (${detail}) and could not remove untracked container ${containerId}: ${cleanupDetail}.`, { cause: error });
+    }
     throw new Error(`Could not persist container metadata (${detail}); removed untracked container ${containerId}. Retry the command after fixing state storage.`, { cause: error });
   }
   const result = await runner.run('devcontainer', ['exec', '--workspace-folder', metadata.worktree, '--config', configPath, '--container-id', containerId, ...command], { stdio: 'inherit' });

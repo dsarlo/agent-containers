@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
-import { loadMetadata, saveMetadata, withWorkspaceLock, type WorkspaceMetadata } from '../src/state.js';
+import { loadMetadata, releaseStaleWorkspaceLock, saveMetadata, withWorkspaceLock, type WorkspaceMetadata } from '../src/state.js';
 
 const metadata: WorkspaceMetadata = { version: 1, name: 'safe', repoRoot: '/repo', worktree: '/repo/worktrees/safe', branch: 'agent-containers/safe', baseBranch: 'main', devcontainerPath: '.devcontainer/devcontainer.json', createdAt: '2026-01-01T00:00:00.000Z' };
 
@@ -42,6 +42,18 @@ test('withWorkspaceLock serializes same-name lifecycle operations across contend
   releaseFirst();
   await Promise.all([first, second]);
   assert.deepEqual(events, ['first-start', 'first-end', 'second']);
+});
+
+test('stale lock recovery refuses an active owner and releases a proven-dead owner', async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), 'agent-containers-stale-lock-'));
+  const lockPath = join(stateDir, 'locks', 'safe.lock');
+  await mkdir(lockPath, { recursive: true });
+  await writeFile(join(lockPath, 'owner.json'), JSON.stringify({ pid: 424242, createdAt: '2026-01-01T00:00:00.000Z' }));
+  await assert.rejects(() => releaseStaleWorkspaceLock(stateDir, 'safe', () => true), /active PID 424242/);
+  await releaseStaleWorkspaceLock(stateDir, 'safe', () => false);
+  let acquired = false;
+  await withWorkspaceLock(stateDir, 'safe', async () => { acquired = true; });
+  assert.equal(acquired, true);
 });
 
 test('withWorkspaceLock makes a lifecycle contender observe deletion rather than restore stale metadata', async () => {

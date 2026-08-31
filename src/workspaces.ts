@@ -92,6 +92,14 @@ export async function removeWorkspace(metadata: WorkspaceMetadata, options: { co
     const recorded = recordedWorktreeState(worktrees.stdout, current);
     if (recorded === 'mismatch') throw new Error('Refusing to remove: Git does not report the exact recorded Git worktree and branch.');
     worktreePresent = recorded === 'present';
+    if (!worktreePresent) {
+      try {
+        await access(current.worktree);
+        throw new Error(`Refusing to remove: Git no longer registers the recorded worktree, but its path still exists at ${current.worktree}. Recover or remove it manually before retrying.`);
+      } catch (error: unknown) {
+        if (!isNodeError(error, 'ENOENT')) throw error;
+      }
+    }
   }
 
   let branchPresent = false;
@@ -200,4 +208,8 @@ function withCleanup(metadata: WorkspaceMetadata, step: 'container' | 'worktree'
 function commandError(command: string, result: ProcessResult): Error {
   const detail = result.stderr.trim() || result.stdout.trim() || `exit code ${result.code}`;
   return new Error(`${command} failed: ${detail}`);
+}
+
+function isNodeError(error: unknown, code: string): error is NodeJS.ErrnoException {
+  return typeof error === 'object' && error !== null && 'code' in error && error.code === code;
 }

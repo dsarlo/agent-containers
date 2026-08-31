@@ -1,4 +1,7 @@
 import assert from 'node:assert/strict';
+import { mkdtemp } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import test from 'node:test';
 import { removeWorkspace } from '../src/workspaces.js';
 import type { WorkspaceMetadata } from '../src/state.js';
@@ -65,6 +68,23 @@ test('removeWorkspace reconciles each recorded resource already absent after a f
     await removeWorkspace(initial, { confirmed: true }, runner, async () => undefined, async () => undefined);
     assert.equal(absent.has(stage), true, `${stage} is reconciled as an already-completed destructive action`);
   }
+});
+
+test('removeWorkspace refuses to forget an unregistered worktree directory', async () => {
+  const worktree = await mkdtemp(join(tmpdir(), 'agent-containers-orphaned-worktree-'));
+  const orphaned: WorkspaceMetadata = { ...metadata, worktree };
+  const runner = {
+    async run(_command: string, args: string[]) {
+      if (args[0] === 'worktree' && args[1] === 'list') return { code: 0, stdout: '', stderr: '' };
+      throw new Error('must not continue after unregistered directory detection');
+    },
+  };
+  let removedMetadata = false;
+  await assert.rejects(
+    () => removeWorkspace(orphaned, { confirmed: true }, runner, async () => undefined, async () => { removedMetadata = true; }),
+    /no longer registers.*path still exists/s,
+  );
+  assert.equal(removedMetadata, false);
 });
 
 test('removeWorkspace deletes the exact verified merged branch without Git upstream semantics', async () => {

@@ -98,3 +98,16 @@ test('execWorkspace reports both metadata and exact container cleanup failures',
     /state disk full.*could not remove untracked container new-container: permission denied/s,
   );
 });
+
+test('execWorkspace preserves recovery context when exact container cleanup throws', async () => {
+  const runner: ProcessRunner = {
+    async run(_command, args) {
+      if (args[0] === 'up') return { code: 0, stdout: '{"containerId":"new-container"}\n', stderr: '' };
+      throw new Error('docker executable missing');
+    },
+  };
+  await assert.rejects(
+    () => execWorkspace(metadata, ['true'], runner, async () => { throw new Error('state disk full'); }, async () => '{}'),
+    /state disk full.*could not remove untracked container new-container: docker executable missing/s,
+  );
+});

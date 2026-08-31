@@ -10,7 +10,15 @@ import { execWorkspace } from '../src/runtime.js';
 const gitAvailable = spawnSync('git', ['--version']).status === 0;
 const dockerAvailable = spawnSync('docker', ['version']).status === 0;
 const devcontainerAvailable = spawnSync('devcontainer', ['--version']).status === 0;
-const relativeWorktreeSupported = gitAvailable && /--relative-paths/.test(`${spawnSync('git', ['worktree', 'add', '-h'], { encoding: 'utf8' }).stdout}${spawnSync('git', ['worktree', 'add', '-h'], { encoding: 'utf8' }).stderr}`);
+const relativeWorktreeSupported = gitAvailable && /(?:^|\s)--(?:\[no-\])?relative-paths(?=\s|$)/m.test(`${spawnSync('git', ['worktree', 'add', '-h'], { encoding: 'utf8' }).stdout}${spawnSync('git', ['worktree', 'add', '-h'], { encoding: 'utf8' }).stderr}`);
+const requireLiveIntegration = process.env.AGENT_CONTAINERS_REQUIRE_LIVE_INTEGRATION === '1';
+
+test('required live integration prerequisites are available', { skip: !requireLiveIntegration }, () => {
+  assert.ok(gitAvailable, 'Git is required');
+  assert.ok(dockerAvailable, 'Docker is required');
+  assert.ok(devcontainerAvailable, 'Dev Containers CLI is required');
+  assert.ok(relativeWorktreeSupported, 'Git must support git worktree add --relative-paths');
+});
 
 test('create produces an isolated worktree without altering source checkout files', { skip: !gitAvailable ? 'Git is unavailable' : !relativeWorktreeSupported ? 'installed Git does not support git worktree add --relative-paths' : false }, async () => {
   const repo = await mkdtemp(join(tmpdir(), 'agent-containers-git-'));
@@ -40,7 +48,7 @@ test('nodeProcessRunner bounds burst capture while retaining terminal Dev Contai
 });
 
 test('production execWorkspace lifecycle exposes the Git common directory inside a linked worktree', {
-  skip: !dockerAvailable ? 'Docker is unavailable' : !devcontainerAvailable ? 'Dev Containers CLI is unavailable' : !relativeWorktreeSupported ? 'installed Git does not support git worktree add --relative-paths' : false,
+  skip: requireLiveIntegration ? false : !dockerAvailable ? 'Docker is unavailable' : !devcontainerAvailable ? 'Dev Containers CLI is unavailable' : !relativeWorktreeSupported ? 'installed Git does not support git worktree add --relative-paths' : false,
 }, async () => {
   const repo = await mkdtemp(join(tmpdir(), 'agent-containers-devcontainer-'));
   const worktree = `${repo}-worktree`;

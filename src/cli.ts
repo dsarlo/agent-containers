@@ -1,6 +1,6 @@
 import { join, resolve } from 'node:path';
 import { initConfig, loadConfig } from './config.js';
-import { defaultStateDir, deleteMetadata, listMetadata, loadMetadata, saveMetadata, withWorkspaceLock } from './state.js';
+import { defaultStateDir, deleteMetadata, listMetadata, loadMetadata, releaseStaleWorkspaceLock, saveMetadata, withWorkspaceLock } from './state.js';
 import { execWorkspace } from './runtime.js';
 import { createWorkspace, findGitRoot, nodeProcessRunner, removeWorkspace } from './workspaces.js';
 
@@ -46,6 +46,14 @@ export async function runCli(args: string[], cwd = process.cwd(), write: (messag
           if (!metadata) throw new Error(`No Agent Containers workspace named "${name}".`);
           await execWorkspace(metadata, rest.slice(separator + 1), nodeProcessRunner, (next) => saveMetadata(stateDir, next));
         });
+        return 0;
+      }
+      case 'unlock': {
+        const name = requiredPositional(rest, 'workspace name');
+        ensureOnly(rest.slice(1), ['--yes']);
+        if (!rest.includes('--yes')) throw new UsageError('Usage: agent-containers unlock <name> --yes');
+        await releaseStaleWorkspaceLock(stateDir, name);
+        write(`Released stale lifecycle lock for ${name}`);
         return 0;
       }
       case 'status': {
@@ -108,5 +116,5 @@ function ensureOptions(args: string[], allowed: string[]): void {
 }
 
 function usage(): string {
-  return 'Usage: agent-containers <init|validate|create|exec|run|status|remove> [options]';
+  return 'Usage: agent-containers <init|validate|create|exec|run|unlock|status|remove> [options]';
 }

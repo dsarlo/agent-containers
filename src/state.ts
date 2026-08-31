@@ -116,9 +116,60 @@ export async function withWorkspaceLock<T>(stateDir: string, name: string, actio
     }
   }
   try {
+    await writeFile(join(lockPath, 'owner.json'), `${JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString() })}\n`, { encoding: 'utf8', flag: 'wx', mode: 0o600 });
+  } catch (error: unknown) {
+    await rm(lockPath, { recursive: true, force: true });
+    throw error;
+  }
+  const onSignal = (signal: NodeJS.Signals) => {
+    void rm(lockPath, { recursive: true, force: true }).finally(() => {
+      process.off('SIGINT', onInterrupt);
+      process.off('SIGTERM', onTerminate);
+      process.kill(process.pid, signal);
+    });
+  };
+  const onInterrupt = () => onSignal('SIGINT');
+  const onTerminate = () => onSignal('SIGTERM');
+  process.once('SIGINT', onInterrupt);
+  process.once('SIGTERM', onTerminate);
+  try {
     return await action();
   } finally {
+    process.off('SIGINT', onInterrupt);
+    process.off('SIGTERM', onTerminate);
     await rm(lockPath, { recursive: true, force: true });
+  }
+}
+
+/** Release only a lock whose recorded local owner PID is proven no longer alive. */
+export async function releaseStaleWorkspaceLock(stateDir: string, name: string, isPidAlive: (pid: number) => boolean = localPidIsAlive): Promise<void> {
+  const lockPath = join(stateDir, 'locks', `${validateWorkspaceName(name)}.lock`);
+  let owner: unknown;
+  try {
+    owner = JSON.parse(await readFile(join(lockPath, 'owner.json'), 'utf8'));
+  } catch (error: unknown) {
+    if (isNodeError(error, 'ENOENT')) throw new Error(`No recoverable lifecycle lock exists for workspace "${name}". Refusing to remove a lock without owner metadata.`, { cause: error });
+    throw error;
+  }
+  if (!isLockOwner(owner)) {
+    throw new Error(`Lifecycle lock for workspace "${name}" has invalid owner metadata; refusing unsafe removal.`);
+  }
+  if (isPidAlive(owner.pid)) throw new Error(`Lifecycle lock for workspace "${name}" is owned by active PID ${owner.pid}; refusing to interrupt it.`);
+  await rm(lockPath, { recursive: true, force: false });
+}
+
+function isLockOwner(value: unknown): value is { pid: number; createdAt?: string } {
+  const candidate = typeof value === 'object' && value !== null ? (value as { pid?: unknown }).pid : undefined;
+  return Number.isInteger(candidate) && typeof candidate === 'number' && candidate > 0;
+}
+
+function localPidIsAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error: unknown) {
+    if (isNodeError(error, 'ESRCH')) return false;
+    return true;
   }
 }
 
