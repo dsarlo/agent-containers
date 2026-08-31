@@ -7,6 +7,12 @@ import { validateWorkspaceName } from '../src/names.js';
 import { createWorkspace, type ProcessRunner } from '../src/workspaces.js';
 import type { AgentContainersConfig } from '../src/types.js';
 
+test('CI captures git worktree help even though Git exits 129', async () => {
+  const workflow = await readFile(new URL('../../.github/workflows/ci.yml', import.meta.url), 'utf8');
+  assert.match(workflow, /worktree_help="\$\(git worktree add -h 2>&1 \|\| true\)"/);
+  assert.match(workflow, /grep -Eq -- '([^']*relative-paths[^']*)' <<<"\$\{worktree_help\}"/);
+});
+
 test('validateWorkspaceName rejects unsafe names', () => {
   assert.equal(validateWorkspaceName('feature-123'), 'feature-123');
   for (const name of ['', '../escape', 'has space', 'two//slashes', '.hidden', 'UPPER', 'two--hyphens', 'trailing-']) {

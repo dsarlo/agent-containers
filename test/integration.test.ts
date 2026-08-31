@@ -6,13 +6,10 @@ import { spawn, spawnSync } from 'node:child_process';
 import test from 'node:test';
 import { createWorkspace, nodeProcessRunner, PROCESS_OUTPUT_LIMIT } from '../src/workspaces.js';
 import { execWorkspace } from '../src/runtime.js';
-import { isLiveIntegrationEnabled } from '../src/live-integration.js';
+import { isLiveIntegrationEnabled, probeLiveIntegrationPrerequisites } from '../src/live-integration.js';
 
-const gitAvailable = spawnSync('git', ['--version']).status === 0;
-const dockerAvailable = spawnSync('docker', ['version']).status === 0;
-const devcontainerAvailable = spawnSync('devcontainer', ['--version']).status === 0;
-const relativeWorktreeSupported = gitAvailable && /(?:^|\s)--(?:\[no-\])?relative-paths(?=\s|$)/m.test(`${spawnSync('git', ['worktree', 'add', '-h'], { encoding: 'utf8' }).stdout}${spawnSync('git', ['worktree', 'add', '-h'], { encoding: 'utf8' }).stderr}`);
 const requireLiveIntegration = isLiveIntegrationEnabled();
+const { gitAvailable, dockerAvailable, devcontainerAvailable, relativeWorktreeSupported } = probeLiveIntegrationPrerequisites(process.env, (command, args) => spawnSync(command, args, { encoding: 'utf8' }));
 
 test('required live integration prerequisites are available', { skip: !requireLiveIntegration }, () => {
   assert.ok(gitAvailable, 'Git is required');
@@ -66,13 +63,15 @@ test('SIGTERM keeps the lifecycle lock until a cancelled child process has exite
   const stateDir = await mkdtemp(join(tmpdir(), 'agent-containers-signal-lock-'));
   const stateUrl = new URL('../src/state.js', import.meta.url).href;
   const workspacesUrl = new URL('../src/workspaces.js', import.meta.url).href;
+  const reapedMarker = join(stateDir, 'child-reaped');
+  const childCommand = `const fs = require('node:fs'); process.on('SIGTERM', () => setTimeout(() => { fs.writeFileSync(${JSON.stringify(reapedMarker)}, 'reaped'); process.exit(0); }, 200)); setTimeout(() => process.exit(0), 900); setInterval(() => {}, 1000);`;
   const childProgram = `
     import { withWorkspaceLock } from ${JSON.stringify(stateUrl)};
     import { nodeProcessRunner } from ${JSON.stringify(workspacesUrl)};
     const stateDir = process.argv[1];
     await withWorkspaceLock(stateDir, 'safe', async (signal) => {
       process.stdout.write('LOCKED\\n');
-      await nodeProcessRunner.run(process.execPath, ['-e', "process.on('SIGTERM', () => setTimeout(() => process.exit(0), 200)); setTimeout(() => process.exit(0), 900); setInterval(() => {}, 1000);"], { signal });
+      await nodeProcessRunner.run(process.execPath, ['-e', ${JSON.stringify(childCommand)}], { signal });
     });
   `;
   const lifecycle = spawn(process.execPath, ['--input-type=module', '-e', childProgram, stateDir], { stdio: ['ignore', 'pipe', 'pipe'] });
@@ -87,10 +86,13 @@ test('SIGTERM keeps the lifecycle lock until a cancelled child process has exite
   lifecycle.kill('SIGTERM');
   try {
     await new Promise((resolveDelay) => setTimeout(resolveDelay, 75));
+    lifecycle.kill('SIGTERM');
     await lstat(join(stateDir, 'locks', 'safe.lock'));
   } finally {
     const result = await exited;
     assert.equal(result.signal, 'SIGTERM');
+    assert.equal(await readFile(reapedMarker, 'utf8'), 'reaped');
+    await assert.rejects(() => lstat(join(stateDir, 'locks', 'safe.lock')), { code: 'ENOENT' });
   }
 });
 

@@ -22,7 +22,7 @@ export async function execWorkspace(metadata: WorkspaceMetadata, command: string
     const detail = error instanceof Error ? error.message : String(error);
     let cleanup: ProcessResult;
     try {
-      cleanup = await runner.run('docker', ['rm', '-f', containerId], withSignal(undefined, signal));
+      cleanup = await runner.run('docker', ['rm', '-f', containerId], withSignal(undefined, AbortSignal.timeout(5_000)));
     } catch (cleanupError: unknown) {
       const cleanupDetail = cleanupError instanceof Error ? cleanupError.message : String(cleanupError);
       throw new Error(`Could not persist container metadata (${detail}) and could not remove untracked container ${containerId}: ${cleanupDetail}.`, { cause: cleanupError });
@@ -33,7 +33,9 @@ export async function execWorkspace(metadata: WorkspaceMetadata, command: string
     }
     throw new Error(`Could not persist container metadata (${detail}); removed untracked container ${containerId}. Retry the command after fixing state storage.`, { cause: error });
   }
-  const result = await runner.run('devcontainer', ['exec', '--workspace-folder', metadata.worktree, '--config', configPath, '--container-id', containerId, ...command], withSignal({ stdio: 'inherit' }, signal));
+  // `devcontainer exec` only owns a local CLI; killing it cannot prove an in-container
+  // command stopped. Keep the lifecycle lock until the CLI reports the remote command done.
+  const result = await runner.run('devcontainer', ['exec', '--workspace-folder', metadata.worktree, '--config', configPath, '--container-id', containerId, ...command], { stdio: 'inherit' });
   if (result.code !== 0) throw commandError('devcontainer exec', result);
   return result;
 }

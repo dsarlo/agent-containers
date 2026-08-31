@@ -19,6 +19,8 @@ export interface ProcessResult {
 export interface ProcessRunOptions {
   cwd?: string;
   stdio?: 'inherit' | 'pipe';
+  /** UTF-8 input written to the child stdin before it is closed. */
+  input?: string;
   /** Aborts the active process, which is reaped before run() settles. */
   signal?: AbortSignal;
 }

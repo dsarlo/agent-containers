@@ -120,6 +120,29 @@ test('stale lock recovery serializes validation and removal with a new lifecycle
   assert.equal(contenderRan, true);
 });
 
+test('lock acquisition ignores interrupted unpublished lock and recovery creation stages', async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), 'agent-containers-lock-crash-'));
+  const locksDir = join(stateDir, 'locks');
+  await mkdir(join(locksDir, '.safe.lock-empty.pending'), { recursive: true });
+  await mkdir(join(locksDir, '.safe.lock-owned.pending'), { recursive: true });
+  await writeFile(join(locksDir, '.safe.lock-owned.pending', 'owner.json'), JSON.stringify({ pid: 424242, token: '33333333-3333-4333-8333-333333333333' }));
+  await mkdir(join(locksDir, '.safe.recovery-owned.pending'), { recursive: true });
+  await writeFile(join(locksDir, '.safe.recovery-owned.pending', 'owner.json'), JSON.stringify({ pid: 424242, token: '44444444-4444-4444-8444-444444444444' }));
+  let acquired = false;
+  await withWorkspaceLock(stateDir, 'safe', async () => { acquired = true; }, { timeoutMs: 100 });
+  assert.equal(acquired, true, 'only owner-complete directories are ever published at a lock path');
+});
+
+test('a crashed owner-complete recovery lock is reclaimed before a lifecycle operation blocks forever', async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), 'agent-containers-recovery-crash-'));
+  const recoveryPath = join(stateDir, 'locks', 'safe.recovery');
+  await mkdir(recoveryPath, { recursive: true });
+  await writeFile(join(recoveryPath, 'owner.json'), JSON.stringify({ pid: 424242, token: '55555555-5555-4555-8555-555555555555' }));
+  let acquired = false;
+  await withWorkspaceLock(stateDir, 'safe', async () => { acquired = true; }, { timeoutMs: 100 });
+  assert.equal(acquired, true);
+});
+
 test('withWorkspaceLock makes a lifecycle contender observe deletion rather than restore stale metadata', async () => {
   const stateDir = await mkdtemp(join(tmpdir(), 'agent-containers-lock-'));
   await saveMetadata(stateDir, metadata);

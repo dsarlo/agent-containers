@@ -19,6 +19,7 @@ export const nodeProcessRunner: ProcessRunner = {
       }
       const stdio = options.stdio ?? 'pipe';
       const child = spawn(command, args, { cwd: options.cwd, shell: false, stdio, detached: process.platform !== 'win32' });
+      if (options.input !== undefined) child.stdin?.end(options.input);
       let stdout = '';
       let stderr = '';
       let settled = false;
@@ -152,6 +153,8 @@ export async function removeWorkspace(metadata: WorkspaceMetadata, options: { co
 
   let branchPresent = false;
   let branchOid: string | undefined;
+  let baseOid: string | undefined;
+  const baseRef = `refs/heads/${current.baseBranch}`;
   if (!current.cleanup?.branch) {
     const branch = await runner.run('git', ['show-ref', '--verify', '--quiet', `refs/heads/${current.branch}`], withSignal({ cwd: current.repoRoot }, options.signal));
     if (branch.code === 0) branchPresent = true;
@@ -161,7 +164,11 @@ export async function removeWorkspace(metadata: WorkspaceMetadata, options: { co
       if (revision.code !== 0) throw commandError('git rev-parse', revision);
       branchOid = revision.stdout.trim();
       if (!/^[0-9a-f]{40,64}$/i.test(branchOid)) throw new Error(`git rev-parse returned an invalid branch object ID for ${current.branch}.`);
-      const merged = await runner.run('git', ['merge-base', '--is-ancestor', branchOid, current.baseBranch], withSignal({ cwd: current.repoRoot }, options.signal));
+      const baseRevision = await runner.run('git', ['rev-parse', '--verify', baseRef], withSignal({ cwd: current.repoRoot }, options.signal));
+      if (baseRevision.code !== 0) throw commandError('git rev-parse', baseRevision);
+      baseOid = baseRevision.stdout.trim();
+      if (!/^[0-9a-f]{40,64}$/i.test(baseOid)) throw new Error(`git rev-parse returned an invalid base object ID for ${current.baseBranch}.`);
+      const merged = await runner.run('git', ['merge-base', '--is-ancestor', branchOid, baseOid], withSignal({ cwd: current.repoRoot }, options.signal));
       if (merged.code === 1) throw new Error(`Refusing to remove unmerged branch ${current.branch}; merge it into ${current.baseBranch} first.`);
       if (merged.code !== 0) throw commandError('git merge-base', merged);
     }
@@ -192,8 +199,9 @@ export async function removeWorkspace(metadata: WorkspaceMetadata, options: { co
   }
 
   if (!current.cleanup?.branch) {
-    if (branchPresent && branchOid) {
-      const branchResult = await runner.run('git', ['update-ref', '-d', `refs/heads/${current.branch}`, branchOid], withSignal({ cwd: current.repoRoot }, options.signal));
+    if (branchPresent && branchOid && baseOid) {
+      const transaction = `start\nverify ${baseRef} ${baseOid}\ndelete refs/heads/${current.branch} ${branchOid}\nprepare\ncommit\n`;
+      const branchResult = await runner.run('git', ['update-ref', '--stdin'], withSignal({ cwd: current.repoRoot, input: transaction }, options.signal));
       if (branchResult.code !== 0) throw commandError('git update-ref', branchResult);
     }
     current = withCleanup(current, 'branch');

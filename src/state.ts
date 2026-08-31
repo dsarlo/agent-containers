@@ -123,20 +123,7 @@ export async function withWorkspaceLock<T>(stateDir: string, name: string, actio
   const deadline = Date.now() + timeoutMs;
   while (true) {
     await waitForRecoveryToFinish(recoveryPath, deadline, name);
-    try {
-      await mkdir(lockPath, { recursive: false, mode: 0o700 });
-      break;
-    } catch (error: unknown) {
-      if (!isNodeError(error, 'EEXIST')) throw error;
-      if (Date.now() >= deadline) throw lockTimeout(name, error);
-      await delay();
-    }
-  }
-  try {
-    await writeFile(join(lockPath, 'owner.json'), `${JSON.stringify({ pid: process.pid, token: randomUUID(), createdAt: new Date().toISOString() })}\n`, { encoding: 'utf8', flag: 'wx', mode: 0o600 });
-  } catch (error: unknown) {
-    await rm(lockPath, { recursive: true, force: true });
-    throw error;
+    if (await acquireOwnedDirectory(lockPath, locksDir, lockName, deadline, name)) break;
   }
   const cancellation = new AbortController();
   let receivedSignal: NodeJS.Signals | undefined;
@@ -150,8 +137,8 @@ export async function withWorkspaceLock<T>(stateDir: string, name: string, actio
   const onTerminate = () => onSignal('SIGTERM');
   abortSignal?.addEventListener('abort', cancel, { once: true });
   if (abortSignal?.aborted) cancel();
-  process.once('SIGINT', onInterrupt);
-  process.once('SIGTERM', onTerminate);
+  process.on('SIGINT', onInterrupt);
+  process.on('SIGTERM', onTerminate);
   try {
     if (cancellation.signal.aborted) throw abortError();
     return await action(cancellation.signal);
@@ -171,7 +158,7 @@ export async function releaseStaleWorkspaceLock(stateDir: string, name: string, 
   const lockPath = join(locksDir, `${lockName}.lock`);
   const recoveryPath = join(locksDir, `${lockName}.recovery`);
   await mkdir(locksDir, { recursive: true, mode: 0o700 });
-  await acquireRecoveryLock(recoveryPath, Date.now() + timeoutMs, name);
+  await acquireRecoveryLock(recoveryPath, locksDir, lockName, Date.now() + timeoutMs, name);
   try {
     let owner: unknown;
     try {
@@ -201,21 +188,54 @@ async function waitForRecoveryToFinish(recoveryPath: string, deadline: number, n
       if (isNodeError(error, 'ENOENT')) return;
       throw error;
     }
+    const owner = await readLockOwner(recoveryPath);
+    if (owner && !localPidIsAlive(owner.pid)) {
+      const abandonedPath = `${recoveryPath}.${owner.token}.abandoned`;
+      try {
+        await rename(recoveryPath, abandonedPath);
+        await rm(abandonedPath, { recursive: true, force: false });
+        return;
+      } catch (error: unknown) {
+        if (!isNodeError(error, 'ENOENT')) throw error;
+        continue;
+      }
+    }
     if (Date.now() >= deadline) throw lockTimeout(name);
     await delay();
   }
 }
 
-async function acquireRecoveryLock(recoveryPath: string, deadline: number, name: string): Promise<void> {
+async function acquireRecoveryLock(recoveryPath: string, locksDir: string, lockName: string, deadline: number, name: string): Promise<void> {
   while (true) {
-    try {
-      await mkdir(recoveryPath, { recursive: false, mode: 0o700 });
-      return;
-    } catch (error: unknown) {
-      if (!isNodeError(error, 'EEXIST')) throw error;
-      if (Date.now() >= deadline) throw lockTimeout(name, error);
-      await delay();
-    }
+    if (await acquireOwnedDirectory(recoveryPath, locksDir, `${lockName}.recovery`, deadline, name)) return;
+  }
+}
+
+/** Build owner metadata off-path, then atomically publish the directory. */
+async function acquireOwnedDirectory(path: string, locksDir: string, temporaryStem: string, deadline: number, name: string): Promise<boolean> {
+  const temporaryPath = join(locksDir, `.${temporaryStem}.${randomUUID()}.pending`);
+  try {
+    await mkdir(temporaryPath, { recursive: false, mode: 0o700 });
+    const owner: LockOwner = { pid: process.pid, token: randomUUID(), createdAt: new Date().toISOString() };
+    await writeFile(join(temporaryPath, 'owner.json'), `${JSON.stringify(owner)}\n`, { encoding: 'utf8', flag: 'wx', mode: 0o600 });
+    await rename(temporaryPath, path);
+    return true;
+  } catch (error: unknown) {
+    await rm(temporaryPath, { recursive: true, force: true });
+    if (!isNodeError(error, 'EEXIST') && !isNodeError(error, 'ENOTEMPTY')) throw error;
+    if (Date.now() >= deadline) throw lockTimeout(name, error);
+    await delay();
+    return false;
+  }
+}
+
+async function readLockOwner(path: string): Promise<LockOwner | undefined> {
+  try {
+    const owner: unknown = JSON.parse(await readFile(join(path, 'owner.json'), 'utf8'));
+    return isLockOwner(owner) ? owner : undefined;
+  } catch (error: unknown) {
+    if (isNodeError(error, 'ENOENT')) return undefined;
+    throw error;
   }
 }
 

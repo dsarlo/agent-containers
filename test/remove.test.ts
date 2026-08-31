@@ -17,11 +17,12 @@ test('removeWorkspace requires confirmation and records every safe destructive c
     { command: 'git', args: ['worktree', 'list', '--porcelain'], cwd: '/repo' },
     { command: 'git', args: ['show-ref', '--verify', '--quiet', 'refs/heads/agent-containers/safe'], cwd: '/repo' },
     { command: 'git', args: ['rev-parse', '--verify', 'refs/heads/agent-containers/safe'], cwd: '/repo' },
-    { command: 'git', args: ['merge-base', '--is-ancestor', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'main'], cwd: '/repo' },
+    { command: 'git', args: ['rev-parse', '--verify', 'refs/heads/main'], cwd: '/repo' },
+    { command: 'git', args: ['merge-base', '--is-ancestor', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'], cwd: '/repo' },
     { command: 'docker', args: ['inspect', '--format', '{{ index .Config.Labels "devcontainer.local_folder" }}', 'abc'] },
     { command: 'docker', args: ['rm', '-f', 'abc'] },
     { command: 'git', args: ['worktree', 'remove', '/repo/worktrees/safe'], cwd: '/repo' },
-    { command: 'git', args: ['update-ref', '-d', 'refs/heads/agent-containers/safe', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'], cwd: '/repo' },
+    { command: 'git', args: ['update-ref', '--stdin'], cwd: '/repo', input: 'start\nverify refs/heads/main aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\ndelete refs/heads/agent-containers/safe aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nprepare\ncommit\n' },
   ]);
 });
 
@@ -110,10 +111,10 @@ test('removeWorkspace refuses to forget an unregistered dangling worktree symlin
 });
 
 test('removeWorkspace deletes the exact verified merged branch without Git upstream semantics', async () => {
-  const calls: string[][] = [];
-  const runner = { async run(_command: string, args: string[]) { calls.push(args); if (args[1] === 'list') return { code: 0, stdout: 'worktree /repo/worktrees/safe\nbranch refs/heads/agent-containers/safe\n', stderr: '' }; if (args[0] === 'show-ref') return { code: 0, stdout: '', stderr: '' }; if (args[0] === 'rev-parse') return { code: 0, stdout: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n', stderr: '' }; if (args[0] === 'inspect') return { code: 0, stdout: '/repo/worktrees/safe\n', stderr: '' }; return { code: 0, stdout: '', stderr: '' }; } };
+  const calls: Array<{ args: string[]; input?: string }> = [];
+  const runner = { async run(_command: string, args: string[], options?: { input?: string }) { calls.push({ args, input: options?.input }); if (args[1] === 'list') return { code: 0, stdout: 'worktree /repo/worktrees/safe\nbranch refs/heads/agent-containers/safe\n', stderr: '' }; if (args[0] === 'show-ref') return { code: 0, stdout: '', stderr: '' }; if (args[0] === 'rev-parse') return { code: 0, stdout: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n', stderr: '' }; if (args[0] === 'inspect') return { code: 0, stdout: '/repo/worktrees/safe\n', stderr: '' }; return { code: 0, stdout: '', stderr: '' }; } };
   await removeWorkspace(metadata, { confirmed: true }, runner, async () => undefined, async () => undefined);
-  assert.ok(calls.some((args) => args[0] === 'update-ref' && args[1] === '-d' && args[2] === 'refs/heads/agent-containers/safe' && args[3] === 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'));
+  assert.deepEqual(calls.at(-1), { args: ['update-ref', '--stdin'], input: 'start\nverify refs/heads/main aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\ndelete refs/heads/agent-containers/safe aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nprepare\ncommit\n' });
 });
 
 test('removeWorkspace refuses to delete a branch that moved after its merged OID was verified', async () => {
@@ -134,6 +135,32 @@ test('removeWorkspace refuses to delete a branch that moved after its merged OID
     /git update-ref failed/,
   );
   assert.equal(calls.some((args) => args[0] === 'branch' && args[1] === '-D'), false);
-  assert.deepEqual(calls.at(-1), ['update-ref', '-d', 'refs/heads/agent-containers/safe', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa']);
+  assert.deepEqual(calls.at(-1), ['update-ref', '--stdin']);
   assert.equal(removedMetadata, false);
+});
+
+test('removeWorkspace atomically verifies the captured base OID before deleting the verified branch', async () => {
+  const calls: Array<{ args: string[]; input?: string }> = [];
+  let removedMetadata = false;
+  const branchOid = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+  const baseOid = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+  const runner = {
+    async run(_command: string, args: string[], options?: { input?: string }) {
+      calls.push({ args, input: options?.input });
+      if (args[0] === 'worktree' && args[1] === 'list') return { code: 0, stdout: '', stderr: '' };
+      if (args[0] === 'show-ref') return { code: 0, stdout: '', stderr: '' };
+      if (args[0] === 'rev-parse') return { code: 0, stdout: args.at(-1) === 'refs/heads/main' ? `${baseOid}\n` : `${branchOid}\n`, stderr: '' };
+      if (args[0] === 'update-ref') return { code: 1, stdout: '', stderr: 'base changed' };
+      return { code: 0, stdout: '', stderr: '' };
+    },
+  };
+  await assert.rejects(
+    () => removeWorkspace({ ...metadata, cleanup: { container: true } }, { confirmed: true }, runner, async () => undefined, async () => { removedMetadata = true; }),
+    /git update-ref failed/,
+  );
+  assert.deepEqual(calls.at(-1), {
+    args: ['update-ref', '--stdin'],
+    input: `start\nverify refs/heads/main ${baseOid}\ndelete refs/heads/agent-containers/safe ${branchOid}\nprepare\ncommit\n`,
+  });
+  assert.equal(removedMetadata, false, 'a changed base leaves branch cleanup and state intact');
 });

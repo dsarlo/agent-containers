@@ -1,7 +1,10 @@
 import assert from 'node:assert/strict';
+import { mkdtemp } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import test from 'node:test';
 import { execWorkspace, type ProcessRunner } from '../src/runtime.js';
-import type { WorkspaceMetadata } from '../src/state.js';
+import { withWorkspaceLock, type WorkspaceMetadata } from '../src/state.js';
 
 const metadata: WorkspaceMetadata = {
   version: 1,
@@ -103,6 +106,68 @@ test('execWorkspace removes exactly the untracked container when saving its ID f
     /state disk full.*removed untracked container new-container/s,
   );
   assert.deepEqual(calls.at(-1), { command: 'docker', args: ['rm', '-f', 'new-container'] });
+});
+
+test('execWorkspace cleanup uses a fresh bounded signal after the lifecycle signal is aborted', async () => {
+  const lifecycle = new AbortController();
+  let cleanupSignal: AbortSignal | undefined;
+  const runner: ProcessRunner = {
+    async run(_command, args, options) {
+      if (args[0] === 'up') return { code: 0, stdout: '{"containerId":"new-container"}\n', stderr: '' };
+      cleanupSignal = options?.signal;
+      return { code: 0, stdout: '', stderr: '' };
+    },
+  };
+  await assert.rejects(
+    () => execWorkspace(metadata, ['true'], runner, async () => { lifecycle.abort(); throw new Error('state disk full'); }, async () => '{}', lifecycle.signal),
+    /removed untracked container new-container/,
+  );
+  assert.ok(cleanupSignal, 'cleanup receives its own bounded signal');
+  assert.notEqual(cleanupSignal, lifecycle.signal);
+  assert.equal(cleanupSignal.aborted, false);
+});
+
+test('execWorkspace does not pass lifecycle cancellation to a remote Dev Container command', async () => {
+  const lifecycle = new AbortController();
+  let remoteSignal: AbortSignal | undefined;
+  const runner: ProcessRunner = {
+    async run(_command, args, options) {
+      if (args[0] === 'up') return { code: 0, stdout: '{"containerId":"container-1"}\n', stderr: '' };
+      remoteSignal = options?.signal;
+      lifecycle.abort();
+      return { code: 0, stdout: '', stderr: '' };
+    },
+  };
+  await execWorkspace(metadata, ['true'], runner, async () => undefined, async () => '{}', lifecycle.signal);
+  assert.equal(remoteSignal, undefined, 'v0.1 must not claim local CLI cancellation stops an in-container command');
+});
+
+test('a cancelled remote exec retains the workspace lock until the Dev Containers CLI reports completion', async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), 'agent-containers-remote-lock-'));
+  const lifecycle = new AbortController();
+  let remoteStarted!: () => void;
+  const remoteIsRunning = new Promise<void>((resolve) => { remoteStarted = resolve; });
+  let finishRemote!: () => void;
+  const remoteMayFinish = new Promise<void>((resolve) => { finishRemote = resolve; });
+  const runner: ProcessRunner = {
+    async run(_command, args, options) {
+      if (args[0] === 'up') return { code: 0, stdout: '{"containerId":"container-1"}\n', stderr: '' };
+      remoteStarted();
+      options?.signal?.addEventListener('abort', finishRemote, { once: true });
+      await remoteMayFinish;
+      return { code: 0, stdout: '', stderr: '' };
+    },
+  };
+  const executing = withWorkspaceLock(stateDir, 'safe-name', (signal) => execWorkspace(metadata, ['true'], runner, async () => undefined, async () => '{}', signal), { abortSignal: lifecycle.signal });
+  await remoteIsRunning;
+  lifecycle.abort();
+  let removalRan = false;
+  const remove = withWorkspaceLock(stateDir, 'safe-name', async () => { removalRan = true; });
+  await new Promise((resolve) => setTimeout(resolve, 35));
+  assert.equal(removalRan, false, 'a concurrent remove cannot proceed while an unproven remote command may still run');
+  finishRemote();
+  await Promise.all([executing, remove]);
+  assert.equal(removalRan, true);
 });
 
 test('execWorkspace reports both metadata and exact container cleanup failures', async () => {

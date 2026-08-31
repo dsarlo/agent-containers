@@ -46,5 +46,6 @@ jobs:
         run: |
           docker version
           devcontainer --version
-          git worktree add -h 2>&1 | grep -Eq -- '(^|[[:space:]])--(\[no-\])?relative-paths([[:space:]]|$)'
+          worktree_help="$(git worktree add -h 2>&1 || true)"
+          grep -Eq -- '(^|[[:space:]])--(\[no-\])?relative-paths([[:space:]]|$)' <<<"${worktree_help}"
       - run: AGENT_CONTAINERS_REQUIRE_LIVE_INTEGRATION=1 npm run test:integration
