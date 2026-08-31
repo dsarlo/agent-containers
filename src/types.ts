@@ -16,6 +16,13 @@ export interface ProcessResult {
   stderr: string;
 }
 
+export interface ProcessRunOptions {
+  cwd?: string;
+  stdio?: 'inherit' | 'pipe';
+  /** Aborts the active process, which is reaped before run() settles. */
+  signal?: AbortSignal;
+}
+
 export interface ProcessRunner {
-  run(command: string, args: string[], options?: { cwd?: string; stdio?: 'inherit' | 'pipe' }): Promise<ProcessResult>;
+  run(command: string, args: string[], options?: ProcessRunOptions): Promise<ProcessResult>;
 }

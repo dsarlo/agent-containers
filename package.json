@@ -3,24 +3,42 @@
   "version": "0.1.0",
   "description": "Isolated Git workspaces with Dev Container runtimes for coding agents",
   "license": "MIT",
-  "repository": { "type": "git", "url": "git+https://github.com/dsarlo/agent-containers.git" },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dsarlo/agent-containers.git"
+  },
   "homepage": "https://github.com/dsarlo/agent-containers#readme",
-  "bugs": { "url": "https://github.com/dsarlo/agent-containers/issues" },
-  "keywords": ["agents", "git-worktree", "devcontainers", "developer-tools"],
-  "publishConfig": { "access": "public" },
+  "bugs": {
+    "url": "https://github.com/dsarlo/agent-containers/issues"
+  },
+  "keywords": [
+    "agents",
+    "git-worktree",
+    "devcontainers",
+    "developer-tools"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
   "type": "module",
-  "engines": { "node": ">=20.19.0" },
+  "engines": {
+    "node": ">=20.19.0"
+  },
   "bin": {
     "ac": "./dist/src/bin/agent-containers.js",
     "agent-containers": "./dist/src/bin/agent-containers.js"
   },
-  "files": ["dist/src", "*.md", "docs"],
+  "files": [
+    "dist/src",
+    "*.md",
+    "docs"
+  ],
   "scripts": {
     "build": "node scripts/build.mjs",
     "lint": "eslint .",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "npm run build && node --test dist/test/*.test.js",
-    "test:integration": "npm run build && node --test dist/test/integration.test.js",
+    "test:integration": "AGENT_CONTAINERS_REQUIRE_LIVE_INTEGRATION=1 npm run build && AGENT_CONTAINERS_REQUIRE_LIVE_INTEGRATION=1 node --test dist/test/integration.test.js",
     "prepack": "npm run build"
   },
   "devDependencies": {
@@ -30,5 +48,8 @@
     "typescript": "^5.7.2",
     "typescript-eslint": "^8.68.0"
   },
-  "dependencies": { "yaml": "^2.7.0" }
+  "dependencies": {
+    "jsonc-parser": "^3.3.1",
+    "yaml": "^2.7.0"
+  }
 }

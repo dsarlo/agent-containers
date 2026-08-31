@@ -1,4 +1,4 @@
-import { mkdir, readdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, readdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { isAbsolute, join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -19,6 +19,17 @@ export interface WorkspaceMetadata {
     worktree?: boolean;
     branch?: boolean;
   };
+}
+
+export interface StaleLockRecoveryHooks {
+  /** Test seam: runs after ownership is validated while normal acquisition remains blocked. */
+  beforeRemoval?: () => void | Promise<void>;
+}
+
+interface LockOwner {
+  pid: number;
+  token: string;
+  createdAt?: string;
 }
 
 export function defaultStateDir(environment: NodeJS.ProcessEnv = process.env): string {
@@ -96,71 +107,137 @@ function isCleanupState(value: unknown): boolean {
     ['container', 'worktree', 'branch'].includes(key) && typeof completed === 'boolean');
 }
 
-/**
- * Serialize all destructive lifecycle work for one workspace across processes.
- * The lock is an atomically-created directory; it is deliberately never broken
- * automatically because stealing a live lock could resurrect deleted metadata.
- */
-export async function withWorkspaceLock<T>(stateDir: string, name: string, action: () => Promise<T>, timeoutMs = 30_000): Promise<T> {
-  const lockPath = join(stateDir, 'locks', `${validateWorkspaceName(name)}.lock`);
-  await mkdir(join(stateDir, 'locks'), { recursive: true, mode: 0o700 });
+export interface WorkspaceLockOptions {
+  timeoutMs?: number;
+  /** Optional test or embedding cancellation source; process signals are wired internally. */
+  abortSignal?: AbortSignal;
+}
+
+export async function withWorkspaceLock<T>(stateDir: string, name: string, action: (signal: AbortSignal) => Promise<T>, options: number | WorkspaceLockOptions = 30_000): Promise<T> {
+  const { timeoutMs, abortSignal } = typeof options === 'number' ? { timeoutMs: options, abortSignal: undefined } : { timeoutMs: options.timeoutMs ?? 30_000, abortSignal: options.abortSignal };
+  const lockName = validateWorkspaceName(name);
+  const locksDir = join(stateDir, 'locks');
+  const lockPath = join(locksDir, `${lockName}.lock`);
+  const recoveryPath = join(locksDir, `${lockName}.recovery`);
+  await mkdir(locksDir, { recursive: true, mode: 0o700 });
   const deadline = Date.now() + timeoutMs;
   while (true) {
+    await waitForRecoveryToFinish(recoveryPath, deadline, name);
     try {
       await mkdir(lockPath, { recursive: false, mode: 0o700 });
       break;
     } catch (error: unknown) {
       if (!isNodeError(error, 'EEXIST')) throw error;
-      if (Date.now() >= deadline) throw new Error(`Timed out waiting for lifecycle lock for workspace "${name}". A previous Agent Containers command may still be running.`, { cause: error });
-      await new Promise<void>((resolveDelay) => setTimeout(resolveDelay, 25));
+      if (Date.now() >= deadline) throw lockTimeout(name, error);
+      await delay();
     }
   }
   try {
-    await writeFile(join(lockPath, 'owner.json'), `${JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString() })}\n`, { encoding: 'utf8', flag: 'wx', mode: 0o600 });
+    await writeFile(join(lockPath, 'owner.json'), `${JSON.stringify({ pid: process.pid, token: randomUUID(), createdAt: new Date().toISOString() })}\n`, { encoding: 'utf8', flag: 'wx', mode: 0o600 });
   } catch (error: unknown) {
     await rm(lockPath, { recursive: true, force: true });
     throw error;
   }
+  const cancellation = new AbortController();
+  let receivedSignal: NodeJS.Signals | undefined;
+  const cancel = () => cancellation.abort();
   const onSignal = (signal: NodeJS.Signals) => {
-    void rm(lockPath, { recursive: true, force: true }).finally(() => {
-      process.off('SIGINT', onInterrupt);
-      process.off('SIGTERM', onTerminate);
-      process.kill(process.pid, signal);
-    });
+    if (receivedSignal) return;
+    receivedSignal = signal;
+    cancel();
   };
   const onInterrupt = () => onSignal('SIGINT');
   const onTerminate = () => onSignal('SIGTERM');
+  abortSignal?.addEventListener('abort', cancel, { once: true });
+  if (abortSignal?.aborted) cancel();
   process.once('SIGINT', onInterrupt);
   process.once('SIGTERM', onTerminate);
   try {
-    return await action();
+    if (cancellation.signal.aborted) throw abortError();
+    return await action(cancellation.signal);
   } finally {
     process.off('SIGINT', onInterrupt);
     process.off('SIGTERM', onTerminate);
+    abortSignal?.removeEventListener('abort', cancel);
     await rm(lockPath, { recursive: true, force: true });
+    if (receivedSignal) process.kill(process.pid, receivedSignal);
   }
 }
 
 /** Release only a lock whose recorded local owner PID is proven no longer alive. */
-export async function releaseStaleWorkspaceLock(stateDir: string, name: string, isPidAlive: (pid: number) => boolean = localPidIsAlive): Promise<void> {
-  const lockPath = join(stateDir, 'locks', `${validateWorkspaceName(name)}.lock`);
-  let owner: unknown;
+export async function releaseStaleWorkspaceLock(stateDir: string, name: string, isPidAlive: (pid: number) => boolean = localPidIsAlive, hooks: StaleLockRecoveryHooks = {}, timeoutMs = 30_000): Promise<void> {
+  const lockName = validateWorkspaceName(name);
+  const locksDir = join(stateDir, 'locks');
+  const lockPath = join(locksDir, `${lockName}.lock`);
+  const recoveryPath = join(locksDir, `${lockName}.recovery`);
+  await mkdir(locksDir, { recursive: true, mode: 0o700 });
+  await acquireRecoveryLock(recoveryPath, Date.now() + timeoutMs, name);
   try {
-    owner = JSON.parse(await readFile(join(lockPath, 'owner.json'), 'utf8'));
-  } catch (error: unknown) {
-    if (isNodeError(error, 'ENOENT')) throw new Error(`No recoverable lifecycle lock exists for workspace "${name}". Refusing to remove a lock without owner metadata.`, { cause: error });
-    throw error;
+    let owner: unknown;
+    try {
+      owner = JSON.parse(await readFile(join(lockPath, 'owner.json'), 'utf8'));
+    } catch (error: unknown) {
+      if (isNodeError(error, 'ENOENT')) throw new Error(`No recoverable lifecycle lock exists for workspace "${name}". Refusing to remove a lock without owner metadata.`, { cause: error });
+      throw error;
+    }
+    if (!isLockOwner(owner)) {
+      throw new Error(`Lifecycle lock for workspace "${name}" has invalid owner metadata; refusing unsafe removal.`);
+    }
+    if (isPidAlive(owner.pid)) throw new Error(`Lifecycle lock for workspace "${name}" is owned by active PID ${owner.pid}; refusing to interrupt it.`);
+    await hooks.beforeRemoval?.();
+    const reclaimedPath = join(locksDir, `.${lockName}.${owner.token}.reclaimed`);
+    await rename(lockPath, reclaimedPath);
+    await rm(reclaimedPath, { recursive: true, force: false });
+  } finally {
+    await rm(recoveryPath, { recursive: true, force: true });
   }
-  if (!isLockOwner(owner)) {
-    throw new Error(`Lifecycle lock for workspace "${name}" has invalid owner metadata; refusing unsafe removal.`);
-  }
-  if (isPidAlive(owner.pid)) throw new Error(`Lifecycle lock for workspace "${name}" is owned by active PID ${owner.pid}; refusing to interrupt it.`);
-  await rm(lockPath, { recursive: true, force: false });
 }
 
-function isLockOwner(value: unknown): value is { pid: number; createdAt?: string } {
-  const candidate = typeof value === 'object' && value !== null ? (value as { pid?: unknown }).pid : undefined;
-  return Number.isInteger(candidate) && typeof candidate === 'number' && candidate > 0;
+async function waitForRecoveryToFinish(recoveryPath: string, deadline: number, name: string): Promise<void> {
+  while (true) {
+    try {
+      await lstat(recoveryPath);
+    } catch (error: unknown) {
+      if (isNodeError(error, 'ENOENT')) return;
+      throw error;
+    }
+    if (Date.now() >= deadline) throw lockTimeout(name);
+    await delay();
+  }
+}
+
+async function acquireRecoveryLock(recoveryPath: string, deadline: number, name: string): Promise<void> {
+  while (true) {
+    try {
+      await mkdir(recoveryPath, { recursive: false, mode: 0o700 });
+      return;
+    } catch (error: unknown) {
+      if (!isNodeError(error, 'EEXIST')) throw error;
+      if (Date.now() >= deadline) throw lockTimeout(name, error);
+      await delay();
+    }
+  }
+}
+
+function abortError(): Error {
+  const error = new Error('Lifecycle action was aborted.');
+  error.name = 'AbortError';
+  return error;
+}
+
+function lockTimeout(name: string, cause?: unknown): Error {
+  return new Error(`Timed out waiting for lifecycle lock for workspace "${name}". A previous Agent Containers command may still be running.`, cause === undefined ? undefined : { cause });
+}
+
+function delay(): Promise<void> {
+  return new Promise<void>((resolveDelay) => setTimeout(resolveDelay, 25));
+}
+
+function isLockOwner(value: unknown): value is LockOwner {
+  const candidate = typeof value === 'object' && value !== null ? value as { pid?: unknown; token?: unknown; createdAt?: unknown } : undefined;
+  return Number.isInteger(candidate?.pid) && typeof candidate?.pid === 'number' && candidate.pid > 0 &&
+    typeof candidate.token === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(candidate.token) &&
+    (candidate.createdAt === undefined || typeof candidate.createdAt === 'string');
 }
 
 function localPidIsAlive(pid: number): boolean {

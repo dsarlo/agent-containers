@@ -68,6 +68,26 @@ test('execWorkspace rejects unsupported Dev Container fields while parsing JSONC
   }
 });
 
+test('execWorkspace accepts standards-compatible JSONC comments, strings, and trailing commas', async () => {
+  const calls: string[][] = [];
+  const runner: ProcessRunner = {
+    async run(_command, args) {
+      calls.push(args);
+      return args[0] === 'up'
+        ? { code: 0, stdout: '{"containerId":"container-1"}\n', stderr: '' }
+        : { code: 0, stdout: '', stderr: '' };
+    },
+  };
+  const config = `{
+    // line comment
+    "name": "literal // and /* comment markers */",
+    "image": "example",
+    /* block comment */
+  }`;
+  await execWorkspace(metadata, ['true'], runner, async () => undefined, async () => config);
+  assert.equal(calls.length, 2);
+});
+
 test('execWorkspace removes exactly the untracked container when saving its ID fails', async () => {
   const calls: Array<{ command: string; args: string[] }> = [];
   const runner: ProcessRunner = {

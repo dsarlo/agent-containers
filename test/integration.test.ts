@@ -1,17 +1,18 @@
 import assert from 'node:assert/strict';
-import { access, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { access, lstat, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import test from 'node:test';
 import { createWorkspace, nodeProcessRunner, PROCESS_OUTPUT_LIMIT } from '../src/workspaces.js';
 import { execWorkspace } from '../src/runtime.js';
+import { isLiveIntegrationEnabled } from '../src/live-integration.js';
 
 const gitAvailable = spawnSync('git', ['--version']).status === 0;
 const dockerAvailable = spawnSync('docker', ['version']).status === 0;
 const devcontainerAvailable = spawnSync('devcontainer', ['--version']).status === 0;
 const relativeWorktreeSupported = gitAvailable && /(?:^|\s)--(?:\[no-\])?relative-paths(?=\s|$)/m.test(`${spawnSync('git', ['worktree', 'add', '-h'], { encoding: 'utf8' }).stdout}${spawnSync('git', ['worktree', 'add', '-h'], { encoding: 'utf8' }).stderr}`);
-const requireLiveIntegration = process.env.AGENT_CONTAINERS_REQUIRE_LIVE_INTEGRATION === '1';
+const requireLiveIntegration = isLiveIntegrationEnabled();
 
 test('required live integration prerequisites are available', { skip: !requireLiveIntegration }, () => {
   assert.ok(gitAvailable, 'Git is required');
@@ -47,8 +48,54 @@ test('nodeProcessRunner bounds burst capture while retaining terminal Dev Contai
   assert.match(result.stdout, /\{"containerId":"terminal"\}\n$/);
 });
 
+test('nodeProcessRunner abort terminates spawned process-group descendants before settling', { skip: process.platform === 'win32' }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'agent-containers-process-group-'));
+  const marker = join(directory, 'grandchild-survived');
+  const controller = new AbortController();
+  const grandchild = `require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'survived')`;
+  const program = `require('node:child_process').spawn(process.execPath, ['-e', ${JSON.stringify(`setTimeout(() => ${grandchild}, 250)`)}], { stdio: 'ignore' }); setInterval(() => {}, 1000);`;
+  const running = nodeProcessRunner.run(process.execPath, ['-e', program], { signal: controller.signal });
+  await new Promise((resolveDelay) => setTimeout(resolveDelay, 100));
+  controller.abort();
+  await running;
+  await new Promise((resolveDelay) => setTimeout(resolveDelay, 300));
+  await assert.rejects(() => lstat(marker), { code: 'ENOENT' });
+});
+
+test('SIGTERM keeps the lifecycle lock until a cancelled child process has exited', { timeout: 5_000 }, async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), 'agent-containers-signal-lock-'));
+  const stateUrl = new URL('../src/state.js', import.meta.url).href;
+  const workspacesUrl = new URL('../src/workspaces.js', import.meta.url).href;
+  const childProgram = `
+    import { withWorkspaceLock } from ${JSON.stringify(stateUrl)};
+    import { nodeProcessRunner } from ${JSON.stringify(workspacesUrl)};
+    const stateDir = process.argv[1];
+    await withWorkspaceLock(stateDir, 'safe', async (signal) => {
+      process.stdout.write('LOCKED\\n');
+      await nodeProcessRunner.run(process.execPath, ['-e', "process.on('SIGTERM', () => setTimeout(() => process.exit(0), 200)); setTimeout(() => process.exit(0), 900); setInterval(() => {}, 1000);"], { signal });
+    });
+  `;
+  const lifecycle = spawn(process.execPath, ['--input-type=module', '-e', childProgram, stateDir], { stdio: ['ignore', 'pipe', 'pipe'] });
+  let output = '';
+  await new Promise<void>((resolveReady, rejectReady) => {
+    lifecycle.stdout.on('data', (chunk: Buffer) => { output += chunk.toString(); if (output.includes('LOCKED\n')) resolveReady(); });
+    lifecycle.once('error', rejectReady);
+    lifecycle.once('exit', (code, signal) => rejectReady(new Error(`lifecycle process exited before locking (${code ?? signal})`)));
+  });
+  await new Promise((resolveDelay) => setTimeout(resolveDelay, 75));
+  const exited = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolveExit) => lifecycle.once('exit', (code, signal) => resolveExit({ code, signal })));
+  lifecycle.kill('SIGTERM');
+  try {
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 75));
+    await lstat(join(stateDir, 'locks', 'safe.lock'));
+  } finally {
+    const result = await exited;
+    assert.equal(result.signal, 'SIGTERM');
+  }
+});
+
 test('production execWorkspace lifecycle exposes the Git common directory inside a linked worktree', {
-  skip: requireLiveIntegration ? false : !dockerAvailable ? 'Docker is unavailable' : !devcontainerAvailable ? 'Dev Containers CLI is unavailable' : !relativeWorktreeSupported ? 'installed Git does not support git worktree add --relative-paths' : false,
+  skip: !requireLiveIntegration ? 'AGENT_CONTAINERS_REQUIRE_LIVE_INTEGRATION=1 is required' : !dockerAvailable ? 'Docker is unavailable' : !devcontainerAvailable ? 'Dev Containers CLI is unavailable' : !relativeWorktreeSupported ? 'installed Git does not support git worktree add --relative-paths' : false,
 }, async () => {
   const repo = await mkdtemp(join(tmpdir(), 'agent-containers-devcontainer-'));
   const worktree = `${repo}-worktree`;

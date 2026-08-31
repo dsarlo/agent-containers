@@ -32,10 +32,10 @@ export async function runCli(args: string[], cwd = process.cwd(), write: (messag
       case 'create': {
         const name = requiredPositional(rest, 'workspace name');
         ensureOptions(rest.slice(1), ['--base']);
-        return withWorkspaceLock(stateDir, name, async () => {
-          const root = await findGitRoot(cwd, nodeProcessRunner);
+        return withWorkspaceLock(stateDir, name, async (signal) => {
+          const root = await findGitRoot(cwd, nodeProcessRunner, signal);
           const config = await loadConfig(join(root, '.agent-containers.yml'));
-          const workspace = await createWorkspace({ cwd, name, config, stateDir, runner: nodeProcessRunner, baseBranch: optionValue(rest.slice(1), '--base') });
+          const workspace = await createWorkspace({ cwd, name, config, stateDir, runner: nodeProcessRunner, baseBranch: optionValue(rest.slice(1), '--base'), signal });
           write(`Created ${workspace.name} at ${workspace.worktree}`);
           return 0;
         });
@@ -45,10 +45,10 @@ export async function runCli(args: string[], cwd = process.cwd(), write: (messag
         const separator = rest.indexOf('--');
         if (separator !== 1) throw new UsageError(`Usage: agent-containers ${command} <name> -- <command...>`);
         const name = rest[0];
-        await withWorkspaceLock(stateDir, name, async () => {
+        await withWorkspaceLock(stateDir, name, async (signal) => {
           const metadata = await loadMetadata(stateDir, name);
           if (!metadata) throw new Error(`No Agent Containers workspace named "${name}".`);
-          await execWorkspace(metadata, rest.slice(separator + 1), nodeProcessRunner, (next) => saveMetadata(stateDir, next));
+          await execWorkspace(metadata, rest.slice(separator + 1), nodeProcessRunner, (next) => saveMetadata(stateDir, next), undefined, signal);
         });
         return 0;
       }
@@ -71,10 +71,10 @@ export async function runCli(args: string[], cwd = process.cwd(), write: (messag
         const name = requiredPositional(rest, 'workspace name');
         ensureOnly(rest.slice(1), ['--yes', '--skip-container-cleanup']);
         if (!rest.includes('--yes')) throw new UsageError('Usage: agent-containers remove <name> --yes [--skip-container-cleanup]');
-        await withWorkspaceLock(stateDir, name, async () => {
+        await withWorkspaceLock(stateDir, name, async (signal) => {
           const metadata = await loadMetadata(stateDir, name);
           if (!metadata) throw new Error(`No Agent Containers workspace named "${name}".`);
-          await removeWorkspace(metadata, { confirmed: true, skipContainerCleanup: rest.includes('--skip-container-cleanup') }, nodeProcessRunner, (next) => saveMetadata(stateDir, next), () => deleteMetadata(stateDir, name));
+          await removeWorkspace(metadata, { confirmed: true, skipContainerCleanup: rest.includes('--skip-container-cleanup'), signal }, nodeProcessRunner, (next) => saveMetadata(stateDir, next), () => deleteMetadata(stateDir, name));
         });
         write(`Removed ${name}`);
         return 0;

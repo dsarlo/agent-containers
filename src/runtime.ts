@@ -1,17 +1,18 @@
 import { readFile } from 'node:fs/promises';
+import { parse, type ParseError } from 'jsonc-parser';
 import { resolve } from 'node:path';
-import type { ProcessResult, ProcessRunner } from './types.js';
+import type { ProcessResult, ProcessRunner, ProcessRunOptions } from './types.js';
 import type { WorkspaceMetadata } from './state.js';
 
 export type { ProcessRunner } from './types.js';
 
 type DevcontainerConfig = Record<string, unknown>;
 
-export async function execWorkspace(metadata: WorkspaceMetadata, command: string[], runner: ProcessRunner, save: (metadata: WorkspaceMetadata) => Promise<void>, readConfig: (path: string) => Promise<string> = (path) => readFile(path, 'utf8')): Promise<ProcessResult> {
+export async function execWorkspace(metadata: WorkspaceMetadata, command: string[], runner: ProcessRunner, save: (metadata: WorkspaceMetadata) => Promise<void>, readConfig: (path: string) => Promise<string> = (path) => readFile(path, 'utf8'), signal?: AbortSignal): Promise<ProcessResult> {
   if (command.length === 0) throw new Error('A command is required after --.');
   const configPath = resolve(metadata.worktree, metadata.devcontainerPath);
   await assertSupportedDevcontainerConfig(configPath, readConfig);
-  const up = await runner.run('devcontainer', ['up', '--workspace-folder', metadata.worktree, '--config', configPath, '--log-format', 'json', '--mount-git-worktree-common-dir']);
+  const up = await runner.run('devcontainer', ['up', '--workspace-folder', metadata.worktree, '--config', configPath, '--log-format', 'json', '--mount-git-worktree-common-dir'], withSignal(undefined, signal));
   if (up.code !== 0) throw commandError('devcontainer up', up);
   const containerId = containerIdFromOutput(up.stdout);
   if (!containerId) throw new Error('devcontainer up did not report a current containerId in its terminal JSON output.');
@@ -21,7 +22,7 @@ export async function execWorkspace(metadata: WorkspaceMetadata, command: string
     const detail = error instanceof Error ? error.message : String(error);
     let cleanup: ProcessResult;
     try {
-      cleanup = await runner.run('docker', ['rm', '-f', containerId]);
+      cleanup = await runner.run('docker', ['rm', '-f', containerId], withSignal(undefined, signal));
     } catch (cleanupError: unknown) {
       const cleanupDetail = cleanupError instanceof Error ? cleanupError.message : String(cleanupError);
       throw new Error(`Could not persist container metadata (${detail}) and could not remove untracked container ${containerId}: ${cleanupDetail}.`, { cause: cleanupError });
@@ -32,7 +33,7 @@ export async function execWorkspace(metadata: WorkspaceMetadata, command: string
     }
     throw new Error(`Could not persist container metadata (${detail}); removed untracked container ${containerId}. Retry the command after fixing state storage.`, { cause: error });
   }
-  const result = await runner.run('devcontainer', ['exec', '--workspace-folder', metadata.worktree, '--config', configPath, '--container-id', containerId, ...command], { stdio: 'inherit' });
+  const result = await runner.run('devcontainer', ['exec', '--workspace-folder', metadata.worktree, '--config', configPath, '--container-id', containerId, ...command], withSignal({ stdio: 'inherit' }, signal));
   if (result.code !== 0) throw commandError('devcontainer exec', result);
   return result;
 }
@@ -40,8 +41,7 @@ export async function execWorkspace(metadata: WorkspaceMetadata, command: string
 export async function assertSupportedDevcontainerConfig(path: string, readConfig: (path: string) => Promise<string> = (configPath) => readFile(configPath, 'utf8')): Promise<void> {
   let config: DevcontainerConfig;
   try {
-    // JSONC comments are accepted by devcontainer.json; strip comments outside strings conservatively.
-    config = JSON.parse(stripJsonComments(await readConfig(path))) as DevcontainerConfig;
+    config = parseJsoncObject(await readConfig(path));
   } catch (error: unknown) {
     throw new Error(`Could not parse Dev Container configuration at ${path} for Agent Containers safety checks: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
   }
@@ -49,24 +49,16 @@ export async function assertSupportedDevcontainerConfig(path: string, readConfig
   if (unsupported.length > 0) throw new Error(`Agent Containers v0.1 does not support Dev Container ${unsupported.join(', ')} configuration. Remove it or use a simple image-based devcontainer.json; custom mounts and Compose are rejected to preserve isolated-worktree cleanup.`);
 }
 
-function stripJsonComments(source: string): string {
-  let output = '';
-  let quoted = false;
-  let escaped = false;
-  for (let index = 0; index < source.length; index += 1) {
-    const char = source[index];
-    const next = source[index + 1];
-    if (quoted) {
-      output += char;
-      if (escaped) escaped = false;
-      else if (char === '\\') escaped = true;
-      else if (char === '"') quoted = false;
-    } else if (char === '"') { quoted = true; output += char; }
-    else if (char === '/' && next === '/') { while (index < source.length && source[index] !== '\n') index += 1; output += '\n'; }
-    else if (char === '/' && next === '*') { index += 2; while (index < source.length && !(source[index] === '*' && source[index + 1] === '/')) index += 1; index += 1; }
-    else output += char;
-  }
-  return output;
+function parseJsoncObject(source: string): DevcontainerConfig {
+  const errors: ParseError[] = [];
+  const parsed = parse(source, errors, { allowTrailingComma: true, disallowComments: false });
+  if (errors.length > 0) throw new Error(`invalid JSONC (${errors.map((error) => error.error).join(', ')})`);
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) throw new Error('Dev Container configuration must be a JSON object');
+  return parsed as DevcontainerConfig;
+}
+
+function withSignal(options: Omit<ProcessRunOptions, 'signal'> | undefined, signal?: AbortSignal): ProcessRunOptions | undefined {
+  return signal ? { ...options, signal } : options;
 }
 
 function containerIdFromOutput(output: string): string | undefined {
