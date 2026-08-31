@@ -5,6 +5,10 @@ import { execWorkspace } from './runtime.js';
 import { createWorkspace, findGitRoot, nodeProcessRunner, removeWorkspace } from './workspaces.js';
 
 export async function runCli(args: string[], cwd = process.cwd(), write: (message: string) => void = console.log): Promise<number> {
+  if (args.length === 1 && (args[0] === '--help' || args[0] === '-h')) {
+    write(usage());
+    return 0;
+  }
   try {
     const [command, ...rest] = args;
     const stateDir = defaultStateDir();

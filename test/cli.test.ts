@@ -26,6 +26,12 @@ test('CLI help and errors use the public Agent Containers command identity', asy
   assert.match(messages[0], /Usage: agent-containers /);
 });
 
+test('CLI help returns success and describes public commands', async () => {
+  const messages: string[] = [];
+  assert.equal(await runCli(['--help'], process.cwd(), (message) => messages.push(message)), 0);
+  assert.match(messages[0], /unlock/);
+});
+
 test('init and implicit validation resolve the repository root from a subdirectory', async () => {
   const root = await mkdtemp(join(tmpdir(), 'agent-containers-cli-root-'));
   const nested = join(root, 'nested', 'deeper');
