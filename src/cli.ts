@@ -1,7 +1,7 @@
 import { join, resolve } from 'node:path';
 import { initConfig, loadConfig } from './config.js';
-import { clearManualRecovery, defaultStateDir, deleteMetadata, listMetadata, loadMetadata, recordManualRecovery, releaseStaleWorkspaceLock, saveMetadata, withWorkspaceLock } from './state.js';
-import { execWorkspace } from './runtime.js';
+import { clearManualRecovery, defaultStateDir, deleteMetadata, listMetadata, loadMetadata, releaseStaleWorkspaceLock, saveMetadata, withWorkspaceLock } from './state.js';
+import { execWorkspaceLifecycle } from './runtime.js';
 import { createWorkspace, findGitRoot, nodeProcessRunner, removeWorkspace } from './workspaces.js';
 
 export async function runCli(args: string[], cwd = process.cwd(), write: (message: string) => void = console.log): Promise<number> {
@@ -45,11 +45,9 @@ export async function runCli(args: string[], cwd = process.cwd(), write: (messag
         const separator = rest.indexOf('--');
         if (separator !== 1) throw new UsageError(`Usage: agent-containers ${command} <name> -- <command...>`);
         const name = rest[0];
-        await withWorkspaceLock(stateDir, name, async (signal) => {
-          const metadata = await loadMetadata(stateDir, name);
-          if (!metadata) throw new Error(`No Agent Containers workspace named "${name}".`);
-          await execWorkspace(metadata, rest.slice(separator + 1), nodeProcessRunner, (next) => saveMetadata(stateDir, next), undefined, signal, (recovery) => recordManualRecovery(stateDir, name, recovery), () => clearManualRecovery(stateDir, name));
-        });
+        const metadata = await loadMetadata(stateDir, name);
+        if (!metadata) throw new Error(`No Agent Containers workspace named "${name}".`);
+        await execWorkspaceLifecycle(metadata, rest.slice(separator + 1), nodeProcessRunner, (next) => saveMetadata(stateDir, next), stateDir);
         return 0;
       }
       case 'recover': {
@@ -58,7 +56,7 @@ export async function runCli(args: string[], cwd = process.cwd(), write: (messag
         if (!rest.includes('--yes') || !rest.includes('--remote-command-stopped')) {
           throw new UsageError('Usage: agent-containers recover <name> --yes --remote-command-stopped');
         }
-        await clearManualRecovery(stateDir, name);
+        await withWorkspaceLock(stateDir, name, async () => clearManualRecovery(stateDir, name), { allowManualRecovery: true });
         write(`Cleared manual recovery block for ${name}; this acknowledgement did not stop or remove any remote container.`);
         return 0;
       }

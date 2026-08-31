@@ -193,10 +193,14 @@ export interface WorkspaceLockOptions {
   timeoutMs?: number;
   /** Optional test or embedding cancellation source; process signals are wired internally. */
   abortSignal?: AbortSignal;
+  /** Allows only the recovery acknowledgement to acquire a guarded lifecycle lock. */
+  allowManualRecovery?: boolean;
 }
 
 export async function withWorkspaceLock<T>(stateDir: string, name: string, action: (signal: AbortSignal) => Promise<T>, options: number | WorkspaceLockOptions = 30_000): Promise<T> {
-  const { timeoutMs, abortSignal } = typeof options === 'number' ? { timeoutMs: options, abortSignal: undefined } : { timeoutMs: options.timeoutMs ?? 30_000, abortSignal: options.abortSignal };
+  const { timeoutMs, abortSignal, allowManualRecovery } = typeof options === 'number'
+    ? { timeoutMs: options, abortSignal: undefined, allowManualRecovery: false }
+    : { timeoutMs: options.timeoutMs ?? 30_000, abortSignal: options.abortSignal, allowManualRecovery: options.allowManualRecovery ?? false };
   const lockName = validateWorkspaceName(name);
   const locksDir = join(stateDir, 'locks');
   const lockPath = join(locksDir, `${lockName}.lock`);
@@ -208,7 +212,7 @@ export async function withWorkspaceLock<T>(stateDir: string, name: string, actio
     if (await acquireOwnedDirectory(lockPath, locksDir, lockName, deadline, name)) break;
   }
   try {
-    if (await loadManualRecovery(stateDir, lockName)) throw manualRecoveryError(name);
+    if (!allowManualRecovery && await loadManualRecovery(stateDir, lockName)) throw manualRecoveryError(name);
   } catch (error) {
     await rm(lockPath, { recursive: true, force: true });
     throw error;

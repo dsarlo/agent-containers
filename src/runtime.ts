@@ -2,7 +2,7 @@ import { readFile } from 'node:fs/promises';
 import { parse, type ParseError } from 'jsonc-parser';
 import { resolve } from 'node:path';
 import type { ProcessResult, ProcessRunner, ProcessRunOptions } from './types.js';
-import type { WorkspaceMetadata } from './state.js';
+import { clearManualRecovery, recordManualRecovery, withWorkspaceLock, type WorkspaceMetadata } from './state.js';
 
 export type { ProcessRunner } from './types.js';
 
@@ -17,6 +17,20 @@ export interface ManualRecovery {
 
 type RecoveryRecorder = (recovery: ManualRecovery) => Promise<void>;
 type RecoveryClearer = () => Promise<void>;
+
+/** Run the remote lifecycle under its durable workspace lock and recovery guard. */
+export async function execWorkspaceLifecycle(metadata: WorkspaceMetadata, command: string[], runner: ProcessRunner, save: (metadata: WorkspaceMetadata) => Promise<void>, stateDir: string, readConfig: (path: string) => Promise<string> = (path) => readFile(path, 'utf8')): Promise<ProcessResult> {
+  return withWorkspaceLock(stateDir, metadata.name, (signal) => execWorkspace(
+    metadata,
+    command,
+    runner,
+    save,
+    readConfig,
+    signal,
+    (recovery) => recordManualRecovery(stateDir, metadata.name, recovery),
+    () => clearManualRecovery(stateDir, metadata.name),
+  ));
+}
 
 export async function execWorkspace(metadata: WorkspaceMetadata, command: string[], runner: ProcessRunner, save: (metadata: WorkspaceMetadata) => Promise<void>, readConfig: (path: string) => Promise<string> = (path) => readFile(path, 'utf8'), signal?: AbortSignal, recordRecovery: RecoveryRecorder = missingRecoveryRecorder, clearRecovery: RecoveryClearer = missingRecoveryClearer): Promise<ProcessResult> {
   if (command.length === 0) throw new Error('A command is required after --.');
@@ -36,9 +50,21 @@ export async function execWorkspace(metadata: WorkspaceMetadata, command: string
     await save({ ...metadata, containerId });
   } catch (error: unknown) {
     const detail = error instanceof Error ? error.message : String(error);
+    const cleanupSignal = AbortSignal.timeout(5_000);
+    let inspection: ProcessResult;
+    try {
+      inspection = await runner.run('docker', ['inspect', '--format', '{{ index .Config.Labels "devcontainer.local_folder" }}', containerId], withSignal(undefined, cleanupSignal));
+    } catch (inspectionError: unknown) {
+      const inspectionDetail = inspectionError instanceof Error ? inspectionError.message : String(inspectionError);
+      throw new Error(`Could not persist container metadata (${detail}); did not remove unverified container ${containerId} because Docker inspection failed: ${inspectionDetail}. The manual recovery block remains in place.`, { cause: inspectionError });
+    }
+    if (inspection.code !== 0 || inspection.stdout.trim() !== metadata.worktree) {
+      const inspectionDetail = inspection.code !== 0 ? commandDetail(inspection) : 'its devcontainer.local_folder label does not exactly match the recorded worktree';
+      throw new Error(`Could not persist container metadata (${detail}); did not remove unverified container ${containerId} because ${inspectionDetail}. The manual recovery block remains in place.`, { cause: error });
+    }
     let cleanup: ProcessResult;
     try {
-      cleanup = await runner.run('docker', ['rm', '-f', containerId], withSignal(undefined, AbortSignal.timeout(5_000)));
+      cleanup = await runner.run('docker', ['rm', '-f', containerId], withSignal(undefined, cleanupSignal));
     } catch (cleanupError: unknown) {
       const cleanupDetail = cleanupError instanceof Error ? cleanupError.message : String(cleanupError);
       throw new Error(`Could not persist container metadata (${detail}) and could not remove untracked container ${containerId}: ${cleanupDetail}.`, { cause: cleanupError });
@@ -108,7 +134,7 @@ async function recordAmbiguousUp(recordRecovery: RecoveryRecorder, metadata: Wor
 }
 
 function isDockerContainerId(value: string): boolean {
-  return /^[a-f0-9]{12,64}$/i.test(value);
+  return /^[a-f0-9]{12,64}$/.test(value);
 }
 
 function commandDetail(result: ProcessResult): string {
@@ -149,8 +175,10 @@ function withSignal(options: Omit<ProcessRunOptions, 'signal'> | undefined, sign
 function containerIdFromOutput(output: string): string | undefined {
   for (const line of output.trim().split('\n').reverse()) {
     try {
-      const parsed = JSON.parse(line) as { containerId?: unknown };
-      return typeof parsed.containerId === 'string' && parsed.containerId.length > 0 ? parsed.containerId : undefined;
+      const parsed = JSON.parse(line) as { outcome?: unknown; containerId?: unknown };
+      return parsed.outcome === 'success' && typeof parsed.containerId === 'string' && isDockerContainerId(parsed.containerId)
+        ? parsed.containerId
+        : undefined;
     } catch { /* log lines may precede terminal JSON */ }
   }
   return undefined;
