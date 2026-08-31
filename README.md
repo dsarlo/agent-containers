@@ -71,15 +71,18 @@ agent-containers validate [--config path]
 agent-containers create <name> [--base branch]
 agent-containers exec <name> -- <command...>
 agent-containers run <name> -- <agent command...>
+agent-containers recover <name> --yes --remote-command-stopped
 agent-containers unlock <name> --yes
 agent-containers status [name]
 agent-containers remove <name> --yes [--skip-container-cleanup]
 ```
 
 - `init --force` atomically replaces only the configuration path; it refuses symlinks and cannot overwrite a hard-link peer.
-- `exec` and `run` pass each argument directly to Dev Containers without host-shell interpolation and inherit the invoking terminal for interactive tools.
+- `exec` and `run` pass each argument directly to Dev Containers without host-shell interpolation and inherit the invoking terminal for interactive tools. Ctrl-C/SIGTERM is forwarded to the **local** Dev Containers CLI, but that cannot prove an in-container command stopped. After the local CLI is reaped, Agent Containers writes a durable manual-recovery block and refuses `create`, `exec`, `run`, and `remove` for that workspace.
+- `recover <name> --yes --remote-command-stopped` is an explicit operator acknowledgement, not remote cleanup: first inspect the container (and its logs/processes) yourself and stop or wait for the in-container command as appropriate; then use this command to clear the block. It neither stops nor removes a container. `unlock` never clears manual recovery, even after the original PID has died.
+- If an interrupted `devcontainer up` lacks terminal JSON, Agent Containers runs `docker ps --all --quiet --filter label=devcontainer.local_folder=<recorded-worktree>` and independently verifies each candidate's exact label. It records one exact match as the workspace container, but **every** interrupted-start result—including zero matches, multiple candidates, or Docker inspection failure—blocks for manual recovery because provisioning may still continue. It never deletes a discovered resource.
 - `status` reads local metadata and works without Docker or Dev Containers.
-- `unlock <name> --yes` releases only a lock whose recorded local owner PID has exited; it refuses active or malformed locks. Use it after a machine crash or force-kill, never for a command that may still be running.
+- `unlock <name> --yes` releases only a normal lock whose recorded local owner PID has exited; it refuses active or malformed locks. Use it after a machine crash or force-kill, never for a command that may still be running.
 - `remove` requires `--yes`, verifies recorded resource identity and ownership, and checkpoints completed cleanup stages for safe retries.
 
 ## v0.1 limitations and recovery

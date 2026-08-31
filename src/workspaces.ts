@@ -105,18 +105,26 @@ export async function createWorkspace(options: {
   const branchResult = await options.runner.run('git', ['show-ref', '--verify', '--quiet', `refs/heads/${branch}`], withSignal({ cwd: root }, options.signal));
   if (branchResult.code === 0) throw new Error(`Git branch ${branch} already exists.`);
   if (branchResult.code !== 1) throw commandError('git show-ref', branchResult);
-  const baseBranch = options.baseBranch ?? options.config.workspace.baseBranch;
+  const baseRef = localBaseRef(options.baseBranch ?? options.config.workspace.baseBranch);
+  const base = await options.runner.run('git', ['show-ref', '--verify', '--quiet', baseRef], withSignal({ cwd: root }, options.signal));
+  if (base.code === 1) throw new Error(`Base must name an existing local branch under refs/heads/: ${baseRef}.`);
+  if (base.code !== 0) throw commandError('git show-ref', base);
   const relativePaths = await supportsRelativeWorktreePaths(root, options.runner, options.signal);
   if (!relativePaths) throw new Error('Agent Containers requires Git support for git worktree add --relative-paths so Dev Containers can use Git inside linked worktrees.');
-  const result = await options.runner.run('git', ['worktree', 'add', '--relative-paths', '-b', branch, worktree, baseBranch], withSignal({ cwd: root }, options.signal));
-  if (result.code !== 0) throw commandError('git worktree add', result);
+  let result: ProcessResult;
+  try {
+    result = await options.runner.run('git', ['worktree', 'add', '--relative-paths', '-b', branch, worktree, baseRef], withSignal({ cwd: root }, options.signal));
+  } catch (error: unknown) {
+    throw await worktreeAddRecoveryError(error, root, worktree, branch, options.runner);
+  }
+  if (result.code !== 0) throw await worktreeAddRecoveryError(commandError('git worktree add', result), root, worktree, branch, options.runner);
   const metadata: WorkspaceMetadata = {
     version: 1,
     name,
     repoRoot: root,
     worktree: await canonicalPath(worktree),
     branch,
-    baseBranch,
+    baseRef,
     devcontainerPath: options.config.environment.devcontainerPath,
     createdAt: new Date().toISOString(),
   };
@@ -154,7 +162,7 @@ export async function removeWorkspace(metadata: WorkspaceMetadata, options: { co
   let branchPresent = false;
   let branchOid: string | undefined;
   let baseOid: string | undefined;
-  const baseRef = `refs/heads/${current.baseBranch}`;
+  const baseRef = current.baseRef;
   if (!current.cleanup?.branch) {
     const branch = await runner.run('git', ['show-ref', '--verify', '--quiet', `refs/heads/${current.branch}`], withSignal({ cwd: current.repoRoot }, options.signal));
     if (branch.code === 0) branchPresent = true;
@@ -167,9 +175,9 @@ export async function removeWorkspace(metadata: WorkspaceMetadata, options: { co
       const baseRevision = await runner.run('git', ['rev-parse', '--verify', baseRef], withSignal({ cwd: current.repoRoot }, options.signal));
       if (baseRevision.code !== 0) throw commandError('git rev-parse', baseRevision);
       baseOid = baseRevision.stdout.trim();
-      if (!/^[0-9a-f]{40,64}$/i.test(baseOid)) throw new Error(`git rev-parse returned an invalid base object ID for ${current.baseBranch}.`);
+      if (!/^[0-9a-f]{40,64}$/i.test(baseOid)) throw new Error(`git rev-parse returned an invalid base object ID for ${baseRef}.`);
       const merged = await runner.run('git', ['merge-base', '--is-ancestor', branchOid, baseOid], withSignal({ cwd: current.repoRoot }, options.signal));
-      if (merged.code === 1) throw new Error(`Refusing to remove unmerged branch ${current.branch}; merge it into ${current.baseBranch} first.`);
+      if (merged.code === 1) throw new Error(`Refusing to remove unmerged branch ${current.branch}; merge it into ${baseRef} first.`);
       if (merged.code !== 0) throw commandError('git merge-base', merged);
     }
   }
@@ -235,6 +243,23 @@ async function supportsRelativeWorktreePaths(cwd: string, runner: ProcessRunner,
   return /(?:^|\s)--(?:\[no-\])?relative-paths(?=\s|$)/m.test(`${help.stdout}\n${help.stderr}`);
 }
 
+async function worktreeAddRecoveryError(cause: unknown, repoRoot: string, worktree: string, branch: string, runner: ProcessRunner): Promise<Error> {
+  const inspectionSignal = AbortSignal.timeout(5_000);
+  const branchRef = `refs/heads/${branch}`;
+  let branchState: string;
+  let worktreeState: string;
+  try {
+    const branchResult = await runner.run('git', ['show-ref', '--verify', '--quiet', branchRef], withSignal({ cwd: repoRoot }, inspectionSignal));
+    branchState = branchResult.code === 0 ? 'present' : branchResult.code === 1 ? 'absent' : `inspection failed (${branchResult.code})`;
+  } catch { branchState = 'inspection failed'; }
+  try {
+    const worktrees = await runner.run('git', ['worktree', 'list', '--porcelain'], withSignal({ cwd: repoRoot }, inspectionSignal));
+    worktreeState = worktrees.code === 0 && worktrees.stdout.split('\n').some((line) => line === `worktree ${worktree}`) ? 'present' : worktrees.code === 0 ? 'absent' : `inspection failed (${worktrees.code})`;
+  } catch { worktreeState = 'inspection failed'; }
+  const detail = cause instanceof Error ? cause.message : String(cause);
+  return new Error(`${detail}. A failed or interrupted git worktree add may have created data; Agent Containers left it intact. Inspect with git worktree list: expected worktree ${worktree} is ${worktreeState}; expected local branch ${branchRef} is ${branchState}. Do not delete either until you have reviewed it.`, { cause });
+}
+
 function recordedWorktreeState(output: string, metadata: WorkspaceMetadata): 'present' | 'absent' | 'mismatch' {
   let path: string | undefined;
   let branch: string | undefined;
@@ -267,6 +292,13 @@ function withCleanup(metadata: WorkspaceMetadata, step: 'container' | 'worktree'
 function commandError(command: string, result: ProcessResult): Error {
   const detail = result.stderr.trim() || result.stdout.trim() || `exit code ${result.code}`;
   return new Error(`${command} failed: ${detail}`);
+}
+
+function localBaseRef(base: string): string {
+  if (!base || base.startsWith('refs/') || base.startsWith('origin/') || /^[0-9a-f]{40,64}$/i.test(base)) {
+    throw new Error('Base must be a local branch name that resolves under refs/heads/.');
+  }
+  return `refs/heads/${base}`;
 }
 
 function isNodeError(error: unknown, code: string): error is NodeJS.ErrnoException {

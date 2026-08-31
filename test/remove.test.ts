@@ -6,7 +6,7 @@ import test from 'node:test';
 import { removeWorkspace } from '../src/workspaces.js';
 import type { WorkspaceMetadata } from '../src/state.js';
 
-const metadata: WorkspaceMetadata = { version: 1, name: 'safe', repoRoot: '/repo', worktree: '/repo/worktrees/safe', branch: 'agent-containers/safe', baseBranch: 'main', devcontainerPath: '.devcontainer/devcontainer.json', createdAt: '2026-01-01T00:00:00.000Z', containerId: 'abc' };
+const metadata: WorkspaceMetadata = { version: 1, name: 'safe', repoRoot: '/repo', worktree: '/repo/worktrees/safe', branch: 'agent-containers/safe', baseRef: 'refs/heads/main', devcontainerPath: '.devcontainer/devcontainer.json', createdAt: '2026-01-01T00:00:00.000Z', containerId: 'abc' };
 
 test('removeWorkspace requires confirmation and records every safe destructive command', async () => {
   const calls: Array<{ command: string; args: string[]; cwd?: string; stdio?: string }> = [];

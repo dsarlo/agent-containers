@@ -3,10 +3,11 @@ import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promise
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
+import * as state from '../src/state.js';
 import { loadMetadata, releaseStaleWorkspaceLock, saveMetadata, withWorkspaceLock, type WorkspaceMetadata } from '../src/state.js';
 import type { ProcessRunner } from '../src/types.js';
 
-const metadata: WorkspaceMetadata = { version: 1, name: 'safe', repoRoot: '/repo', worktree: '/repo/worktrees/safe', branch: 'agent-containers/safe', baseBranch: 'main', devcontainerPath: '.devcontainer/devcontainer.json', createdAt: '2026-01-01T00:00:00.000Z' };
+const metadata: WorkspaceMetadata = { version: 1, name: 'safe', repoRoot: '/repo', worktree: '/repo/worktrees/safe', branch: 'agent-containers/safe', baseRef: 'refs/heads/main', devcontainerPath: '.devcontainer/devcontainer.json', createdAt: '2026-01-01T00:00:00.000Z' };
 
 test('metadata rejects a filename/name mismatch and non-canonical paths', async () => {
   const stateDir = await mkdtemp(join(tmpdir(), 'agent-containers-state-'));
@@ -24,6 +25,21 @@ test('metadata writes are atomic and never expose a predictable temporary file',
   assert.deepEqual(JSON.parse(content), metadata);
   await writeFile(join(stateDir, 'workspaces', '.safe.json.tmp'), 'partial');
   assert.deepEqual(JSON.parse(await readFile(join(stateDir, 'workspaces', 'safe.json'), 'utf8')), metadata);
+});
+
+test('a durable manual recovery blocks lifecycle and stale-PID unlock until an explicit operator acknowledgement', async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), 'agent-containers-manual-recovery-'));
+  const recoveryApi = state as unknown as {
+    recordManualRecovery: (stateDir: string, name: string, recovery: { reason: string; containerIds: string[]; worktree: string }) => Promise<void>;
+    clearManualRecovery: (stateDir: string, name: string) => Promise<void>;
+  };
+  await recoveryApi.recordManualRecovery(stateDir, 'safe', { reason: 'remote-exec-interrupted', containerIds: ['container-1'], worktree: '/repo/worktrees/safe' });
+  await assert.rejects(() => withWorkspaceLock(stateDir, 'safe', async () => undefined), /manual recovery.*recover safe --yes --remote-command-stopped/i);
+  await assert.rejects(() => releaseStaleWorkspaceLock(stateDir, 'safe', () => false), /manual recovery/i);
+  await recoveryApi.clearManualRecovery(stateDir, 'safe');
+  let acquired = false;
+  await withWorkspaceLock(stateDir, 'safe', async () => { acquired = true; });
+  assert.equal(acquired, true);
 });
 
 test('withWorkspaceLock serializes same-name lifecycle operations across contenders', async () => {
@@ -119,6 +135,22 @@ test('stale lock recovery serializes validation and removal with a new lifecycle
   await Promise.all([recovering, contender]);
   assert.equal(contenderRan, true);
 });
+
+test('unlock reclaims a dead published recovery owner after an interrupted unlock and can retry safely', async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), 'agent-containers-unlock-retry-'));
+  const locksDir = join(stateDir, 'locks');
+  const lockPath = join(locksDir, 'safe.lock');
+  const recoveryPath = join(locksDir, 'safe.recovery');
+  await mkdir(lockPath, { recursive: true });
+  await writeFile(join(lockPath, 'owner.json'), JSON.stringify({ pid: 424242, token: '66666666-6666-4666-8666-666666666666' }));
+  await mkdir(recoveryPath, { recursive: true });
+  await writeFile(join(recoveryPath, 'owner.json'), JSON.stringify({ pid: 424242, token: '77777777-7777-4777-8777-777777777777' }));
+  await releaseStaleWorkspaceLock(stateDir, 'safe', () => false, {}, 100);
+  let acquired = false;
+  await withWorkspaceLock(stateDir, 'safe', async () => { acquired = true; });
+  assert.equal(acquired, true);
+});
+
 
 test('lock acquisition ignores interrupted unpublished lock and recovery creation stages', async () => {
   const stateDir = await mkdtemp(join(tmpdir(), 'agent-containers-lock-crash-'));

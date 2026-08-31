@@ -10,7 +10,8 @@ export interface WorkspaceMetadata {
   repoRoot: string;
   worktree: string;
   branch: string;
-  baseBranch: string;
+  /** Verified local branch ref used as the immutable cleanup base. */
+  baseRef: string;
   devcontainerPath: string;
   createdAt: string;
   containerId?: string;
@@ -32,12 +33,65 @@ interface LockOwner {
   createdAt?: string;
 }
 
+export interface ManualRecovery {
+  version: 1;
+  reason: 'remote-exec-interrupted' | 'devcontainer-up-ambiguous';
+  containerIds: string[];
+  worktree: string;
+  createdAt: string;
+}
+
+export interface ManualRecoveryInput {
+  reason: ManualRecovery['reason'];
+  containerIds: string[];
+  worktree: string;
+}
+
 export function defaultStateDir(environment: NodeJS.ProcessEnv = process.env): string {
   return join(environment.XDG_STATE_HOME || join(homedir(), '.local', 'state'), 'agent-containers');
 }
 
 export function metadataPath(stateDir: string, name: string): string {
   return join(stateDir, 'workspaces', `${validateWorkspaceName(name)}.json`);
+}
+
+function manualRecoveryPath(stateDir: string, name: string): string {
+  return join(stateDir, 'locks', `${validateWorkspaceName(name)}.manual-recovery.json`);
+}
+
+/** Persist a recovery barrier before a lifecycle can release after remote completion is unknown. */
+export async function recordManualRecovery(stateDir: string, name: string, input: ManualRecoveryInput): Promise<void> {
+  const recovery: ManualRecovery = { version: 1, ...input, createdAt: new Date().toISOString() };
+  if (!isManualRecovery(recovery)) throw new Error('Refusing to save invalid manual recovery state.');
+  const path = manualRecoveryPath(stateDir, name);
+  const directory = join(stateDir, 'locks');
+  await mkdir(directory, { recursive: true, mode: 0o700 });
+  const temporaryPath = join(directory, `.${validateWorkspaceName(name)}.${randomUUID()}.manual-recovery.tmp`);
+  try {
+    await writeFile(temporaryPath, `${JSON.stringify(recovery, null, 2)}\n`, { encoding: 'utf8', flag: 'wx', mode: 0o600 });
+    await rename(temporaryPath, path);
+  } catch (error) {
+    await rm(temporaryPath, { force: true });
+    throw error;
+  }
+}
+
+export async function loadManualRecovery(stateDir: string, name: string): Promise<ManualRecovery | undefined> {
+  try {
+    const recovery: unknown = JSON.parse(await readFile(manualRecoveryPath(stateDir, name), 'utf8'));
+    if (!isManualRecovery(recovery)) throw new Error(`Manual recovery state for ${name} is invalid; refusing to release lifecycle protection.`);
+    return recovery;
+  } catch (error: unknown) {
+    if (isNodeError(error, 'ENOENT')) return undefined;
+    throw error;
+  }
+}
+
+/** This is deliberately separate from `unlock`: it records an operator's explicit remote-state acknowledgement. */
+export async function clearManualRecovery(stateDir: string, name: string): Promise<void> {
+  const recovery = await loadManualRecovery(stateDir, name);
+  if (!recovery) throw new Error(`No manual recovery block exists for workspace "${name}".`);
+  await rm(manualRecoveryPath(stateDir, name), { force: false });
 }
 
 export async function loadMetadata(stateDir: string, name: string): Promise<WorkspaceMetadata | undefined> {
@@ -91,7 +145,7 @@ export function isAgentContainersWorkspace(metadata: unknown): metadata is Works
     'branch' in metadata && metadata.branch === `agent-containers/${metadata.name}` &&
     'worktree' in metadata && isCanonicalPath(metadata.worktree) &&
     'repoRoot' in metadata && isCanonicalPath(metadata.repoRoot) &&
-    'baseBranch' in metadata && typeof metadata.baseBranch === 'string' &&
+    'baseRef' in metadata && isLocalBranchRef(metadata.baseRef) &&
     'devcontainerPath' in metadata && typeof metadata.devcontainerPath === 'string' &&
     'createdAt' in metadata && typeof metadata.createdAt === 'string' &&
     (!('containerId' in metadata) || metadata.containerId === undefined || (typeof metadata.containerId === 'string' && metadata.containerId.length > 0)) &&
@@ -102,9 +156,27 @@ function isCanonicalPath(value: unknown): value is string {
   return typeof value === 'string' && isAbsolute(value) && resolve(value) === value;
 }
 
+function isLocalBranchRef(value: unknown): value is string {
+  return typeof value === 'string' && /^refs\/heads\/.+/.test(value) &&
+    !/[\s~^:?*\\[]/.test(value) && ![...value].some((character) => character.charCodeAt(0) <= 0x1f) &&
+    !value.endsWith('.') && !value.endsWith('/');
+}
+
 function isCleanupState(value: unknown): boolean {
   return typeof value === 'object' && value !== null && Object.entries(value).every(([key, completed]) =>
     ['container', 'worktree', 'branch'].includes(key) && typeof completed === 'boolean');
+}
+
+function isManualRecovery(value: unknown): value is ManualRecovery {
+  const candidate = typeof value === 'object' && value !== null ? value as Partial<ManualRecovery> : undefined;
+  return candidate?.version === 1 &&
+    (candidate.reason === 'remote-exec-interrupted' || candidate.reason === 'devcontainer-up-ambiguous') &&
+    Array.isArray(candidate.containerIds) && candidate.containerIds.every((id) => typeof id === 'string' && id.length > 0) &&
+    isCanonicalPath(candidate.worktree) && typeof candidate.createdAt === 'string';
+}
+
+function manualRecoveryError(name: string): Error {
+  return new Error(`Workspace "${name}" is blocked by durable manual recovery because a remote Dev Container operation may still be active. Verify the remote command/container state, then run agent-containers recover ${name} --yes --remote-command-stopped. The ordinary unlock command never clears this block.`);
 }
 
 export interface WorkspaceLockOptions {
@@ -124,6 +196,12 @@ export async function withWorkspaceLock<T>(stateDir: string, name: string, actio
   while (true) {
     await waitForRecoveryToFinish(recoveryPath, deadline, name);
     if (await acquireOwnedDirectory(lockPath, locksDir, lockName, deadline, name)) break;
+  }
+  try {
+    if (await loadManualRecovery(stateDir, lockName)) throw manualRecoveryError(name);
+  } catch (error) {
+    await rm(lockPath, { recursive: true, force: true });
+    throw error;
   }
   const cancellation = new AbortController();
   let receivedSignal: NodeJS.Signals | undefined;
@@ -158,7 +236,8 @@ export async function releaseStaleWorkspaceLock(stateDir: string, name: string, 
   const lockPath = join(locksDir, `${lockName}.lock`);
   const recoveryPath = join(locksDir, `${lockName}.recovery`);
   await mkdir(locksDir, { recursive: true, mode: 0o700 });
-  await acquireRecoveryLock(recoveryPath, locksDir, lockName, Date.now() + timeoutMs, name);
+  if (await loadManualRecovery(stateDir, lockName)) throw manualRecoveryError(name);
+  await acquireRecoveryLock(recoveryPath, locksDir, lockName, Date.now() + timeoutMs, name, isPidAlive);
   try {
     let owner: unknown;
     try {
@@ -205,9 +284,22 @@ async function waitForRecoveryToFinish(recoveryPath: string, deadline: number, n
   }
 }
 
-async function acquireRecoveryLock(recoveryPath: string, locksDir: string, lockName: string, deadline: number, name: string): Promise<void> {
+async function acquireRecoveryLock(recoveryPath: string, locksDir: string, lockName: string, deadline: number, name: string, isPidAlive: (pid: number) => boolean): Promise<void> {
   while (true) {
+    await reclaimDeadPublishedLock(recoveryPath, isPidAlive);
     if (await acquireOwnedDirectory(recoveryPath, locksDir, `${lockName}.recovery`, deadline, name)) return;
+  }
+}
+
+async function reclaimDeadPublishedLock(path: string, isPidAlive: (pid: number) => boolean): Promise<void> {
+  const owner = await readLockOwner(path);
+  if (!owner || isPidAlive(owner.pid)) return;
+  const abandonedPath = `${path}.${owner.token}.abandoned`;
+  try {
+    await rename(path, abandonedPath);
+    await rm(abandonedPath, { recursive: true, force: false });
+  } catch (error: unknown) {
+    if (!isNodeError(error, 'ENOENT')) throw error;
   }
 }
 

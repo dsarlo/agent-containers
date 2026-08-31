@@ -30,6 +30,10 @@ test('CLI help returns success and describes public commands', async () => {
   const messages: string[] = [];
   assert.equal(await runCli(['--help'], process.cwd(), (message) => messages.push(message)), 0);
   assert.match(messages[0], /unlock/);
+  assert.match(messages[0], /recover/);
+  const recoveryMessages: string[] = [];
+  assert.equal(await runCli(['recover', 'safe', '--yes'], process.cwd(), (message) => recoveryMessages.push(message)), 2);
+  assert.match(recoveryMessages.at(-1) ?? '', /--remote-command-stopped/);
 });
 
 test('init and implicit validation resolve the repository root from a subdirectory', async () => {

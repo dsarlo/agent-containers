@@ -1,6 +1,6 @@
 import { join, resolve } from 'node:path';
 import { initConfig, loadConfig } from './config.js';
-import { defaultStateDir, deleteMetadata, listMetadata, loadMetadata, releaseStaleWorkspaceLock, saveMetadata, withWorkspaceLock } from './state.js';
+import { clearManualRecovery, defaultStateDir, deleteMetadata, listMetadata, loadMetadata, recordManualRecovery, releaseStaleWorkspaceLock, saveMetadata, withWorkspaceLock } from './state.js';
 import { execWorkspace } from './runtime.js';
 import { createWorkspace, findGitRoot, nodeProcessRunner, removeWorkspace } from './workspaces.js';
 
@@ -48,8 +48,18 @@ export async function runCli(args: string[], cwd = process.cwd(), write: (messag
         await withWorkspaceLock(stateDir, name, async (signal) => {
           const metadata = await loadMetadata(stateDir, name);
           if (!metadata) throw new Error(`No Agent Containers workspace named "${name}".`);
-          await execWorkspace(metadata, rest.slice(separator + 1), nodeProcessRunner, (next) => saveMetadata(stateDir, next), undefined, signal);
+          await execWorkspace(metadata, rest.slice(separator + 1), nodeProcessRunner, (next) => saveMetadata(stateDir, next), undefined, signal, (recovery) => recordManualRecovery(stateDir, name, recovery));
         });
+        return 0;
+      }
+      case 'recover': {
+        const name = requiredPositional(rest, 'workspace name');
+        ensureOnly(rest.slice(1), ['--yes', '--remote-command-stopped']);
+        if (!rest.includes('--yes') || !rest.includes('--remote-command-stopped')) {
+          throw new UsageError('Usage: agent-containers recover <name> --yes --remote-command-stopped');
+        }
+        await clearManualRecovery(stateDir, name);
+        write(`Cleared manual recovery block for ${name}; this acknowledgement did not stop or remove any remote container.`);
         return 0;
       }
       case 'unlock': {
@@ -120,5 +130,5 @@ function ensureOptions(args: string[], allowed: string[]): void {
 }
 
 function usage(): string {
-  return 'Usage: agent-containers <init|validate|create|exec|run|unlock|status|remove> [options]';
+  return 'Usage: agent-containers <init|validate|create|exec|run|recover|unlock|status|remove> [options]';
 }
