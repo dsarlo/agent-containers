@@ -4,7 +4,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { execWorkspace, type ProcessRunner } from '../src/runtime.js';
-import { clearManualRecovery, recordManualRecovery, withWorkspaceLock, type WorkspaceMetadata } from '../src/state.js';
+import { clearManualRecovery, loadManualRecovery, recordManualRecovery, withWorkspaceLock, type WorkspaceMetadata } from '../src/state.js';
+
+const noOpRecovery = async (): Promise<void> => undefined;
 
 const metadata: WorkspaceMetadata = {
   version: 1,
@@ -28,7 +30,7 @@ test('execWorkspace uses the linked-worktree mount, requires a current container
     },
   };
 
-  await execWorkspace(metadata, ['sh', '-lc', 'printf "$HOME;$(whoami)"'], runner, async (next) => { saved = next; }, async () => '{}');
+  await execWorkspace(metadata, ['sh', '-lc', 'printf "$HOME;$(whoami)"'], runner, async (next) => { saved = next; }, async () => '{}', undefined, noOpRecovery, noOpRecovery);
   assert.deepEqual(calls, [
     { command: 'devcontainer', args: ['up', '--workspace-folder', '/repo/worktrees/safe-name', '--config', '/repo/worktrees/safe-name/.devcontainer/devcontainer.json', '--log-format', 'json', '--mount-git-worktree-common-dir'], options: undefined },
     { command: 'devcontainer', args: ['exec', '--workspace-folder', '/repo/worktrees/safe-name', '--config', '/repo/worktrees/safe-name/.devcontainer/devcontainer.json', '--container-id', 'container-1', 'sh', '-lc', 'printf "$HOME;$(whoami)"'], options: { stdio: 'inherit' } },
@@ -38,7 +40,97 @@ test('execWorkspace uses the linked-worktree mount, requires a current container
 
 test('execWorkspace refuses successful up output without a terminal container ID', async () => {
   const runner: ProcessRunner = { async run() { return { code: 0, stdout: '{"outcome":"success"}\n', stderr: '' }; } };
-  await assert.rejects(() => execWorkspace(metadata, ['true'], runner, async () => undefined, async () => '{}'), /containerId/);
+  await assert.rejects(() => execWorkspace(metadata, ['true'], runner, async () => undefined, async () => '{}', undefined, noOpRecovery, noOpRecovery), /containerId/);
+});
+
+test('execWorkspace refuses dispatch when its durable pre-dispatch operation guard cannot be persisted', async () => {
+  const calls: string[] = [];
+  const runner: ProcessRunner = {
+    async run(command, args) {
+      calls.push(`${command} ${args[0]}`);
+      return args[0] === 'up'
+        ? { code: 0, stdout: '{"containerId":"container-1"}\n', stderr: '' }
+        : { code: 0, stdout: '', stderr: '' };
+    },
+  };
+
+  await assert.rejects(
+    () => (execWorkspace as (...args: unknown[]) => Promise<unknown>)(metadata, ['true'], runner, async () => undefined, async () => '{}', undefined, async () => { throw new Error('state disk full'); }),
+    /state disk full/,
+  );
+  assert.deepEqual(calls, [], 'no local Dev Containers command is dispatched without durable protection');
+});
+
+test('execWorkspace clears its pre-dispatch operation guard only after confirmed normal completion', async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), 'agent-containers-normal-operation-'));
+  const runner: ProcessRunner = {
+    async run(_command, args) {
+      return args[0] === 'up'
+        ? { code: 0, stdout: '{"containerId":"container-1"}\n', stderr: '' }
+        : { code: 0, stdout: '', stderr: '' };
+    },
+  };
+
+  await (execWorkspace as (...args: unknown[]) => Promise<unknown>)(
+    metadata,
+    ['true'],
+    runner,
+    async () => undefined,
+    async () => '{}',
+    undefined,
+    (recovery: { reason: 'operation-may-be-active' | 'remote-exec-interrupted' | 'devcontainer-up-ambiguous'; containerIds: string[]; worktree: string }) => recordManualRecovery(stateDir, metadata.name, recovery),
+    () => clearManualRecovery(stateDir, metadata.name),
+  );
+  assert.equal(await loadManualRecovery(stateDir, metadata.name), undefined);
+});
+
+test('a recovery writer failure during interruption leaves the durable pre-dispatch guard blocking lifecycle release', async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), 'agent-containers-interrupted-operation-'));
+  const lifecycle = new AbortController();
+  let writes = 0;
+  const runner: ProcessRunner = {
+    async run(_command, args, options) {
+      if (args[0] === 'up') return { code: 0, stdout: '{"containerId":"container-1"}\n', stderr: '' };
+      queueMicrotask(() => lifecycle.abort());
+      await new Promise<void>((resolve) => options?.signal?.addEventListener('abort', () => resolve(), { once: true }));
+      return { code: 143, stdout: '', stderr: 'local CLI interrupted' };
+    },
+  };
+  const record = async (recovery: { reason: 'operation-may-be-active' | 'remote-exec-interrupted' | 'devcontainer-up-ambiguous'; containerIds: string[]; worktree: string }): Promise<void> => {
+    writes += 1;
+    if (writes === 1) return recordManualRecovery(stateDir, metadata.name, recovery);
+    throw new Error('recovery storage failed');
+  };
+
+  await assert.rejects(
+    () => (execWorkspace as (...args: unknown[]) => Promise<unknown>)(metadata, ['true'], runner, async () => undefined, async () => '{}', lifecycle.signal, record, () => clearManualRecovery(stateDir, metadata.name)),
+    /recovery storage failed/,
+  );
+  assert.equal((await loadManualRecovery(stateDir, metadata.name))?.reason, 'operation-may-be-active');
+  await assert.rejects(() => withWorkspaceLock(stateDir, metadata.name, async () => undefined), /manual recovery/);
+});
+
+test('a nonzero devcontainer up reconciles exact-label candidates and records recovery without deleting a container', async () => {
+  const candidate = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
+  const calls: Array<{ command: string; args: string[] }> = [];
+  const records: Array<{ reason: string; containerIds: string[]; worktree: string }> = [];
+  const runner: ProcessRunner = {
+    async run(command, args) {
+      calls.push({ command, args });
+      if (command === 'devcontainer') return { code: 17, stdout: '', stderr: 'post-create provisioning failed' };
+      if (args[0] === 'ps') return { code: 0, stdout: `${candidate}\n`, stderr: '' };
+      if (args[0] === 'inspect') return { code: 0, stdout: metadata.worktree, stderr: '' };
+      throw new Error(`unexpected command: ${command} ${args.join(' ')}`);
+    },
+  };
+
+  await assert.rejects(
+    () => (execWorkspace as (...args: unknown[]) => Promise<unknown>)(metadata, ['true'], runner, async () => undefined, async () => '{}', undefined, async (recovery: { reason: string; containerIds: string[]; worktree: string }) => { records.push(recovery); }, async () => undefined),
+    /manual recovery/,
+  );
+  assert.deepEqual(calls.filter((call) => call.command === 'docker').map((call) => call.args[0]), ['ps', 'inspect']);
+  assert.deepEqual(records.at(-1), { reason: 'devcontainer-up-ambiguous', containerIds: [candidate], worktree: metadata.worktree });
+  assert.equal(calls.some((call) => call.command === 'docker' && call.args[0] === 'rm'), false, 'reconciliation must never delete a candidate');
 });
 
 test('execWorkspace reconciles an interrupted up through an exact worktree label and then blocks for manual recovery', async () => {
@@ -95,7 +187,7 @@ test('interrupted up with no currently discoverable container still records a ma
 
 test('execWorkspace does not reuse an earlier container ID when terminal JSON omits it', async () => {
   const runner: ProcessRunner = { async run() { return { code: 0, stdout: '{"containerId":"stale"}\n{"outcome":"success"}\n', stderr: '' }; } };
-  await assert.rejects(() => execWorkspace(metadata, ['true'], runner, async () => undefined, async () => '{}'), /containerId/);
+  await assert.rejects(() => execWorkspace(metadata, ['true'], runner, async () => undefined, async () => '{}', undefined, noOpRecovery, noOpRecovery), /containerId/);
 });
 
 test('execWorkspace preserves a remote command exit code', async () => {
@@ -106,7 +198,7 @@ test('execWorkspace preserves a remote command exit code', async () => {
         : { code: 42, stdout: '', stderr: 'remote command failed' };
     },
   };
-  await assert.rejects(() => execWorkspace(metadata, ['false'], runner, async () => undefined, async () => '{}'), (error: unknown) => {
+  await assert.rejects(() => execWorkspace(metadata, ['false'], runner, async () => undefined, async () => '{}', undefined, noOpRecovery, noOpRecovery), (error: unknown) => {
     assert.equal((error as { exitCode?: number }).exitCode, 42);
     return true;
   });
@@ -139,7 +231,7 @@ test('execWorkspace accepts standards-compatible JSONC comments, strings, and tr
     "image": "example",
     /* block comment */
   }`;
-  await execWorkspace(metadata, ['true'], runner, async () => undefined, async () => config);
+  await execWorkspace(metadata, ['true'], runner, async () => undefined, async () => config, undefined, noOpRecovery, noOpRecovery);
   assert.equal(calls.length, 2);
 });
 
@@ -154,7 +246,7 @@ test('execWorkspace removes exactly the untracked container when saving its ID f
     },
   };
   await assert.rejects(
-    () => execWorkspace(metadata, ['true'], runner, async () => { throw new Error('state disk full'); }, async () => '{}'),
+    () => execWorkspace(metadata, ['true'], runner, async () => { throw new Error('state disk full'); }, async () => '{}', undefined, noOpRecovery, noOpRecovery),
     /state disk full.*removed untracked container new-container/s,
   );
   assert.deepEqual(calls.at(-1), { command: 'docker', args: ['rm', '-f', 'new-container'] });
@@ -170,7 +262,7 @@ test('execWorkspace never removes a reused recorded container when persisting it
         : { code: 0, stdout: '', stderr: '' };
     },
   };
-  await execWorkspace({ ...metadata, containerId: 'existing-container' }, ['true'], runner, async () => { throw new Error('must not rewrite known container'); }, async () => '{}');
+  await execWorkspace({ ...metadata, containerId: 'existing-container' }, ['true'], runner, async () => { throw new Error('must not rewrite known container'); }, async () => '{}', undefined, noOpRecovery, noOpRecovery);
   assert.equal(calls.some((call) => call.command === 'docker' && call.args[0] === 'rm'), false);
   assert.equal(calls.filter((call) => call.command === 'devcontainer').length, 2);
 });
@@ -186,7 +278,7 @@ test('execWorkspace cleanup uses a fresh bounded signal after the lifecycle sign
     },
   };
   await assert.rejects(
-    () => execWorkspace(metadata, ['true'], runner, async () => { lifecycle.abort(); throw new Error('state disk full'); }, async () => '{}', lifecycle.signal),
+    () => execWorkspace(metadata, ['true'], runner, async () => { lifecycle.abort(); throw new Error('state disk full'); }, async () => '{}', lifecycle.signal, noOpRecovery, noOpRecovery),
     /removed untracked container new-container/,
   );
   assert.ok(cleanupSignal, 'cleanup receives its own bounded signal');
@@ -251,7 +343,7 @@ test('a cancelled remote exec records one durable block and prevents a concurren
   finishRemote();
   await assert.rejects(() => executing, /remote command may still be active/);
   assert.match(String(await observedRemove), /manual recovery/);
-  assert.equal(recoveryWrites, 1, 'repeated interruption does not create a second recovery record');
+  assert.equal(recoveryWrites, 2, 'the pre-dispatch guard is promoted once when the local remote-exec transport is interrupted');
   assert.ok(await observedExecution);
   await clearManualRecovery(stateDir, 'safe-name');
   await withWorkspaceLock(stateDir, 'safe-name', async () => { removalRan = true; });
@@ -267,7 +359,7 @@ test('execWorkspace reports both metadata and exact container cleanup failures',
     },
   };
   await assert.rejects(
-    () => execWorkspace(metadata, ['true'], runner, async () => { throw new Error('state disk full'); }, async () => '{}'),
+    () => execWorkspace(metadata, ['true'], runner, async () => { throw new Error('state disk full'); }, async () => '{}', undefined, noOpRecovery, noOpRecovery),
     /state disk full.*could not remove untracked container new-container: permission denied/s,
   );
 });
@@ -280,7 +372,7 @@ test('execWorkspace preserves recovery context when exact container cleanup thro
     },
   };
   await assert.rejects(
-    () => execWorkspace(metadata, ['true'], runner, async () => { throw new Error('state disk full'); }, async () => '{}'),
+    () => execWorkspace(metadata, ['true'], runner, async () => { throw new Error('state disk full'); }, async () => '{}', undefined, noOpRecovery, noOpRecovery),
     /state disk full.*could not remove untracked container new-container: docker executable missing/s,
   );
 });

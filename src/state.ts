@@ -1,4 +1,4 @@
-import { lstat, mkdir, readdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, open, readdir, readFile, rename, rm, writeFile, type FileHandle } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { isAbsolute, join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -35,7 +35,7 @@ interface LockOwner {
 
 export interface ManualRecovery {
   version: 1;
-  reason: 'remote-exec-interrupted' | 'devcontainer-up-ambiguous';
+  reason: 'operation-may-be-active' | 'remote-exec-interrupted' | 'devcontainer-up-ambiguous';
   containerIds: string[];
   worktree: string;
   createdAt: string;
@@ -67,10 +67,26 @@ export async function recordManualRecovery(stateDir: string, name: string, input
   const directory = join(stateDir, 'locks');
   await mkdir(directory, { recursive: true, mode: 0o700 });
   const temporaryPath = join(directory, `.${validateWorkspaceName(name)}.${randomUUID()}.manual-recovery.tmp`);
+  await durableReplace(temporaryPath, path, directory, `${JSON.stringify(recovery, null, 2)}\n`);
+}
+
+async function durableReplace(temporaryPath: string, path: string, directory: string, content: string): Promise<void> {
+  let file: FileHandle | undefined;
   try {
-    await writeFile(temporaryPath, `${JSON.stringify(recovery, null, 2)}\n`, { encoding: 'utf8', flag: 'wx', mode: 0o600 });
+    file = await open(temporaryPath, 'wx', 0o600);
+    await file.writeFile(content, 'utf8');
+    await file.sync();
+    await file.close();
+    file = undefined;
     await rename(temporaryPath, path);
+    const parent = await open(directory, 'r');
+    try {
+      await parent.sync();
+    } finally {
+      await parent.close();
+    }
   } catch (error) {
+    await file?.close();
     await rm(temporaryPath, { force: true });
     throw error;
   }
@@ -114,13 +130,7 @@ export async function saveMetadata(stateDir: string, metadata: WorkspaceMetadata
   const directory = join(stateDir, 'workspaces');
   await mkdir(directory, { recursive: true });
   const temporaryPath = join(directory, `.${metadata.name}.${randomUUID()}.tmp`);
-  try {
-    await writeFile(temporaryPath, `${JSON.stringify(metadata, null, 2)}\n`, { encoding: 'utf8', flag: 'wx', mode: 0o600 });
-    await rename(temporaryPath, path);
-  } catch (error) {
-    await rm(temporaryPath, { force: true });
-    throw error;
-  }
+  await durableReplace(temporaryPath, path, directory, `${JSON.stringify(metadata, null, 2)}\n`);
 }
 
 export async function deleteMetadata(stateDir: string, name: string): Promise<void> {
@@ -170,7 +180,7 @@ function isCleanupState(value: unknown): boolean {
 function isManualRecovery(value: unknown): value is ManualRecovery {
   const candidate = typeof value === 'object' && value !== null ? value as Partial<ManualRecovery> : undefined;
   return candidate?.version === 1 &&
-    (candidate.reason === 'remote-exec-interrupted' || candidate.reason === 'devcontainer-up-ambiguous') &&
+    (candidate.reason === 'operation-may-be-active' || candidate.reason === 'remote-exec-interrupted' || candidate.reason === 'devcontainer-up-ambiguous') &&
     Array.isArray(candidate.containerIds) && candidate.containerIds.every((id) => typeof id === 'string' && id.length > 0) &&
     isCanonicalPath(candidate.worktree) && typeof candidate.createdAt === 'string';
 }

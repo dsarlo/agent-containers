@@ -10,33 +10,28 @@ type DevcontainerConfig = Record<string, unknown>;
 
 /** Durable state required before releasing a lifecycle after remote completion is unknown. */
 export interface ManualRecovery {
-  reason: 'remote-exec-interrupted' | 'devcontainer-up-ambiguous';
+  reason: 'operation-may-be-active' | 'remote-exec-interrupted' | 'devcontainer-up-ambiguous';
   containerIds: string[];
   worktree: string;
 }
 
 type RecoveryRecorder = (recovery: ManualRecovery) => Promise<void>;
+type RecoveryClearer = () => Promise<void>;
 
-export async function execWorkspace(metadata: WorkspaceMetadata, command: string[], runner: ProcessRunner, save: (metadata: WorkspaceMetadata) => Promise<void>, readConfig: (path: string) => Promise<string> = (path) => readFile(path, 'utf8'), signal?: AbortSignal, recordRecovery: RecoveryRecorder = missingRecoveryRecorder): Promise<ProcessResult> {
+export async function execWorkspace(metadata: WorkspaceMetadata, command: string[], runner: ProcessRunner, save: (metadata: WorkspaceMetadata) => Promise<void>, readConfig: (path: string) => Promise<string> = (path) => readFile(path, 'utf8'), signal?: AbortSignal, recordRecovery: RecoveryRecorder = missingRecoveryRecorder, clearRecovery: RecoveryClearer = missingRecoveryClearer): Promise<ProcessResult> {
   if (command.length === 0) throw new Error('A command is required after --.');
   const configPath = resolve(metadata.worktree, metadata.devcontainerPath);
   await assertSupportedDevcontainerConfig(configPath, readConfig);
+  await recordRecovery({ reason: 'operation-may-be-active', containerIds: [], worktree: metadata.worktree });
   let up: ProcessResult;
   try {
     up = await runner.run('devcontainer', ['up', '--workspace-folder', metadata.worktree, '--config', configPath, '--log-format', 'json', '--mount-git-worktree-common-dir'], withSignal(undefined, signal));
   } catch (error: unknown) {
-    if (!signal?.aborted) throw error;
-    return ambiguousUpRecovery(metadata, runner, save, recordRecovery);
+    return ambiguousUpRecovery(metadata, runner, save, recordRecovery, `devcontainer up did not return a trustworthy terminal outcome: ${error instanceof Error ? error.message : String(error)}`);
   }
-  if (up.code !== 0) {
-    if (signal?.aborted) return ambiguousUpRecovery(metadata, runner, save, recordRecovery);
-    throw commandError('devcontainer up', up);
-  }
+  if (up.code !== 0) return ambiguousUpRecovery(metadata, runner, save, recordRecovery, `devcontainer up failed without a trustworthy terminal outcome: ${commandDetail(up)}`);
   const containerId = containerIdFromOutput(up.stdout);
-  if (!containerId) {
-    if (signal?.aborted) return ambiguousUpRecovery(metadata, runner, save, recordRecovery);
-    throw new Error('devcontainer up did not report a current containerId in its terminal JSON output.');
-  }
+  if (!containerId) return ambiguousUpRecovery(metadata, runner, save, recordRecovery, 'devcontainer up completed without a trustworthy terminal containerId');
   if (metadata.containerId !== containerId) try {
     await save({ ...metadata, containerId });
   } catch (error: unknown) {
@@ -62,6 +57,7 @@ export async function execWorkspace(metadata: WorkspaceMetadata, command: string
     throw new Error(`The local Dev Containers CLI was interrupted; the remote command may still be active in container ${containerId}. Agent Containers recorded a manual-recovery block and will not run lifecycle commands for ${metadata.name} until an operator verifies the remote command is stopped and clears it.`);
   }
   if (result.code !== 0) throw commandError('devcontainer exec', result);
+  await clearRecovery();
   return result;
 }
 
@@ -69,7 +65,7 @@ export async function execWorkspace(metadata: WorkspaceMetadata, command: string
  * An aborted local `up` has no trustworthy terminal container ID. Query Docker
  * by the exact Dev Containers local-folder label, but never remove a result.
  */
-async function ambiguousUpRecovery(metadata: WorkspaceMetadata, runner: ProcessRunner, save: (metadata: WorkspaceMetadata) => Promise<void>, recordRecovery: RecoveryRecorder): Promise<never> {
+async function ambiguousUpRecovery(metadata: WorkspaceMetadata, runner: ProcessRunner, save: (metadata: WorkspaceMetadata) => Promise<void>, recordRecovery: RecoveryRecorder, outcome: string): Promise<never> {
   const inspectionSignal = AbortSignal.timeout(5_000);
   let candidates: string[];
   try {
@@ -92,7 +88,7 @@ async function ambiguousUpRecovery(metadata: WorkspaceMetadata, runner: ProcessR
   }
 
   if (matching.length === 0) {
-    return recordAmbiguousUp(recordRecovery, metadata, [], `devcontainer up was interrupted without a terminal containerId and Docker found no container whose devcontainer.local_folder label exactly matches ${metadata.worktree}; provisioning may still be starting`);
+    return recordAmbiguousUp(recordRecovery, metadata, [], `${outcome} and Docker found no container whose devcontainer.local_folder label exactly matches ${metadata.worktree}; provisioning may still be starting`);
   }
   if (matching.length === 1) {
     try {
@@ -102,8 +98,8 @@ async function ambiguousUpRecovery(metadata: WorkspaceMetadata, runner: ProcessR
     }
   }
   return recordAmbiguousUp(recordRecovery, metadata, matching, matching.length === 1
-    ? `Found and recorded container ${matching[0]} with the exact worktree label, but interrupted provisioning may still be active`
-    : `Found ${matching.length} containers with the exact worktree label; ownership is ambiguous`);
+    ? `Found and recorded container ${matching[0]} with the exact worktree label, but ${outcome}`
+    : `Found ${matching.length} containers with the exact worktree label after ${outcome}; ownership is ambiguous`);
 }
 
 async function recordAmbiguousUp(recordRecovery: RecoveryRecorder, metadata: WorkspaceMetadata, containerIds: string[], detail: string): Promise<never> {
@@ -140,6 +136,10 @@ function parseJsoncObject(source: string): DevcontainerConfig {
 
 function missingRecoveryRecorder(): Promise<void> {
   return Promise.reject(new Error('Remote completion is unknown, but this execWorkspace caller did not provide durable recovery storage. Refusing to claim the command stopped.'));
+}
+
+function missingRecoveryClearer(): Promise<void> {
+  return Promise.reject(new Error('Remote completion was confirmed, but this execWorkspace caller did not provide durable recovery storage to clear the operation guard. Refusing to release lifecycle protection.'));
 }
 
 function withSignal(options: Omit<ProcessRunOptions, 'signal'> | undefined, signal?: AbortSignal): ProcessRunOptions | undefined {

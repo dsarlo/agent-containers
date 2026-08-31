@@ -48,7 +48,7 @@ export async function runCli(args: string[], cwd = process.cwd(), write: (messag
         await withWorkspaceLock(stateDir, name, async (signal) => {
           const metadata = await loadMetadata(stateDir, name);
           if (!metadata) throw new Error(`No Agent Containers workspace named "${name}".`);
-          await execWorkspace(metadata, rest.slice(separator + 1), nodeProcessRunner, (next) => saveMetadata(stateDir, next), undefined, signal, (recovery) => recordManualRecovery(stateDir, name, recovery));
+          await execWorkspace(metadata, rest.slice(separator + 1), nodeProcessRunner, (next) => saveMetadata(stateDir, next), undefined, signal, (recovery) => recordManualRecovery(stateDir, name, recovery), () => clearManualRecovery(stateDir, name));
         });
         return 0;
       }
