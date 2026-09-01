@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict';
 import { access, mkdtemp, rename } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, parse } from 'node:path';
 import test from 'node:test';
+import { pathToFileURL } from 'node:url';
 import { createNativeDurabilityAdapter, nativeAddonPackageRoot, type NativeDurabilityBinding, type StateDurabilityAdapter } from '../src/durability.js';
 import { withWorkspaceLock } from '../src/state.js';
 
@@ -16,7 +17,8 @@ function binding(overrides: Partial<NativeDurabilityBinding> = {}): NativeDurabi
 }
 
 test('production native addon loading starts at the package root rather than dist/src', () => {
-  assert.equal(nativeAddonPackageRoot('file:///opt/agent-containers/dist/src/durability.js'), '/opt/agent-containers');
+  const fixture = join(parse(process.cwd()).root, 'opt', 'agent-containers', 'dist', 'src', 'durability.js');
+  assert.equal(nativeAddonPackageRoot(pathToFileURL(fixture).href), join(parse(process.cwd()).root, 'opt', 'agent-containers'));
 });
 
 test('native durability adapter preserves macOS full-sync file results and reports unsupported directory durability', async () => {

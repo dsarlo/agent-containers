@@ -279,6 +279,46 @@ test('nodeProcessRunner records an unconfirmed reap when a cancelled POSIX group
   await rejected;
 });
 
+test('nodeProcessRunner stops cancellation targeting after the root exits but before stdio closes', async () => {
+  const root = Object.assign(new EventEmitter(), { pid: 2472, kill: () => true }) as unknown as ChildProcess;
+  const processKillCalls: Array<{ pid: number; signal: NodeJS.Signals | 0 | undefined }> = [];
+  const runner = createNodeProcessRunner({
+    platform: 'linux',
+    spawn: (() => root) as typeof spawn,
+    processKill: ((pid: number, signal?: NodeJS.Signals | 0) => {
+      processKillCalls.push({ pid, signal });
+      return true;
+    }) as typeof process.kill,
+  });
+  const controller = new AbortController();
+  const running = runner.run('managed-command', [], { signal: controller.signal });
+
+  root.emit('exit', 0);
+  controller.abort();
+  assert.deepEqual(processKillCalls, [], 'an exited root PID must never be reused as a process-group cancellation target');
+  root.emit('close', 0);
+  assert.equal((await running).code, 0, 'the runner still waits for stdio close');
+
+  const windowsRoot = Object.assign(new EventEmitter(), { pid: 2473, kill: () => true }) as unknown as ChildProcess;
+  const windowsCommands: string[] = [];
+  const windowsRunner = createNodeProcessRunner({
+    platform: 'win32',
+    spawn: ((command: string) => {
+      windowsCommands.push(command);
+      return windowsRoot;
+    }) as typeof spawn,
+    windowsDirectory: () => 'C:\\Windows',
+  });
+  const windowsController = new AbortController();
+  const windowsRunning = windowsRunner.run('managed-command', [], { signal: windowsController.signal });
+
+  windowsRoot.emit('exit', 0);
+  windowsController.abort();
+  assert.deepEqual(windowsCommands, ['managed-command'], 'an exited root PID must never be passed to taskkill');
+  windowsRoot.emit('close', 0);
+  assert.equal((await windowsRunning).code, 0, 'the Windows runner still waits for stdio close');
+});
+
 test('nodeProcessRunner retains POSIX escalation after root close when a descendant may remain', async () => {
   const root = Object.assign(new EventEmitter(), { pid: 2469, kill: () => true }) as unknown as ChildProcess;
   const signals: NodeJS.Signals[] = [];

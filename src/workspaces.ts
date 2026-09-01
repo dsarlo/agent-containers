@@ -75,11 +75,12 @@ export function createNodeProcessRunner({
         let windowsReaper: ChildProcess | undefined;
         let windowsReaperLive = false;
         let windowsTaskkillSucceeded = false;
+        let rootExited = false;
         let rootClosed = false;
         let posixGroupGone = false;
         let rootTerminationAttempted = false;
         const terminateRootOnce = () => {
-          if (rootTerminationAttempted) return;
+          if (rootTerminationAttempted || rootExited) return;
           rootTerminationAttempted = true;
           terminateManagedRoot(child);
         };
@@ -101,7 +102,7 @@ export function createNodeProcessRunner({
           reject(error);
         };
         const abortChild = () => {
-          if (settled || cancellationStarted) return;
+          if (settled || cancellationStarted || rootExited) return;
           cancellationStarted = true;
           if (platform === 'win32') {
             reapWindowsProcessTree();
@@ -113,7 +114,7 @@ export function createNodeProcessRunner({
         const finishCancellation = () => unconfirmed();
         const unconfirmed = () => fail(options.kind === 'lifecycle' ? new UnconfirmedProcessReapError() : processReapTimeoutError(platform));
         const signalGroup = (signal: NodeJS.Signals | 0): boolean => {
-          if (child.pid === undefined) return false;
+          if (rootExited || child.pid === undefined) return false;
           try {
             processKill(-child.pid, signal);
             return true;
@@ -207,6 +208,10 @@ export function createNodeProcessRunner({
         child.on('error', (error) => {
           if (cancellationStarted) unconfirmed();
           else fail(error);
+        });
+        child.on('exit', () => {
+          rootExited = true;
+          if (!cancellationStarted) options.signal?.removeEventListener('abort', abortChild);
         });
         child.on('close', (code) => {
           rootClosed = true;

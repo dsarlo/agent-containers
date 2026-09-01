@@ -357,6 +357,31 @@ test('a post-delete failsafe directory-sync failure completes the committed ackn
   }
 });
 
+test('a post-journal-clear publication-mode failure retains the recovery barrier', async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), 'agent-containers-recovery-clear-publication-mode-'));
+  await recordManualRecovery(stateDir, 'safe', { reason: 'operation-may-be-active', containerIds: [], worktree: metadata.worktree });
+  const observed = await loadManualRecovery(stateDir, 'safe');
+  assert.ok(observed);
+  let publicationModeCalls = 0;
+  setStateDurabilityAdapterForTesting({
+    ...testDurabilityAdapter,
+    publicationMode: async () => {
+      publicationModeCalls += 1;
+      if (publicationModeCalls === 5) throw new Error('publication mode unavailable after journal clear');
+      return 'strict';
+    },
+  });
+  try {
+    await assert.rejects(() => state.clearManualRecoveryIfCurrent(stateDir, 'safe', observed.generation), /publication mode unavailable after journal clear/);
+    assert.equal((await loadManualRecovery(stateDir, 'safe'))?.generation, observed.generation);
+    let lifecycleRan = false;
+    await assert.rejects(() => withWorkspaceLock(stateDir, 'safe', async () => { lifecycleRan = true; }), /manual recovery/i);
+    assert.equal(lifecycleRan, false);
+  } finally {
+    setStateDurabilityAdapterForTesting(testDurabilityAdapter);
+  }
+});
+
 test('a durable manual recovery blocks lifecycle and stale-PID unlock until an explicit operator acknowledgement', async () => {
   const stateDir = await mkdtemp(join(tmpdir(), 'agent-containers-manual-recovery-'));
   const recoveryApi = state as unknown as {

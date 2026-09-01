@@ -843,10 +843,12 @@ async function durableRemove(path: string, directory: string, force: boolean, du
 }
 
 async function retireClearFailsafeAfterCommittedJournalClear(path: string, directory: string, durability: StateDurabilityAdapter): Promise<void> {
+  // Resolve the publication capability before removing the last recovery barrier.
+  const mode = await durability.publicationMode();
   await rm(path, { recursive: true, force: false });
   // Windows write-through publication does not offer a directory flush. Do not
   // convert adapter capability failures into an acknowledgement either.
-  if (await durability.publicationMode() === 'recoverable') return;
+  if (mode === 'recoverable') return;
   try {
     await durability.syncDirectory(directory);
   } catch {
