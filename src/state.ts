@@ -296,13 +296,13 @@ export async function clearManualRecoveryIfCurrent(stateDir: string, name: strin
     await durability.assertStateWriteSupport();
     await bootstrapManualRecoveryJournalUnsafe(stateDir, name);
     const directory = join(stateDir, 'locks');
-    // Keep a separately durable copy until the clear is fully published. If
-    // replacement or its directory sync fails after visibility, readers still
-    // observe this barrier instead of treating the acknowledgement as complete.
+    // Keep a separately durable copy until the journal clear is fully published.
+    // A failed removal leaves the journal authoritative; a failed clear leaves
+    // this published copy authoritative.
     const failsafePath = manualRecoveryClearFailsafePath(stateDir, name);
     await durableReplace(join(directory, `.${randomUUID()}.manual-recovery.clear-failsafe.tmp`), failsafePath, directory, `${JSON.stringify(current)}\n`, durability);
-    await appendManualRecoveryJournalEvent(manualRecoveryJournalPath(stateDir, name), { event: 'clear' }, durability);
     await durableRemove(failsafePath, directory, false, durability);
+    await appendManualRecoveryJournalEvent(manualRecoveryJournalPath(stateDir, name), { event: 'clear' }, durability);
   });
 }
 

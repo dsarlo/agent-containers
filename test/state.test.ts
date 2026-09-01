@@ -272,6 +272,46 @@ test('a failed strict clear retains a durable recovery barrier and a retry clear
   assert.equal(await loadManualRecovery(stateDir, 'safe'), undefined);
 });
 
+test('a post-delete failsafe sync failure retains the journal barrier until the same generation is retried', async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), 'agent-containers-recovery-clear-post-delete-'));
+  await recordManualRecovery(stateDir, 'safe', { reason: 'operation-may-be-active', containerIds: [], worktree: metadata.worktree });
+  const observed = await loadManualRecovery(stateDir, 'safe');
+  assert.ok(observed);
+  let locksSyncs = 0;
+  let failPostDeleteSync = true;
+  const journalPath = join(stateDir, 'locks', 'safe.manual-recovery.journal');
+  const failsafePath = join(stateDir, 'locks', 'safe.manual-recovery.clear-failsafe.json');
+  setStateDurabilityAdapterForTesting({
+    ...testDurabilityAdapter,
+    syncDirectory: async (path) => {
+      if (path !== join(stateDir, 'locks')) return;
+      locksSyncs += 1;
+      if (!failPostDeleteSync) return;
+      try {
+        await lstat(failsafePath);
+        return;
+      } catch (error: unknown) {
+        if (typeof error !== 'object' || error === null || !('code' in error) || error.code !== 'ENOENT') throw error;
+      }
+      const journal = await readFile(journalPath, 'utf8');
+      if (!journal.includes('"event":"clear"')) throw new Error('post-delete failsafe sync failed');
+    },
+  });
+  try {
+    await assert.rejects(() => state.clearManualRecoveryIfCurrent(stateDir, 'safe', observed.generation), /post-delete failsafe sync failed/);
+    assert.equal(locksSyncs, 2, 'the injected failure is the failsafe removal parent sync');
+    const retained = await loadManualRecovery(stateDir, 'safe');
+    assert.equal(retained?.generation, observed.generation, 'a rejected clear must leave the acknowledged generation as a barrier');
+    setStateDurabilityAdapterForTesting(testDurabilityAdapter);
+    await assert.rejects(() => withWorkspaceLock(stateDir, 'safe', async () => undefined), /manual recovery/i);
+    failPostDeleteSync = false;
+    await state.clearManualRecoveryIfCurrent(stateDir, 'safe', observed.generation);
+    assert.equal(await loadManualRecovery(stateDir, 'safe'), undefined);
+  } finally {
+    setStateDurabilityAdapterForTesting(testDurabilityAdapter);
+  }
+});
+
 test('a durable manual recovery blocks lifecycle and stale-PID unlock until an explicit operator acknowledgement', async () => {
   const stateDir = await mkdtemp(join(tmpdir(), 'agent-containers-manual-recovery-'));
   const recoveryApi = state as unknown as {

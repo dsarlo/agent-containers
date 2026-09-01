@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { access, mkdtemp } from 'node:fs/promises';
+import { access, mkdtemp, rename } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -43,6 +43,39 @@ test('Windows file flush and write-through move select recoverable publication r
 
   await adapter.assertStateWriteSupport();
   assert.equal(await adapter.publicationMode(), 'recoverable');
+});
+
+test('a native Windows contention result retains its machine-readable code and serializes lifecycle locks', async () => {
+  const stateDir = join(await mkdtemp(join(tmpdir(), 'agent-containers-windows-contention-')), 'state');
+  const adapter = createNativeDurabilityAdapter(binding({
+    capabilities: () => ({ regularFileSync: true, directorySync: false, writeThroughMove: true }),
+    moveFileWriteThrough: async (source, destination) => {
+      try {
+        await rename(source, destination);
+        return { ok: true, source, destination, method: 'move-file-write-through' };
+      } catch {
+        return { ok: false, source, destination, method: 'move-file-write-through', code: 'EEXIST', error: 'The file already exists.' };
+      }
+    },
+  }));
+  const events: string[] = [];
+  let releaseFirst!: () => void;
+  const firstMayFinish = new Promise<void>((resolveFirst) => { releaseFirst = resolveFirst; });
+  let firstStarted!: () => void;
+  const firstHasStarted = new Promise<void>((resolveFirstStarted) => { firstStarted = resolveFirstStarted; });
+  const first = withWorkspaceLock(stateDir, 'safe', async () => {
+    events.push('first-start');
+    firstStarted();
+    await firstMayFinish;
+    events.push('first-end');
+  }, { durabilityAdapter: adapter });
+  await firstHasStarted;
+  const second = withWorkspaceLock(stateDir, 'safe', async () => { events.push('second'); }, { durabilityAdapter: adapter });
+  await new Promise((resolve) => setTimeout(resolve, 35));
+  assert.deepEqual(events, ['first-start']);
+  releaseFirst();
+  await Promise.all([first, second]);
+  assert.deepEqual(events, ['first-start', 'first-end', 'second']);
 });
 
 test('state lifecycle fails closed before creating state or invoking its action when required durability is unavailable', async () => {

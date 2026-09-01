@@ -425,7 +425,7 @@ test('nodeProcessRunner reports bounded readonly cancellation when the POSIX gro
   }
 });
 
-test('SIGTERM keeps the lifecycle lock until a cancelled child process has exited', { timeout: 5_000 }, async () => {
+test('POSIX SIGTERM keeps the lifecycle lock until a cancelled child process has exited', { skip: process.platform === 'win32', timeout: 5_000 }, async () => {
   const stateDir = await mkdtemp(join(tmpdir(), 'agent-containers-signal-lock-'));
   const stateUrl = new URL('../src/state.js', import.meta.url).href;
   const workspacesUrl = new URL('../src/workspaces.js', import.meta.url).href;

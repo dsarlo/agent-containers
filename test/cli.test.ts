@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { chmod, lstat, mkdtemp, mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { delimiter, join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import test from 'node:test';
@@ -12,10 +12,32 @@ import { nodeProcessRunner, UnconfirmedProcessReapError } from '../src/workspace
 const repoRoot = resolve(tmpdir(), 'agent-containers-cli-repo');
 const worktree = join(repoRoot, 'worktrees', 'safe');
 
-test('built public CLI entry point is executable', async () => {
+test('built public CLI entry point has the platform-appropriate package-bin contract', async () => {
+  if (process.platform === 'win32') {
+    const result = spawnSync(process.execPath, ['dist/src/bin/agent-containers.js', '--help'], { encoding: 'utf8' });
+    assert.equal(result.status, 0, result.stderr);
+    return;
+  }
   const mode = (await stat('dist/src/bin/agent-containers.js')).mode & 0o777;
   assert.equal(mode & 0o111, 0o111, 'the built CLI must be directly executable for npm link and package bins');
 });
+
+async function installGitWrapper(bin: string, gitPath: string, gitLog: string): Promise<void> {
+  const wrapper = join(bin, 'git-wrapper.mjs');
+  await writeFile(wrapper, `import { appendFileSync } from 'node:fs';\nimport { spawnSync } from 'node:child_process';\nconst args = process.argv.slice(2);\nappendFileSync(${JSON.stringify(gitLog)}, args.join(' ') + '\\n');\nconst result = spawnSync(${JSON.stringify(gitPath)}, args, { stdio: 'inherit' });\nprocess.exit(result.status ?? 1);\n`);
+  if (process.platform === 'win32') {
+    await writeFile(join(bin, 'git.cmd'), `@echo off\r\n"${process.execPath}" "${wrapper}" %*\r\n`);
+  } else {
+    const command = join(bin, 'git');
+    await writeFile(command, `#!${process.execPath}\nimport(${JSON.stringify(new URL(`file://${wrapper}`).href)});\n`);
+    await chmod(command, 0o755);
+  }
+}
+
+function installedGitPath(): string {
+  const command = process.platform === 'win32' ? 'where.exe' : 'which';
+  return spawnSync(command, ['git'], { encoding: 'utf8' }).stdout.trim().split(/\r?\n/, 1)[0] ?? '';
+}
 
 test('CLI parses destructive confirmation options strictly', async () => {
   const messages: string[] = [];
@@ -212,7 +234,7 @@ test('create without --base validates its configured base before Git worktree ad
   const root = await mkdtemp(join(tmpdir(), 'agent-containers-cli-create-default-base-contract-'));
   const stateHome = await mkdtemp(join(tmpdir(), 'agent-containers-cli-create-default-state-'));
   const bin = await mkdtemp(join(tmpdir(), 'agent-containers-cli-create-default-git-bin-'));
-  const gitPath = spawnSync('which', ['git'], { encoding: 'utf8' }).stdout.trim();
+  const gitPath = installedGitPath();
   const gitLog = join(root, 'git.log');
   const previousPath = process.env.PATH;
   const previousStateHome = process.env.XDG_STATE_HOME;
@@ -223,11 +245,10 @@ test('create without --base validates its configured base before Git worktree ad
   await writeFile(join(root, 'tracked.txt'), 'main\n');
   assert.equal(spawnSync('git', ['add', '.agent-containers.yml', 'tracked.txt'], { cwd: root }).status, 0);
   assert.equal(spawnSync('git', ['-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '-m', 'main missing config'], { cwd: root }).status, 0);
-  await writeFile(join(bin, 'git'), `#!${process.execPath}\nimport { appendFileSync } from 'node:fs';\nimport { spawnSync } from 'node:child_process';\nconst args = process.argv.slice(2);\nappendFileSync(${JSON.stringify(gitLog)}, args.join(' ') + '\\n');\nconst result = spawnSync(${JSON.stringify(gitPath)}, args, { stdio: 'inherit' });\nprocess.exit(result.status ?? 1);\n`);
-  await chmod(join(bin, 'git'), 0o755);
+  await installGitWrapper(bin, gitPath, gitLog);
 
   try {
-    process.env.PATH = `${bin}:${previousPath ?? ''}`;
+    process.env.PATH = `${bin}${delimiter}${previousPath ?? ''}`;
     process.env.XDG_STATE_HOME = stateHome;
     const messages: string[] = [];
     await assert.rejects(
@@ -250,7 +271,7 @@ test('create with --base refuses a base missing its Dev Container config before 
   const root = await mkdtemp(join(tmpdir(), 'agent-containers-cli-create-base-contract-'));
   const stateHome = await mkdtemp(join(tmpdir(), 'agent-containers-cli-create-state-'));
   const bin = await mkdtemp(join(tmpdir(), 'agent-containers-cli-git-bin-'));
-  const gitPath = spawnSync('which', ['git'], { encoding: 'utf8' }).stdout.trim();
+  const gitPath = installedGitPath();
   const gitLog = join(root, 'git.log');
   const previousPath = process.env.PATH;
   const previousStateHome = process.env.XDG_STATE_HOME;
@@ -266,11 +287,10 @@ test('create with --base refuses a base missing its Dev Container config before 
   assert.equal(spawnSync('git', ['rm', '.devcontainer/devcontainer.json'], { cwd: root }).status, 0);
   assert.equal(spawnSync('git', ['-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '-m', 'remove alternate config'], { cwd: root }).status, 0);
   assert.equal(spawnSync('git', ['checkout', 'main'], { cwd: root }).status, 0);
-  await writeFile(join(bin, 'git'), `#!${process.execPath}\nimport { appendFileSync } from 'node:fs';\nimport { spawnSync } from 'node:child_process';\nconst args = process.argv.slice(2);\nappendFileSync(${JSON.stringify(gitLog)}, args.join(' ') + '\\n');\nconst result = spawnSync(${JSON.stringify(gitPath)}, args, { stdio: 'inherit' });\nprocess.exit(result.status ?? 1);\n`);
-  await chmod(join(bin, 'git'), 0o755);
+  await installGitWrapper(bin, gitPath, gitLog);
 
   try {
-    process.env.PATH = `${bin}:${previousPath ?? ''}`;
+    process.env.PATH = `${bin}${delimiter}${previousPath ?? ''}`;
     process.env.XDG_STATE_HOME = stateHome;
     await assert.rejects(
       () => runCli(['create', 'blocked', '--base', 'alternate'], root, () => undefined),

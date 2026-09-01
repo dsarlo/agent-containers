@@ -26,6 +26,8 @@ export interface NativeMoveDurabilityResult {
   source: string;
   destination: string;
   method: 'move-file-write-through' | 'unsupported';
+  /** Stable filesystem error code when the native move did not publish. */
+  code?: 'EEXIST' | 'ENOTEMPTY';
   error?: string;
 }
 
@@ -77,7 +79,11 @@ export function createNativeDurabilityAdapter(binding: NativeDurabilityBinding):
     },
     async moveFileWriteThrough(source: string, destination: string): Promise<void> {
       const result = await binding.moveFileWriteThrough(source, destination);
-      if (!result.ok) throw new Error(result.error ?? `Native write-through move failed for ${source} -> ${destination}.`);
+      if (!result.ok) {
+        const error = new Error(result.error ?? `Native write-through move failed for ${source} -> ${destination}.`);
+        if (result.code) Object.assign(error, { code: result.code });
+        throw error;
+      }
     },
   };
 }
