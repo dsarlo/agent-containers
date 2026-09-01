@@ -226,18 +226,27 @@ export interface ConfigPublicationOptions {
 }
 interface ConfigLockOwner { pid: number; operation: 'configuration-publication'; token: string; createdAt: string }
 
-/** Publishes only a schema-valid candidate with owner-aware durable serialization. */
+/**
+ * Publishes only a schema-valid candidate with owner-aware durable serialization.
+ * undefined is unconstrained, null requires absence, and a hash requires that exact source.
+ */
 export async function saveConfigAtomic(path: string, next: AgentContainersConfig, expectedCurrentHash?: string | null, options: ConfigPublicationOptions = {}): Promise<'saved' | 'no-change'> {
-  const source = `${JSON.stringify(next, null, 2)}\n`;
   // Reparse the serialized candidate at the publication boundary so callers
   // cannot bypass the strict schema by constructing an object directly.
-  parseConfig(source);
+  const source = canonicalConfigSource(next);
   const adapter = options.durabilityAdapter ?? getProductionStateDurabilityAdapter();
   await adapter.assertStateWriteSupport();
   const lock = `${path}.lock`;
   const release = await acquireConfigLock(lock, adapter, options);
   try {
-    try { const current = await readFile(path, 'utf8'); if (current === source) return 'no-change'; if (expectedCurrentHash === null || (expectedCurrentHash !== undefined && hashConfig(current) !== expectedCurrentHash)) throw new Error('Configuration changed concurrently; reload and review the new diff.'); } catch (error: unknown) { if (!isNodeError(error, 'ENOENT')) throw error; if (expectedCurrentHash !== undefined) throw new Error('Configuration changed concurrently; it no longer exists.', { cause: error }); }
+    try {
+      const current = await readFile(path, 'utf8');
+      if (expectedCurrentHash === null || (expectedCurrentHash !== undefined && hashConfig(current) !== expectedCurrentHash)) throw new Error('Configuration changed concurrently; reload and review the new diff.');
+      if (expectedCurrentHash === undefined && canonicalConfigSource(parseConfig(current)) === source) return 'no-change';
+    } catch (error: unknown) {
+      if (!isNodeError(error, 'ENOENT')) throw error;
+      if (expectedCurrentHash !== undefined && expectedCurrentHash !== null) throw new Error('Configuration changed concurrently; it no longer exists.', { cause: error });
+    }
     const directory = dirname(path);
     const temporary = join(directory, `.${basename(path)}.${randomUUID()}.tmp`);
     await writeFile(temporary, source, { encoding: 'utf8', flag: 'wx', mode: 0o600 });
@@ -252,6 +261,9 @@ export async function saveConfigAtomic(path: string, next: AgentContainersConfig
   } finally {
     await release();
   }
+}
+function canonicalConfigSource(config: AgentContainersConfig): string {
+  return `${JSON.stringify(parseConfig(JSON.stringify(config)), null, 2)}\n`;
 }
 async function acquireConfigLock(lock: string, adapter: StateDurabilityAdapter, options: ConfigPublicationOptions): Promise<() => Promise<void>> {
   const now = options.now ?? Date.now;
@@ -278,7 +290,7 @@ async function acquireConfigLock(lock: string, adapter: StateDurabilityAdapter, 
     }
     catch (error: unknown) {
       if (pending) await rm(pending, { recursive: true, force: true });
-      if (!isNodeError(error, 'EEXIST') && !isNodeError(error, 'ENOTEMPTY')) throw new Error(`Could not acquire configuration lock ${lock}.`, { cause: error });
+      if (!isNodeError(error, 'EEXIST') && !isNodeError(error, 'ENOTEMPTY')) throw error;
       const owner = await readConfigLockOwner(lock);
       if (owner && !ownerAlive(owner.pid)) {
         await rm(lock, { recursive: true, force: false });
@@ -293,7 +305,9 @@ async function acquireConfigLock(lock: string, adapter: StateDurabilityAdapter, 
 async function readConfigLockOwner(lock: string): Promise<ConfigLockOwner | undefined> {
   try {
     const value: unknown = JSON.parse(await readFile(join(lock, 'owner.json'), 'utf8'));
-    if (isRecord(value) && typeof value.pid === 'number' && Number.isInteger(value.pid) && value.pid > 0 && value.operation === 'configuration-publication' && typeof value.token === 'string' && typeof value.createdAt === 'string') return value as ConfigLockOwner;
+    if (isRecord(value) && typeof value.pid === 'number' && Number.isInteger(value.pid) && value.pid > 0 && value.operation === 'configuration-publication' && typeof value.token === 'string' && typeof value.createdAt === 'string') {
+      return { pid: value.pid, operation: 'configuration-publication', token: value.token, createdAt: value.createdAt };
+    }
   } catch { /* A malformed owner is never blindly removed. */ }
   return undefined;
 }

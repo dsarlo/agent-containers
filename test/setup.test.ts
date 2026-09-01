@@ -127,6 +127,44 @@ test('configuration publication rejects invalid candidates, leaves no-change unw
   assert.equal(await readFile(path, 'utf8'), JSON.stringify(codespaces));
 });
 
+test('configuration publication recognizes equivalent YAML and JSON configurations as unchanged', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'agent-containers-config-canonical-'));
+  const path = join(directory, '.agent-containers.yml');
+  await writeFile(path, `version: 2
+workspace:
+  worktreeRoot: worktrees
+  baseBranch: main
+project:
+  repository: owner/repo
+  ref: refs/heads/main
+  expectedOid: '0123456789012345678901234567890123456789'
+environment:
+  devcontainerPath: .devcontainer/devcontainer.json
+  devcontainerBlobOid: 'abcdefabcdefabcdefabcdefabcdefabcdefabcd'
+backends:
+  enabled: [codespaces]
+  default: codespaces
+  local: {}
+  codespaces:
+    enabled: true
+    machine: null
+    geo: auto
+    idleTimeoutMinutes: 30
+    retentionPeriodMinutes: 10080
+    maxTotal: 4
+    maxRunning: 2
+    maxCreating: 1
+    maxParallelCommandsPerWorkspace: 1
+    readiness: { providerTimeoutSeconds: 1200, sshTimeoutSeconds: 120, command: [], commandTimeoutSeconds: 600 }
+    transport: { reconnectWindowSeconds: 60, cancelGraceSeconds: 10, remoteLogBytesPerStream: 67108864, remoteLogRetentionHours: 168 }
+    ports: { allowVisibilityChanges: false, allowPublic: false }
+    secrets: { allowedRemoteSecretNames: [], allowCodespaceGitCredential: false }
+`);
+  const current = await readFile(path, 'utf8');
+  assert.equal(await saveConfigAtomic(path, codespaces, undefined, { durabilityAdapter: durability }), 'no-change');
+  assert.equal(await readFile(path, 'utf8'), current);
+});
+
 test('configuration lock waits for an active owner, aborts on deadline signal, and reclaims a proven-dead owner', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'agent-containers-config-owner-'));
   const path = join(directory, '.agent-containers.yml');

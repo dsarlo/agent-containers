@@ -37,10 +37,10 @@ workspace:
 project:
   repository: OWNER/REPOSITORY
   ref: refs/heads/main
-  expectedOid: 0123456789012345678901234567890123456789
+  expectedOid: '0123456789012345678901234567890123456789'
 environment:
   devcontainerPath: .devcontainer/devcontainer.json
-  devcontainerBlobOid: abcdefabcdefabcdefabcdefabcdefabcdefabcd
+  devcontainerBlobOid: 'abcdefabcdefabcdefabcdefabcdefabcdefabcd'
 backends:
   enabled: [codespaces]
   default: codespaces
