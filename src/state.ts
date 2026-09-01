@@ -135,7 +135,7 @@ export async function bootstrapManualRecoveryJournal(stateDir: string, name: str
 
 /** Persist an append-only, checksummed recovery barrier before remote lifecycle work. */
 export async function recordManualRecovery(stateDir: string, name: string, input: ManualRecoveryInput): Promise<void> {
-  const recovery: ManualRecovery = { version: 1, ...input, createdAt: new Date().toISOString() };
+  const recovery: ManualRecovery = { version: 1, ...input, containerIds: input.containerIds.filter(isCanonicalContainerId), createdAt: new Date().toISOString() };
   if (!isManualRecovery(recovery)) throw new Error('Refusing to save invalid manual recovery state.');
   const durability = stateDurability();
   await durability.assertStateWriteSupport();
@@ -273,9 +273,9 @@ export async function deleteMetadata(stateDir: string, name: string): Promise<vo
 export async function listMetadata(stateDir: string): Promise<WorkspaceMetadata[]> {
   try {
     const files = await readdir(join(stateDir, 'workspaces'));
-    const names = files.filter((file) => file.endsWith('.json')).map((file) => file.slice(0, -5));
+    const names = files.filter((file) => file.endsWith('.json')).map((file) => file.slice(0, -5)).sort();
     const entries: Array<WorkspaceMetadata | undefined> = [];
-    // Keep status reads bounded while preserving filesystem enumeration order.
+    // Keep status reads bounded and deterministic regardless of filesystem order.
     for (let index = 0; index < names.length; index += METADATA_LIST_CONCURRENCY) {
       entries.push(...await Promise.all(names.slice(index, index + METADATA_LIST_CONCURRENCY).map((name) => loadMetadata(stateDir, name))));
     }
@@ -321,7 +321,7 @@ function isManualRecovery(value: unknown): value is ManualRecovery {
   const candidate = typeof value === 'object' && value !== null ? value as Partial<ManualRecovery> : undefined;
   return candidate?.version === 1 &&
     (candidate.reason === 'operation-may-be-active' || candidate.reason === 'remote-exec-interrupted' || candidate.reason === 'devcontainer-up-ambiguous' || candidate.reason === 'local-process-reap-unconfirmed') &&
-    Array.isArray(candidate.containerIds) && candidate.containerIds.every((id) => typeof id === 'string' && id.length > 0) &&
+    Array.isArray(candidate.containerIds) && candidate.containerIds.every(isCanonicalContainerId) &&
     isCanonicalPath(candidate.worktree) && typeof candidate.createdAt === 'string';
 }
 
@@ -363,10 +363,10 @@ export async function withWorkspaceLock<T>(stateDir: string, name: string, actio
   const quarantinePath = join(locksDir, `${lockName}.reap-unconfirmed`);
   const recoveryPath = join(locksDir, `${lockName}.recovery`);
   await ensureDurableDirectory(locksDir, durability, onStateDirectoryDurability);
-  if (await pathExists(quarantinePath)) throw unconfirmedReapLockError(name);
+  if (await pathExists(quarantinePath) || await pathExists(unconfirmedReapMarkerPath(lockPath))) throw unconfirmedReapLockError(name);
   const deadline = Date.now() + timeoutMs;
   while (true) {
-    if (await pathExists(quarantinePath)) throw unconfirmedReapLockError(name);
+    if (await pathExists(quarantinePath) || await pathExists(unconfirmedReapMarkerPath(lockPath))) throw unconfirmedReapLockError(name);
     await waitForRecoveryToFinish(recoveryPath, deadline, name, durability);
     if (await acquireOwnedDirectory(lockPath, locksDir, lockName, deadline, name, durability, onLockPublication)) break;
   }
@@ -399,10 +399,16 @@ export async function withWorkspaceLock<T>(stateDir: string, name: string, actio
       try {
         await onUnconfirmedProcessReap(error);
       } catch (recoveryError: unknown) {
-        // Move the published owner into a state ordinary stale-PID unlock never
-        // reclaims before surfacing the failed recovery publication.
-        await durableRename(lockPath, quarantinePath, locksDir, durability);
+        // Preserve the published lock before attempting a move whose durability
+        // result may be unknown. Ordinary unlock must never erase this boundary.
         releaseLock = false;
+        await markUnconfirmedReap(lockPath, durability);
+        try {
+          await durableRename(lockPath, quarantinePath, locksDir, durability);
+        } catch {
+          // The retained marker is the durable fail-closed fallback when the
+          // quarantine rename itself cannot be confirmed.
+        }
         throw recoveryError;
       }
     }
@@ -430,7 +436,7 @@ export async function releaseStaleWorkspaceLock(stateDir: string, name: string, 
   const quarantinePath = join(locksDir, `${lockName}.reap-unconfirmed`);
   const recoveryPath = join(locksDir, `${lockName}.recovery`);
   await ensureDurableDirectory(locksDir, durability);
-  if (await pathExists(quarantinePath)) throw unconfirmedReapLockError(name);
+  if (await pathExists(quarantinePath) || await pathExists(unconfirmedReapMarkerPath(lockPath))) throw unconfirmedReapLockError(name);
   if (await loadManualRecovery(stateDir, lockName)) throw manualRecoveryError(name);
   await acquireRecoveryLock(recoveryPath, locksDir, lockName, Date.now() + timeoutMs, name, isPidAlive, durability);
   try {
@@ -463,12 +469,33 @@ export async function acknowledgeUnconfirmedProcessReap(stateDir: string, name: 
   const recoveryPath = join(locksDir, `${lockName}.recovery`);
   const quarantinePath = join(locksDir, `${lockName}.reap-unconfirmed`);
   await ensureDurableDirectory(locksDir, durability);
-  if (!await pathExists(quarantinePath)) return;
+  const retainedMarker = unconfirmedReapMarkerPath(join(locksDir, `${lockName}.lock`));
+  if (!await pathExists(quarantinePath) && !await pathExists(retainedMarker)) return;
   await acquireRecoveryLock(recoveryPath, locksDir, lockName, Date.now() + timeoutMs, name, localPidIsAlive, durability);
   try {
     if (await pathExists(quarantinePath)) await durableRemove(quarantinePath, locksDir, false, durability);
+    else await durableRemove(retainedMarker, join(locksDir, `${lockName}.lock`), false, durability);
   } finally {
     await durableRemove(recoveryPath, locksDir, true, durability);
+  }
+}
+
+function unconfirmedReapMarkerPath(lockPath: string): string {
+  return join(lockPath, 'reap-unconfirmed');
+}
+
+async function markUnconfirmedReap(lockPath: string, durability: StateDurabilityAdapter): Promise<void> {
+  const marker = unconfirmedReapMarkerPath(lockPath);
+  let file: FileHandle | undefined;
+  try {
+    file = await open(marker, 'wx', 0o600);
+    await file.close();
+    file = undefined;
+    await durability.syncFile(marker);
+    await syncDirectory(lockPath, durability);
+  } catch (error: unknown) {
+    await file?.close();
+    if (!isNodeError(error, 'EEXIST')) throw error;
   }
 }
 

@@ -79,13 +79,13 @@ test('nodeProcessRunner rejects a Windows lifecycle cancellation when taskkill e
   }) as unknown as ChildProcess;
   const spawnForTest = ((command: string, args: readonly string[], options: Record<string, unknown>) => {
     calls.push({ command, args: [...args], options });
-    if (command !== 'taskkill') return managedChild;
+    if (!command.endsWith('taskkill.exe')) return managedChild;
     const killer = new EventEmitter();
     killers.push(killer);
     return killer as ChildProcess;
   }) as typeof spawn;
   const controller = new AbortController();
-  const runner = createNodeProcessRunner({ platform: 'win32', spawn: spawnForTest, windowsReapTimeoutMs: 0 });
+  const runner = createNodeProcessRunner({ platform: 'win32', spawn: spawnForTest, windowsReapTimeoutMs: 0, systemRoot: 'C:\\Windows' });
   let settled = false;
   const running = runner.run('managed-command', [], { kind: 'lifecycle', signal: controller.signal }).then((result) => { settled = true; return result; }, (error: unknown) => { settled = true; return error; });
 
@@ -93,7 +93,7 @@ test('nodeProcessRunner rejects a Windows lifecycle cancellation when taskkill e
   await new Promise((resolveTick) => setImmediate(resolveTick));
   assert.deepEqual(calls, [
     { command: 'managed-command', args: [], options: { cwd: undefined, shell: false, stdio: 'pipe', detached: false } },
-    { command: 'taskkill', args: ['/PID', '4321', '/T', '/F'], options: { shell: false, stdio: 'ignore', windowsHide: true } },
+    { command: 'C:\\Windows\\System32\\taskkill.exe', args: ['/PID', '4321', '/T', '/F'], options: { shell: false, stdio: 'ignore', windowsHide: true } },
   ]);
   killers[0]?.emit('error', new Error('taskkill could not start'));
   await new Promise((resolveTick) => setImmediate(resolveTick));
@@ -181,7 +181,7 @@ test('nodeProcessRunner turns Windows post-cancellation fallback failures into l
   }
 });
 
-test('nodeProcessRunner does not treat a cancelled POSIX root close as process-group reaping proof', async () => {
+test('nodeProcessRunner records an unconfirmed reap when a cancelled POSIX group disappears because descendants can escape it', async () => {
   const managedChild = Object.assign(new EventEmitter(), {
     pid: 2468,
     kill: () => true,
@@ -202,19 +202,37 @@ test('nodeProcessRunner does not treat a cancelled POSIX root close as process-g
     processKill,
     posixGraceMs: 0,
     posixVerificationTimeoutMs: 50,
-    reapPollMs: 0,
   } as never);
   const controller = new AbortController();
-  let settled = false;
-  const running = runner.run('managed-command', [], { signal: controller.signal }).then((result) => { settled = true; return result; });
+  const running = runner.run('managed-command', [], { kind: 'lifecycle', signal: controller.signal });
+  const rejected = assert.rejects(running, UnconfirmedProcessReapError);
 
   controller.abort();
   managedChild.emit('close', 1);
-  await new Promise((resolveTick) => setImmediate(resolveTick));
-  assert.equal(settled, false, 'root close alone cannot prove descendants were reaped');
   await new Promise((resolveDelay) => setTimeout(resolveDelay, 5));
-  assert.deepEqual(signals, ['SIGTERM', 'SIGKILL']);
-  assert.equal((await running).code, 1);
+  assert.deepEqual(signals, ['SIGTERM']);
+  await rejected;
+});
+
+test('nodeProcessRunner never treats Windows taskkill success and root close as escaped-descendant proof', async () => {
+  const root = Object.assign(new EventEmitter(), { pid: 2468, kill: () => true }) as unknown as ChildProcess;
+  const taskkill = new EventEmitter() as ChildProcess;
+  const calls: string[] = [];
+  const runner = createNodeProcessRunner({
+    platform: 'win32',
+    systemRoot: 'C:\\Windows',
+    spawn: ((command: string) => {
+      calls.push(command);
+      return command.endsWith('taskkill.exe') ? taskkill : root;
+    }) as typeof spawn,
+  });
+  const controller = new AbortController();
+  const running = runner.run('managed-command', [], { kind: 'lifecycle', signal: controller.signal });
+  controller.abort();
+  taskkill.emit('close', 0);
+  root.emit('close', 1);
+  await assert.rejects(running, UnconfirmedProcessReapError);
+  assert.deepEqual(calls, ['managed-command', 'C:\\Windows\\System32\\taskkill.exe']);
 });
 
 test('nodeProcessRunner returns an unconfirmed lifecycle failure when POSIX process-group death cannot be proven', async () => {
@@ -226,13 +244,13 @@ test('nodeProcessRunner returns an unconfirmed lifecycle failure when POSIX proc
     processKill,
     posixGraceMs: 0,
     posixVerificationTimeoutMs: 0,
-    reapPollMs: 0,
   } as never);
   const controller = new AbortController();
   const running = runner.run('managed-command', [], { kind: 'lifecycle', signal: controller.signal });
+  const rejected = assert.rejects(running, UnconfirmedProcessReapError);
   controller.abort();
   managedChild.emit('close', 1);
-  await assert.rejects(running, UnconfirmedProcessReapError);
+  await rejected;
 });
 
 test('nodeProcessRunner bounds initial POSIX SIGTERM ESRCH when the root never closes', async () => {
@@ -249,21 +267,21 @@ test('nodeProcessRunner bounds initial POSIX SIGTERM ESRCH when the root never c
   const controller = new AbortController();
   const running = runner.run('managed-command', [], { kind: 'lifecycle', signal: controller.signal });
   controller.abort();
-  assert.equal(timers.length, 1, 'the deadline starts before SIGTERM can report ESRCH');
+  assert.equal(timers.length, 2, 'the deadline and bounded SIGKILL attempt start even when SIGTERM reports ESRCH');
   timers[0]();
   await assert.rejects(running, UnconfirmedProcessReapError);
 });
 
-test('nodeProcessRunner abort terminates spawned process-group descendants before settling', { skip: process.platform === 'win32' }, async () => {
+test('nodeProcessRunner reports bounded readonly cancellation when the POSIX group is gone but escaped descendants remain unknowable', { skip: process.platform === 'win32' }, async () => {
   const directory = await mkdtemp(join(tmpdir(), 'agent-containers-process-group-'));
   const marker = join(directory, 'grandchild-survived');
   const controller = new AbortController();
   const grandchild = `require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'survived')`;
   const program = `require('node:child_process').spawn(process.execPath, ['-e', ${JSON.stringify(`setTimeout(() => ${grandchild}, 250)`)}], { stdio: 'ignore' }); setInterval(() => {}, 1000);`;
-  const running = nodeProcessRunner.run(process.execPath, ['-e', program], { signal: controller.signal });
+  const running = createNodeProcessRunner({ posixGraceMs: 0, posixVerificationTimeoutMs: 0 }).run(process.execPath, ['-e', program], { signal: controller.signal });
   await new Promise((resolveDelay) => setTimeout(resolveDelay, 100));
   controller.abort();
-  await running;
+  await assert.rejects(running, /POSIX process-group reaping could not be confirmed/);
   await new Promise((resolveDelay) => setTimeout(resolveDelay, 300));
   await assert.rejects(() => lstat(marker), { code: 'ENOENT' });
 });

@@ -432,6 +432,7 @@ test('execWorkspace retains a new container when its Docker ownership inspection
   const id = untrackedContainerId;
   for (const inspection of [
     { code: 0, stdout: `${id}\n/different/worktree\n`, stderr: '' },
+    { code: 0, stdout: `${containerId}\n${metadata.worktree}\n`, stderr: '' },
     { code: 1, stdout: '', stderr: 'inspect denied' },
   ]) {
     const stateDir = await mkdtemp(join(tmpdir(), 'agent-containers-unowned-rollback-'));

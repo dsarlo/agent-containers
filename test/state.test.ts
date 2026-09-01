@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import * as state from '../src/state.js';
-import { acknowledgeUnconfirmedProcessReap, bootstrapManualRecoveryJournal, loadManualRecovery, loadMetadata, recordManualRecovery, releaseStaleWorkspaceLock, saveMetadata, setStateDurabilityAdapterForTesting, withWorkspaceLock, type WorkspaceLockOptions, type WorkspaceMetadata } from '../src/state.js';
+import { acknowledgeUnconfirmedProcessReap, bootstrapManualRecoveryJournal, listMetadata, loadManualRecovery, loadMetadata, recordManualRecovery, releaseStaleWorkspaceLock, saveMetadata, setStateDurabilityAdapterForTesting, withWorkspaceLock, type WorkspaceLockOptions, type WorkspaceMetadata } from '../src/state.js';
 import type { ProcessRunner } from '../src/types.js';
 import type { StateDurabilityAdapter } from '../src/durability.js';
 
@@ -56,6 +56,19 @@ test('metadata writes are atomic and never expose a predictable temporary file',
   assert.deepEqual(JSON.parse(content), metadata);
   await writeFile(join(stateDir, 'workspaces', '.safe.json.tmp'), 'partial');
   assert.deepEqual(JSON.parse(await readFile(join(stateDir, 'workspaces', 'safe.json'), 'utf8')), metadata);
+});
+
+test('listMetadata reads in bounded batches and returns deterministic workspace-name order', async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), 'agent-containers-list-metadata-'));
+  for (const name of ['zeta', 'alpha', 'middle']) await saveMetadata(stateDir, { ...metadata, name, branch: `agent-containers/${name}`, worktree: `/repo/worktrees/${name}` });
+  assert.deepEqual((await listMetadata(stateDir)).map((entry) => entry.name), ['alpha', 'middle', 'zeta']);
+});
+
+test('manual recovery drops non-canonical container hints rather than persisting untrusted IDs', async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), 'agent-containers-recovery-container-hints-'));
+  const canonical = 'a'.repeat(64);
+  await recordManualRecovery(stateDir, 'safe', { reason: 'devcontainer-up-ambiguous', containerIds: ['not-a-container', canonical], worktree: metadata.worktree });
+  assert.deepEqual((await loadManualRecovery(stateDir, 'safe'))?.containerIds, [canonical]);
 });
 
 test('recoverable Windows publication uses its write-through move without pretending to sync directories', async () => {
@@ -303,6 +316,33 @@ test('failed uncertain-reap recovery publication quarantines the lock from stale
   let acquired = false;
   await withWorkspaceLock(stateDir, 'safe', async () => { acquired = true; });
   assert.equal(acquired, true);
+});
+
+test('failed recovery publication and failed quarantine preserve the marked lifecycle lock until acknowledgement', async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), 'agent-containers-retained-uncertain-lock-'));
+  let directorySyncs = 0;
+  let failAt = Number.POSITIVE_INFINITY;
+  const failingRename: StateDurabilityAdapter = {
+    ...testDurabilityAdapter,
+    syncDirectory: async () => {
+      directorySyncs += 1;
+      if (directorySyncs === failAt) throw new Error('quarantine directory sync failed');
+    },
+  };
+  await assert.rejects(
+    () => withWorkspaceLock(stateDir, 'safe', async () => { const error = new Error('unconfirmed'); error.name = 'UnconfirmedProcessReapError'; throw error; }, {
+      durabilityAdapter: failingRename,
+      onLockPublication: (step) => {
+        if (step === 'locks-directory-synced') failAt = directorySyncs + 2;
+      },
+      onUnconfirmedProcessReap: async () => { throw new Error('recovery journal unavailable'); },
+    }),
+    /recovery journal unavailable/,
+  );
+  await assert.rejects(() => releaseStaleWorkspaceLock(stateDir, 'safe', () => false), /reaping could not be confirmed.*Ordinary unlock never clears/i);
+  let ran = false;
+  await assert.rejects(() => withWorkspaceLock(stateDir, 'safe', async () => { ran = true; }, { timeoutMs: 0 }), /lock|uncertain/i);
+  assert.equal(ran, false, 'a later lifecycle cannot proceed after both recovery persistence paths fail');
 });
 
 test('unlock preserves malformed published lifecycle locks and directs verified manual filesystem repair', async () => {

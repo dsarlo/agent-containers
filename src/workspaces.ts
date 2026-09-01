@@ -1,6 +1,6 @@
 import { lstat, realpath } from 'node:fs/promises';
 import { spawn, type ChildProcess } from 'node:child_process';
-import { resolve } from 'node:path';
+import { resolve, win32 } from 'node:path';
 import type { AgentContainersConfig, ProcessResult, ProcessRunner, ProcessRunOptions } from './types.js';
 import { validateWorkspaceName } from './names.js';
 import { bootstrapManualRecoveryJournal, deleteMetadata, isAgentContainersWorkspace, isCanonicalContainerId, loadMetadata, saveMetadata, type WorkspaceMetadata } from './state.js';
@@ -13,7 +13,6 @@ const PROCESS_OUTPUT_EVENT_LIMIT = 64 * 1024;
 const WINDOWS_REAP_TIMEOUT_MS = 5_000;
 const POSIX_REAP_GRACE_MS = 5_000;
 const POSIX_REAP_VERIFICATION_TIMEOUT_MS = 5_000;
-const REAP_POLL_MS = 100;
 
 export interface NodeProcessRunnerDependencies {
   /** Override only for focused cross-platform process-runner tests. */
@@ -26,10 +25,10 @@ export interface NodeProcessRunnerDependencies {
   posixGraceMs?: number;
   /** Override process-group verification timing only for focused process-runner tests. */
   posixVerificationTimeoutMs?: number;
-  /** Override process-group verification polling only for focused process-runner tests. */
-  reapPollMs?: number;
   /** Override process-group signalling only for focused process-runner tests. */
   processKill?: typeof process.kill;
+  /** Override the trusted Windows system root for focused process-runner tests. */
+  systemRoot?: string;
   /** Override cancellation timers only for focused process-runner tests. */
   setTimeout?: typeof setTimeout;
   clearTimeout?: typeof clearTimeout;
@@ -49,8 +48,8 @@ export function createNodeProcessRunner({
   windowsReapTimeoutMs = WINDOWS_REAP_TIMEOUT_MS,
   posixGraceMs = POSIX_REAP_GRACE_MS,
   posixVerificationTimeoutMs = POSIX_REAP_VERIFICATION_TIMEOUT_MS,
-  reapPollMs = REAP_POLL_MS,
   processKill = process.kill,
+  systemRoot = process.env.SystemRoot,
   setTimeout: schedule = setTimeout,
   clearTimeout: cancelTimer = clearTimeout,
 }: NodeProcessRunnerDependencies = {}): ProcessRunner {
@@ -70,13 +69,8 @@ export function createNodeProcessRunner({
         const stderrDecoder = new TextDecoder();
         let settled = false;
         let cancellationTimer: NodeJS.Timeout | undefined;
-        let verificationTimer: NodeJS.Timeout | undefined;
         let cancellationDeadline: NodeJS.Timeout | undefined;
         let cancellationStarted = false;
-        let rootClosed = false;
-        let rootResult: ProcessResult | undefined;
-        let treeConfirmed = false;
-        let terminationOperationCompleted = false;
         let windowsReaper: ChildProcess | undefined;
         let rootTerminationAttempted = false;
         const terminateRootOnce = () => {
@@ -87,7 +81,6 @@ export function createNodeProcessRunner({
         const cleanup = () => {
           options.signal?.removeEventListener('abort', abortChild);
           if (cancellationTimer) cancelTimer(cancellationTimer);
-          if (verificationTimer) cancelTimer(verificationTimer);
           if (cancellationDeadline) cancelTimer(cancellationDeadline);
         };
         const settle = (result: ProcessResult) => {
@@ -111,54 +104,29 @@ export function createNodeProcessRunner({
           }
           reapPosixProcessGroup();
         };
-        const finishCancellation = () => {
-          if (rootClosed && treeConfirmed && terminationOperationCompleted && rootResult) settle(rootResult);
-        };
+        // Root exit cannot prove descendants remained in the local boundary.
+        const finishCancellation = () => unconfirmed();
         const unconfirmed = () => fail(options.kind === 'lifecycle' ? new UnconfirmedProcessReapError() : processReapTimeoutError(platform));
-        const signalGroup = (signal: NodeJS.Signals): boolean => {
-          if (child.pid === undefined) return false;
-          try {
-            processKill(-child.pid, signal);
-            return false;
-          } catch (error: unknown) {
-            if (isNodeError(error, 'ESRCH')) return true;
-            throw error;
-          }
-        };
-        const verifyPosixGroup = () => {
-          if (settled || treeConfirmed) return;
+        const signalGroup = (signal: NodeJS.Signals): void => {
           if (child.pid === undefined) return;
           try {
-            processKill(-child.pid, 0);
-          } catch (error: unknown) {
-            if (isNodeError(error, 'ESRCH')) {
-              treeConfirmed = true;
-              terminationOperationCompleted = true;
-              finishCancellation();
-              return;
-            }
-            unconfirmed();
+            processKill(-child.pid, signal);
             return;
+          } catch (error: unknown) {
+            if (isNodeError(error, 'ESRCH')) return;
+            throw error;
           }
-          verificationTimer = schedule(verifyPosixGroup, reapPollMs);
         };
         const reapPosixProcessGroup = () => {
           try {
             // Bound even an initial ESRCH race: the root may never emit close.
             cancellationDeadline = schedule(unconfirmed, posixGraceMs + posixVerificationTimeoutMs);
-            treeConfirmed = signalGroup('SIGTERM');
-            if (treeConfirmed) {
-              terminationOperationCompleted = true;
-              finishCancellation();
-              return;
-            }
+            signalGroup('SIGTERM');
             cancellationTimer = schedule(() => {
               try {
-                treeConfirmed = signalGroup('SIGKILL');
-                if (treeConfirmed) {
-                  terminationOperationCompleted = true;
-                  finishCancellation();
-                } else verifyPosixGroup();
+                signalGroup('SIGKILL');
+                // A process-group boundary cannot contain a setsid escapee.
+                unconfirmed();
               } catch { unconfirmed(); }
             }, posixGraceMs);
           } catch { unconfirmed(); }
@@ -179,7 +147,8 @@ export function createNodeProcessRunner({
           } else {
             let killer: ChildProcess;
             try {
-              killer = spawnProcess('taskkill', ['/PID', String(child.pid), '/T', '/F'], { shell: false, stdio: 'ignore', windowsHide: true });
+              if (!Number.isSafeInteger(child.pid) || child.pid <= 0 || !isTrustedWindowsSystemRoot(systemRoot)) throw new Error('trusted taskkill path unavailable');
+              killer = spawnProcess(win32.join(systemRoot, 'System32', 'taskkill.exe'), ['/PID', String(child.pid), '/T', '/F'], { shell: false, stdio: 'ignore', windowsHide: true });
               windowsReaper = killer;
             } catch {
               try { terminateRootOnce(); } catch { unconfirmed(); }
@@ -196,9 +165,9 @@ export function createNodeProcessRunner({
               if (killerSettled) return;
               killerSettled = true;
               if (code === 0) {
-                treeConfirmed = true;
-                terminationOperationCompleted = true;
-                finishCancellation();
+                // taskkill and root close do not prove an adversarial descendant
+                // remained in the Windows tree boundary.
+                unconfirmed();
               } else {
                 try { terminateRootOnce(); } catch { unconfirmed(); }
               }
@@ -223,13 +192,9 @@ export function createNodeProcessRunner({
         child.on('close', (code) => {
           receive('stdout', Buffer.alloc(0), true);
           receive('stderr', Buffer.alloc(0), true);
-          rootClosed = true;
-          rootResult = { code: code ?? 1, stdout, stderr };
+          const rootResult = { code: code ?? 1, stdout, stderr };
           if (!cancellationStarted) settle(rootResult);
           else {
-            // Root close is not proof that detached descendants exited, but it
-            // lets POSIX verify the group without waiting out the full grace.
-            if (platform !== 'win32') verifyPosixGroup();
             finishCancellation();
           }
         });
@@ -237,6 +202,10 @@ export function createNodeProcessRunner({
       });
     },
   };
+}
+
+function isTrustedWindowsSystemRoot(value: string | undefined): value is string {
+  return typeof value === 'string' && win32.isAbsolute(value) && !/[\0\r\n]/.test(value);
 }
 
 export const nodeProcessRunner: ProcessRunner = createNodeProcessRunner();
