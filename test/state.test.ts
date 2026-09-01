@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import * as state from '../src/state.js';
-import { acknowledgeUnconfirmedProcessReap, bootstrapManualRecoveryJournal, listMetadata, loadManualRecovery, loadMetadata, recordManualRecovery, releaseStaleWorkspaceLock, saveMetadata, setStateDurabilityAdapterForTesting, withWorkspaceLock, type WorkspaceLockOptions, type WorkspaceMetadata } from '../src/state.js';
+import { acknowledgeUnconfirmedProcessReap, bootstrapManualRecoveryJournal, listMetadata, loadManualRecovery, loadMetadata, recordManualRecovery, releaseStaleWorkspaceLock, saveMetadata, setStateDurabilityAdapterForTesting, setStateDurableRenameForTesting, setStateJournalStagingWriteForTesting, withWorkspaceLock, type WorkspaceLockOptions, type WorkspaceMetadata } from '../src/state.js';
 import type { ProcessRunner } from '../src/types.js';
 import type { StateDurabilityAdapter } from '../src/durability.js';
 
@@ -69,6 +69,33 @@ test('manual recovery drops non-canonical container hints rather than persisting
   const canonical = 'a'.repeat(64);
   await recordManualRecovery(stateDir, 'safe', { reason: 'devcontainer-up-ambiguous', containerIds: ['not-a-container', canonical], worktree: metadata.worktree });
   assert.deepEqual((await loadManualRecovery(stateDir, 'safe'))?.containerIds, [canonical]);
+});
+
+test('legacy recovery remains a barrier when every staged journal migration boundary fails', async () => {
+  for (const boundary of ['staging write', 'staging sync', 'publication', 'journal parent sync'] as const) {
+    const stateDir = await mkdtemp(join(tmpdir(), `agent-containers-legacy-migration-${boundary.replace(' ', '-')}-`));
+    await mkdir(join(stateDir, 'locks'), { recursive: true });
+    const legacy = { version: 1, reason: 'operation-may-be-active', containerIds: [], worktree: metadata.worktree, createdAt: '2026-01-01T00:00:00.000Z' };
+    await writeFile(join(stateDir, 'locks', 'safe.manual-recovery.json'), JSON.stringify(legacy));
+    let fail = true;
+    const adapter: StateDurabilityAdapter = {
+      ...testDurabilityAdapter,
+      syncFile: async (path) => { if (fail && boundary === 'staging sync' && path.endsWith('.manual-recovery.journal.tmp')) throw new Error(boundary); },
+      syncDirectory: async (path) => { if (fail && boundary === 'journal parent sync' && path.endsWith('locks')) throw new Error(boundary); },
+    };
+    setStateDurabilityAdapterForTesting(adapter);
+    if (boundary === 'staging write') setStateJournalStagingWriteForTesting(async () => { throw new Error(boundary); });
+    if (boundary === 'publication') setStateDurableRenameForTesting(async () => { throw new Error(boundary); });
+    try {
+      await assert.rejects(() => bootstrapManualRecoveryJournal(stateDir, 'safe'), new RegExp(boundary));
+      assert.deepEqual(await loadManualRecovery(stateDir, 'safe'), legacy, `${boundary} must retain the legacy barrier`);
+    } finally {
+      fail = false;
+      setStateDurableRenameForTesting(undefined);
+      setStateJournalStagingWriteForTesting(undefined);
+      setStateDurabilityAdapterForTesting(testDurabilityAdapter);
+    }
+  }
 });
 
 test('recoverable Windows publication uses its write-through move without pretending to sync directories', async () => {
@@ -318,6 +345,16 @@ test('failed uncertain-reap recovery publication quarantines the lock from stale
   assert.equal(acquired, true);
 });
 
+test('explicit reap acknowledgement does not retire an active lifecycle normal guard', async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), 'agent-containers-normal-reap-guard-'));
+  const lockPath = join(stateDir, 'locks', 'safe.lock');
+  await mkdir(lockPath, { recursive: true });
+  await writeFile(join(lockPath, 'owner.json'), JSON.stringify({ pid: process.pid, token: '12121212-1212-4121-8121-121212121212' }));
+  await writeFile(join(lockPath, 'reap-guard'), '');
+  await acknowledgeUnconfirmedProcessReap(stateDir, 'safe');
+  assert.equal((await lstat(lockPath)).isDirectory(), true, 'the normal lifecycle guard is not a retained uncertain-reap marker');
+});
+
 test('failed recovery publication and failed quarantine preserve the marked lifecycle lock until acknowledgement', async () => {
   const stateDir = await mkdtemp(join(tmpdir(), 'agent-containers-retained-uncertain-lock-'));
   let directorySyncs = 0;
@@ -415,6 +452,36 @@ test('stale lock recovery serializes validation and removal with a new lifecycle
   allowRemoval();
   await Promise.all([recovering, contender]);
   assert.equal(contenderRan, true);
+});
+
+test('recovery never transitions a replacement live lock after validating a dead owner', async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), 'agent-containers-lock-owner-race-'));
+  const locksDir = join(stateDir, 'locks');
+  const lockPath = join(locksDir, 'safe.lock');
+  const dead = { pid: 424242, token: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', createdAt: '2026-01-01T00:00:00.000Z' };
+  const live = { pid: process.pid, token: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', createdAt: '2026-01-01T00:00:00.000Z' };
+  await mkdir(lockPath, { recursive: true });
+  await writeFile(join(lockPath, 'owner.json'), JSON.stringify(dead));
+  let replaced = false;
+  setStateDurableRenameForTesting(async (source, destination) => {
+    if (!replaced && source === lockPath) {
+      replaced = true;
+      await rm(lockPath, { recursive: true });
+      await mkdir(lockPath);
+      await writeFile(join(lockPath, 'owner.json'), JSON.stringify(live));
+    }
+    await rename(source, destination);
+  });
+  try {
+    await assert.rejects(() => releaseStaleWorkspaceLock(stateDir, 'safe', (pid) => pid === process.pid), /owner changed|active PID/i);
+    assert.deepEqual(JSON.parse(await readFile(join(lockPath, 'owner.json'), 'utf8')), live, 'stale recovery must not move or remove the replacement owner');
+    let ran = false;
+    const contender = withWorkspaceLock(stateDir, 'safe', async () => { ran = true; }, { timeoutMs: 0 });
+    await assert.rejects(() => contender, /lock|active|timed out/i);
+    assert.equal(ran, false, 'a lifecycle cannot run alongside the replacement owner');
+  } finally {
+    setStateDurableRenameForTesting(undefined);
+  }
 });
 
 test('unlock reclaims a dead published recovery owner after an interrupted unlock and can retry safely', async () => {

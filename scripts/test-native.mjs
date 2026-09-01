@@ -80,7 +80,7 @@ try {
 
   const recoveryInput = {
     reason: 'operation-may-be-active',
-    containerIds: ['native-smoke-container'],
+    containerIds: ['a'.repeat(64)],
     worktree: directory,
   };
   await recordManualRecovery(stateDir, name, recoveryInput);

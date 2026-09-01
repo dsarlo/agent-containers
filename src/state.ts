@@ -50,6 +50,7 @@ export interface ManualRecoveryInput {
 
 let testDurabilityAdapter: StateDurabilityAdapter | undefined;
 let testDurableRename: ((source: string, destination: string) => Promise<void>) | undefined;
+let testJournalStagingWrite: ((file: FileHandle, content: string) => Promise<void>) | undefined;
 
 /** Test-only injection point so state behavior can be exercised without a compiled host addon. */
 export function setStateDurabilityAdapterForTesting(adapter: StateDurabilityAdapter | undefined): void {
@@ -59,6 +60,11 @@ export function setStateDurabilityAdapterForTesting(adapter: StateDurabilityAdap
 /** Test-only seam for a filesystem move that fails before changing either path. */
 export function setStateDurableRenameForTesting(renameForTest: ((source: string, destination: string) => Promise<void>) | undefined): void {
   testDurableRename = renameForTest;
+}
+
+/** Test-only seam for a staging write failure before its file durability boundary. */
+export function setStateJournalStagingWriteForTesting(writer: ((file: FileHandle, content: string) => Promise<void>) | undefined): void {
+  testJournalStagingWrite = writer;
 }
 
 function stateDurability(adapter?: StateDurabilityAdapter): StateDurabilityAdapter {
@@ -103,11 +109,16 @@ export async function bootstrapManualRecoveryJournal(stateDir: string, name: str
     if (!isNodeError(error, 'ENOENT')) throw error;
   }
   const legacy = await loadLegacyManualRecovery(stateDir, lockName);
+  const initialEvent: CheckedManualRecoveryJournalEvent | undefined = legacy
+    ? { event: 'set', recovery: legacy, checksum: journalChecksum({ event: 'set', recovery: legacy }) }
+    : undefined;
+  const initialJournal = initialEvent ? `${JSON.stringify(initialEvent)}\n` : '';
   if (await durability.publicationMode() === 'recoverable') {
     const stagingPath = join(directory, `.${lockName}.${randomUUID()}.manual-recovery.journal.tmp`);
     let stagingFile: FileHandle | undefined;
     try {
       stagingFile = await open(stagingPath, 'wx', 0o600);
+      await (testJournalStagingWrite ?? ((file, content) => file.writeFile(content, 'utf8')))(stagingFile, initialJournal);
       await stagingFile.close();
       stagingFile = undefined;
       await durability.syncFile(stagingPath);
@@ -120,22 +131,21 @@ export async function bootstrapManualRecoveryJournal(stateDir: string, name: str
       throw error;
     }
   } else {
+    const stagingPath = join(directory, `.${lockName}.${randomUUID()}.manual-recovery.journal.tmp`);
     let file: FileHandle | undefined;
     try {
-      file = await open(path, 'wx', 0o600);
+      file = await open(stagingPath, 'wx', 0o600);
+      await (testJournalStagingWrite ?? ((handle, content) => handle.writeFile(content, 'utf8')))(file, initialJournal);
       await file.close();
       file = undefined;
-      await durability.syncFile(path);
-      await syncDirectory(directory, durability);
+      await durability.syncFile(stagingPath);
+      await durableRename(stagingPath, path, directory, durability);
     } catch (error: unknown) {
       await file?.close();
-      if (isNodeError(error, 'EEXIST')) return false;
+      await rm(stagingPath, { force: true });
       throw error;
     }
   }
-  // Previous releases had a replacement marker. Preserve it as a durable set
-  // event so upgrade can never silently release an old manual-recovery block.
-  if (legacy) await appendManualRecoveryJournalEvent(path, { event: 'set', recovery: legacy }, durability);
   return true;
 }
 
@@ -187,7 +197,11 @@ async function durableReplace(temporaryPath: string, path: string, directory: st
 export async function loadManualRecovery(stateDir: string, name: string): Promise<ManualRecovery | undefined> {
   const journalPath = manualRecoveryJournalPath(stateDir, name);
   try {
-    return parseManualRecoveryJournal(await readFile(journalPath, 'utf8'), name);
+    const source = await readFile(journalPath, 'utf8');
+    const recovery = parseManualRecoveryJournal(source, name);
+    // An empty authoritative journal from an interrupted older migration is
+    // not evidence that its legacy barrier was cleared.
+    return recovery ?? (source.trim() === '' ? loadLegacyManualRecovery(stateDir, name) : undefined);
   } catch (error: unknown) {
     if (!isNodeError(error, 'ENOENT')) throw error;
     return loadLegacyManualRecovery(stateDir, name);
@@ -375,21 +389,22 @@ export async function withWorkspaceLock<T>(stateDir: string, name: string, actio
   // Hold this durable boundary for the entire lifecycle. A stale unlock or
   // recovery acknowledgement therefore cannot validate a normal lock while it
   // is being converted into a fail-closed uncertain-reap representation.
-  await acquireRecoveryLock(recoveryPath, locksDir, lockName, deadline, name, localPidIsAlive, durability);
+  const recoveryOwner = await acquireRecoveryLock(recoveryPath, locksDir, lockName, deadline, name, localPidIsAlive, durability);
+  let lifecycleOwner: LockOwner | undefined;
   try {
     if (await hasUnconfirmedReapBarrier(lockPath, quarantinePath)) throw unconfirmedReapLockError(name);
-    while (!await acquireOwnedDirectory(lockPath, locksDir, lockName, deadline, name, durability, onLockPublication)) {
+    while (!(lifecycleOwner = await acquireOwnedDirectory(lockPath, locksDir, lockName, deadline, name, durability, onLockPublication))) {
       if (await hasUnconfirmedReapBarrier(lockPath, quarantinePath)) throw unconfirmedReapLockError(name);
     }
   } catch (error) {
-    await durableRemove(recoveryPath, locksDir, true, durability);
+    await retireOwnedLock(recoveryPath, locksDir, recoveryOwner, durability);
     throw error;
   }
   try {
     if (!allowManualRecovery && await loadManualRecovery(stateDir, lockName)) throw manualRecoveryError(name);
   } catch (error) {
-    await durableRemove(lockPath, locksDir, true, durability);
-    await durableRemove(recoveryPath, locksDir, true, durability);
+    await retireOwnedLock(lockPath, locksDir, lifecycleOwner, durability);
+    await retireOwnedLock(recoveryPath, locksDir, recoveryOwner, durability);
     throw error;
   }
   const cancellation = new AbortController();
@@ -426,7 +441,9 @@ export async function withWorkspaceLock<T>(stateDir: string, name: string, actio
           // retained lock has been moved or explicitly acknowledged.
         }
         try {
-          await durableRename(lockPath, quarantinePath, locksDir, durability);
+          const owner = await readLockOwner(lockPath);
+          if (!owner) throw malformedLockError(name, lockPath);
+          await moveOwnedLock(lockPath, quarantinePath, owner, locksDir, durability);
         } catch {
           // The retained marker is the durable fail-closed fallback when the
           // quarantine rename itself cannot be confirmed.
@@ -439,8 +456,8 @@ export async function withWorkspaceLock<T>(stateDir: string, name: string, actio
     process.off('SIGINT', onInterrupt);
     process.off('SIGTERM', onTerminate);
     abortSignal?.removeEventListener('abort', cancel);
-    if (releaseLock) await durableRemove(lockPath, locksDir, true, durability);
-    await durableRemove(recoveryPath, locksDir, true, durability);
+    if (releaseLock) await retireOwnedLock(lockPath, locksDir, lifecycleOwner, durability);
+    await retireOwnedLock(recoveryPath, locksDir, recoveryOwner, durability);
     if (receivedSignal) process.kill(process.pid, receivedSignal);
   }
 }
@@ -459,7 +476,7 @@ export async function releaseStaleWorkspaceLock(stateDir: string, name: string, 
   const quarantinePath = join(locksDir, `${lockName}.reap-unconfirmed`);
   const recoveryPath = join(locksDir, `${lockName}.recovery`);
   await ensureDurableDirectory(locksDir, durability);
-  await acquireRecoveryLock(recoveryPath, locksDir, lockName, Date.now() + timeoutMs, name, isPidAlive, durability);
+  const recoveryOwner = await acquireRecoveryLock(recoveryPath, locksDir, lockName, Date.now() + timeoutMs, name, isPidAlive, durability);
   try {
     if (await hasUnconfirmedReapBarrier(lockPath, quarantinePath)) throw unconfirmedReapLockError(name);
     if (await loadManualRecovery(stateDir, lockName)) throw manualRecoveryError(name);
@@ -476,10 +493,10 @@ export async function releaseStaleWorkspaceLock(stateDir: string, name: string, 
     if (isPidAlive(owner.pid)) throw new Error(`Lifecycle lock for workspace "${name}" is owned by active PID ${owner.pid}; refusing to interrupt it.`);
     await hooks.beforeRemoval?.();
     const reclaimedPath = join(locksDir, `.${lockName}.${owner.token}.reclaimed`);
-    await durableRename(lockPath, reclaimedPath, locksDir, durability);
+    await moveOwnedLock(lockPath, reclaimedPath, owner, locksDir, durability);
     await durableRemove(reclaimedPath, locksDir, false, durability);
   } finally {
-    await durableRemove(recoveryPath, locksDir, true, durability);
+    await retireOwnedLock(recoveryPath, locksDir, recoveryOwner, durability);
   }
 }
 
@@ -494,23 +511,24 @@ export async function acknowledgeUnconfirmedProcessReap(stateDir: string, name: 
   await ensureDurableDirectory(locksDir, durability);
   const lockPath = join(locksDir, `${lockName}.lock`);
   const retainedMarker = unconfirmedReapMarkerPath(lockPath);
-  const retainedGuard = reapGuardPath(lockPath);
-  await acquireRecoveryLock(recoveryPath, locksDir, lockName, Date.now() + timeoutMs, name, localPidIsAlive, durability);
+  const recoveryOwner = await acquireRecoveryLock(recoveryPath, locksDir, lockName, Date.now() + timeoutMs, name, localPidIsAlive, durability);
   try {
     if (await pathExists(quarantinePath)) {
-      await durableRemove(quarantinePath, locksDir, false, durability);
+      const owner = await readLockOwner(quarantinePath);
+      if (!owner) throw malformedLockError(name, quarantinePath);
+      await retireOwnedLock(quarantinePath, locksDir, owner, durability);
       return;
     }
-    if (!await pathExists(retainedMarker) && !await pathExists(retainedGuard)) return;
+    if (!await pathExists(retainedMarker)) return;
     const owner = await readLockOwner(lockPath);
     if (!owner) throw malformedLockError(name, lockPath);
     // The marker is inside a retained ordinary lock after a pre-move failure.
     // Explicit acknowledgement, not unlock, deliberately retires both.
     const retiredPath = join(locksDir, `.${lockName}.${owner.token}.recovery-acknowledged`);
-    await durableRename(lockPath, retiredPath, locksDir, durability);
+    await moveOwnedLock(lockPath, retiredPath, owner, locksDir, durability);
     await durableRemove(retiredPath, locksDir, false, durability);
   } finally {
-    await durableRemove(recoveryPath, locksDir, true, durability);
+    await retireOwnedLock(recoveryPath, locksDir, recoveryOwner, durability);
   }
 }
 
@@ -526,7 +544,7 @@ function reapGuardPath(lockPath: string): string {
 }
 
 async function hasUnconfirmedReapBarrier(lockPath: string, quarantinePath: string): Promise<boolean> {
-  return await pathExists(quarantinePath) || await pathExists(unconfirmedReapMarkerPath(lockPath)) || await pathExists(reapGuardPath(lockPath));
+  return await pathExists(quarantinePath) || await pathExists(unconfirmedReapMarkerPath(lockPath));
 }
 
 async function markUnconfirmedReap(lockPath: string, durability: StateDurabilityAdapter): Promise<void> {
@@ -544,10 +562,11 @@ async function markUnconfirmedReap(lockPath: string, durability: StateDurability
   }
 }
 
-async function acquireRecoveryLock(recoveryPath: string, locksDir: string, lockName: string, deadline: number, name: string, isPidAlive: (pid: number) => boolean, durability: StateDurabilityAdapter): Promise<void> {
+async function acquireRecoveryLock(recoveryPath: string, locksDir: string, lockName: string, deadline: number, name: string, isPidAlive: (pid: number) => boolean, durability: StateDurabilityAdapter): Promise<LockOwner> {
   while (true) {
     await reclaimDeadPublishedLock(recoveryPath, isPidAlive, durability);
-    if (await acquireOwnedDirectory(recoveryPath, locksDir, `${lockName}.recovery`, deadline, name, durability)) return;
+    const owner = await acquireOwnedDirectory(recoveryPath, locksDir, `${lockName}.recovery`, deadline, name, durability);
+    if (owner) return owner;
   }
 }
 
@@ -556,7 +575,7 @@ async function reclaimDeadPublishedLock(path: string, isPidAlive: (pid: number) 
   if (!owner || isPidAlive(owner.pid)) return;
   const abandonedPath = `${path}.${owner.token}.abandoned`;
   try {
-    await durableRename(path, abandonedPath, dirname(path), durability);
+    await moveOwnedLock(path, abandonedPath, owner, dirname(path), durability);
     await durableRemove(abandonedPath, dirname(path), false, durability);
   } catch (error: unknown) {
     if (!isNodeError(error, 'ENOENT')) throw error;
@@ -564,7 +583,7 @@ async function reclaimDeadPublishedLock(path: string, isPidAlive: (pid: number) 
 }
 
 /** Build owner metadata off-path, then atomically publish the directory. */
-async function acquireOwnedDirectory(path: string, locksDir: string, temporaryStem: string, deadline: number, name: string, durability: StateDurabilityAdapter, onLockPublication?: (step: LockPublicationStep) => void | Promise<void>): Promise<boolean> {
+async function acquireOwnedDirectory(path: string, locksDir: string, temporaryStem: string, deadline: number, name: string, durability: StateDurabilityAdapter, onLockPublication?: (step: LockPublicationStep) => void | Promise<void>): Promise<LockOwner | undefined> {
   const temporaryPath = join(locksDir, `.${temporaryStem}.${randomUUID()}.pending`);
   let ownerFile: FileHandle | undefined;
   try {
@@ -590,14 +609,14 @@ async function acquireOwnedDirectory(path: string, locksDir: string, temporarySt
     await onLockPublication?.('published');
     await syncDirectory(locksDir, durability);
     await onLockPublication?.('locks-directory-synced');
-    return true;
+    return owner;
   } catch (error: unknown) {
     await ownerFile?.close();
     await rm(temporaryPath, { recursive: true, force: true });
     if (!isNodeError(error, 'EEXIST') && !isNodeError(error, 'ENOTEMPTY')) throw error;
     if (Date.now() >= deadline) throw lockTimeout(name, error);
     await delay();
-    return false;
+    return undefined;
   }
 }
 
@@ -649,6 +668,25 @@ async function durableRename(source: string, destination: string, directory: str
   if (await durability.publicationMode() === 'recoverable') await durability.moveFileWriteThrough(source, destination);
   else await (testDurableRename ?? rename)(source, destination);
   await syncDirectory(directory, durability);
+}
+
+async function moveOwnedLock(source: string, destination: string, owner: LockOwner, directory: string, durability: StateDurabilityAdapter): Promise<void> {
+  const current = await readLockOwner(source);
+  if (!sameLockOwner(current, owner)) throw new Error(`Lifecycle lock owner changed before transition; refusing to move ${source}.`);
+  await durableRename(source, destination, directory, durability);
+  const moved = await readLockOwner(destination);
+  if (sameLockOwner(moved, owner)) return;
+  // The recovery lock prevents a compliant contender from claiming source while
+  // this rollback runs. Preserve an unexpected replacement rather than delete it.
+  try { await durableRename(destination, source, directory, durability); } catch { /* leave the unexpected owner intact and fail closed */ }
+  throw new Error(`Lifecycle lock owner changed during transition; refusing to remove the replacement at ${source}.`);
+}
+
+async function retireOwnedLock(path: string, directory: string, owner: LockOwner | undefined, durability: StateDurabilityAdapter): Promise<void> {
+  if (!owner) return;
+  const retired = join(directory, `.${owner.token}.retired`);
+  await moveOwnedLock(path, retired, owner, directory, durability);
+  await durableRemove(retired, directory, false, durability);
 }
 
 async function durableRemove(path: string, directory: string, force: boolean, durability: StateDurabilityAdapter): Promise<void> {
@@ -703,6 +741,10 @@ function isLockOwner(value: unknown): value is LockOwner {
   return Number.isInteger(candidate?.pid) && typeof candidate?.pid === 'number' && candidate.pid > 0 &&
     typeof candidate.token === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(candidate.token) &&
     (candidate.createdAt === undefined || typeof candidate.createdAt === 'string');
+}
+
+function sameLockOwner(left: LockOwner | undefined, right: LockOwner): boolean {
+  return left?.pid === right.pid && left.token === right.token;
 }
 
 function localPidIsAlive(pid: number): boolean {
