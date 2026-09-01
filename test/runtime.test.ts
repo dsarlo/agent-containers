@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import test from 'node:test';
 import { createDevcontainerProgressReporter, devcontainerUpFailureDetail, execNamedWorkspaceLifecycle, execWorkspace, execWorkspaceLifecycle, formatDevcontainerProgressLine, type ProcessRunner } from '../src/runtime.js';
 import type { ProcessRunOptions } from '../src/types.js';
-import { bootstrapManualRecoveryJournal, clearManualRecovery, deleteMetadata, loadManualRecovery, recordManualRecovery, saveMetadata, withWorkspaceLock, type WorkspaceMetadata } from '../src/state.js';
+import { bootstrapManualRecoveryJournal, clearManualRecovery, deleteMetadata, loadManualRecovery, loadMetadata, recordManualRecovery, saveMetadata, withWorkspaceLock, type WorkspaceMetadata } from '../src/state.js';
 import { UnconfirmedProcessReapError } from '../src/workspaces.js';
 
 const noOpRecovery = async (): Promise<void> => undefined;
@@ -137,14 +137,107 @@ test('execWorkspaceLifecycle supplies durable recovery callbacks under the works
   };
 
   await bootstrapManualRecoveryJournal(stateDir, metadata.name);
+  await saveMetadata(stateDir, metadata);
   await execWorkspaceLifecycle(metadata, ['true'], runner, async () => undefined, stateDir, async () => '{}');
   assert.equal(await loadManualRecovery(stateDir, metadata.name), undefined);
   await withWorkspaceLock(stateDir, metadata.name, async () => undefined);
 });
 
+test('execWorkspaceLifecycle reloads recorded metadata under its lock instead of persisting a stale terminal ID', async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), 'agent-containers-stale-lifecycle-'));
+  const recorded = { ...metadata, containerId: knownContainerId };
+  await bootstrapManualRecoveryJournal(stateDir, metadata.name);
+  await saveMetadata(stateDir, metadata);
+  let releaseUpdate!: () => void;
+  const updateMayFinish = new Promise<void>((resolveUpdate) => { releaseUpdate = resolveUpdate; });
+  let updatePersisted!: () => void;
+  const updateIsPersisted = new Promise<void>((resolvePersisted) => { updatePersisted = resolvePersisted; });
+  const update = withWorkspaceLock(stateDir, metadata.name, async () => {
+    await saveMetadata(stateDir, recorded);
+    updatePersisted();
+    await updateMayFinish;
+  });
+  await updateIsPersisted;
+  const calls: Array<{ command: string; args: string[] }> = [];
+  const runner: ProcessRunner = {
+    async run(command, args) {
+      calls.push({ command, args });
+      if (args[0] === 'up') return { code: 0, stdout: `{"outcome":"success","containerId":"${untrackedContainerId}"}\n`, stderr: '' };
+      if (args[0] === 'inspect') return { code: 0, stdout: ownedInspection(untrackedContainerId), stderr: '' };
+      throw new Error(`unexpected command: ${command} ${args.join(' ')}`);
+    },
+  };
+
+  const executing = execWorkspaceLifecycle(metadata, ['true'], runner, async () => { throw new Error('stale save seam must not be used'); }, stateDir, async () => '{}');
+  await new Promise((resolve) => setTimeout(resolve, 35));
+  assert.equal(calls.length, 0, 'the stale lifecycle invocation waits for the concurrent metadata update');
+  releaseUpdate();
+  await update;
+  await assert.rejects(
+    () => executing,
+    /recorded container.*manual recovery/i,
+  );
+  assert.equal((await loadMetadata(stateDir, metadata.name))?.containerId, knownContainerId, 'the canonical record is not replaced by the stale invocation');
+  const recovery = await loadManualRecovery(stateDir, metadata.name);
+  assert.equal(recovery?.reason, 'devcontainer-up-ambiguous');
+  assert.deepEqual(recovery?.containerIds, [knownContainerId, untrackedContainerId]);
+  assert.equal(recovery?.worktree, metadata.worktree);
+  assert.equal(calls.some((call) => call.command === 'devcontainer' && call.args[0] === 'exec'), false, 'the ambiguous terminal is never executed');
+  assert.equal(calls.some((call) => call.command === 'docker' && call.args[0] === 'rm'), false, 'the ambiguous terminal is never deleted');
+});
+
+test('execWorkspaceLifecycle records known and terminal IDs when Docker inspection throws', async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), 'agent-containers-inspect-throw-known-'));
+  const recorded = { ...metadata, containerId: knownContainerId };
+  await bootstrapManualRecoveryJournal(stateDir, metadata.name);
+  await saveMetadata(stateDir, recorded);
+  const calls: Array<{ command: string; args: string[] }> = [];
+  const runner: ProcessRunner = {
+    async run(command, args) {
+      calls.push({ command, args });
+      if (args[0] === 'up') return { code: 0, stdout: `{"outcome":"success","containerId":"${untrackedContainerId}"}\n`, stderr: '' };
+      if (args[0] === 'inspect') throw new Error('Docker inspection transport failed');
+      throw new Error(`unexpected command: ${command} ${args.join(' ')}`);
+    },
+  };
+
+  await assert.rejects(() => execWorkspaceLifecycle(recorded, ['true'], runner, async () => undefined, stateDir, async () => '{}'), /Docker inspection transport failed.*manual recovery/i);
+  assert.equal((await loadMetadata(stateDir, metadata.name))?.containerId, knownContainerId);
+  const recovery = await loadManualRecovery(stateDir, metadata.name);
+  assert.equal(recovery?.reason, 'devcontainer-up-ambiguous');
+  assert.deepEqual(recovery?.containerIds, [knownContainerId, untrackedContainerId]);
+  assert.equal(recovery?.worktree, metadata.worktree);
+  assert.equal(calls.some((call) => call.command === 'devcontainer' && call.args[0] === 'exec'), false);
+  assert.equal(calls.some((call) => call.command === 'docker' && call.args[0] === 'rm'), false);
+});
+
+test('execWorkspaceLifecycle retains the terminal ID without adoption when Docker inspection throws', async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), 'agent-containers-inspect-throw-new-'));
+  await bootstrapManualRecoveryJournal(stateDir, metadata.name);
+  await saveMetadata(stateDir, metadata);
+  const calls: Array<{ command: string; args: string[] }> = [];
+  const runner: ProcessRunner = {
+    async run(command, args) {
+      calls.push({ command, args });
+      if (args[0] === 'up') return { code: 0, stdout: `{"outcome":"success","containerId":"${untrackedContainerId}"}\n`, stderr: '' };
+      if (args[0] === 'inspect') throw new Error('Docker inspection transport failed');
+      throw new Error(`unexpected command: ${command} ${args.join(' ')}`);
+    },
+  };
+
+  await assert.rejects(() => execWorkspaceLifecycle(metadata, ['true'], runner, async () => undefined, stateDir, async () => '{}'), /Docker inspection transport failed.*manual recovery/i);
+  assert.equal((await loadMetadata(stateDir, metadata.name))?.containerId, undefined, 'an unverified terminal ID is not adopted');
+  const recovery = await loadManualRecovery(stateDir, metadata.name);
+  assert.equal(recovery?.reason, 'devcontainer-up-ambiguous');
+  assert.deepEqual(recovery?.containerIds, [untrackedContainerId]);
+  assert.equal(recovery?.worktree, metadata.worktree);
+  assert.equal(calls.some((call) => call.command === 'devcontainer' && call.args[0] === 'exec'), false);
+});
+
 test('unconfirmed local lifecycle reaping records a durable block before releasing the lifecycle lock', async () => {
   const stateDir = await mkdtemp(join(tmpdir(), 'agent-containers-unconfirmed-reap-'));
   await bootstrapManualRecoveryJournal(stateDir, metadata.name);
+  await saveMetadata(stateDir, metadata);
   const runner: ProcessRunner = { async run() { throw new UnconfirmedProcessReapError(); } };
 
   await assert.rejects(

@@ -8,6 +8,7 @@ import test from 'node:test';
 import { createNodeProcessRunner, createWorkspace, nodeProcessRunner, PROCESS_OUTPUT_LIMIT, UnconfirmedProcessReapError } from '../src/workspaces.js';
 import { execWorkspaceLifecycle } from '../src/runtime.js';
 import { isLiveIntegrationEnabled, probeLiveIntegrationPrerequisites } from '../src/live-integration.js';
+import { loadMetadata, saveMetadata } from '../src/state.js';
 
 const requireLiveIntegration = isLiveIntegrationEnabled();
 const { gitAvailable, dockerAvailable, devcontainerAvailable, relativeWorktreeSupported } = probeLiveIntegrationPrerequisites(process.env, (command, args) => spawnSync(command, args, { encoding: 'utf8' }));
@@ -411,9 +412,11 @@ test('production execWorkspace lifecycle exposes the Git common directory inside
     git('commit', '-m', 'initial');
     git('worktree', 'add', '--relative-paths', '-b', 'agent-containers/integration', worktree, 'main');
     const metadata = { version: 1 as const, name: 'integration', repoRoot: repo, worktree, branch: 'agent-containers/integration', baseRef: 'refs/heads/main', devcontainerPath: '.devcontainer.json', createdAt: new Date().toISOString() };
-    const runCommonDirectoryCheck = () => execWorkspaceLifecycle(metadata, ['sh', '-lc', 'git rev-parse --git-common-dir > .agent-containers-git-common-dir'], nodeProcessRunner, async (next) => { containerId = next.containerId; }, stateDir);
+    await saveMetadata(stateDir, metadata);
+    const runCommonDirectoryCheck = () => execWorkspaceLifecycle(metadata, ['sh', '-lc', 'git rev-parse --git-common-dir > .agent-containers-git-common-dir'], nodeProcessRunner, async () => undefined, stateDir);
     await assert.rejects(runCommonDirectoryCheck, /Initialized the durable manual-recovery journal for workspace "integration"\. No Dev Containers command was dispatched; retry this invocation before remote work can begin\./);
     await runCommonDirectoryCheck();
+    containerId = (await loadMetadata(stateDir, metadata.name))?.containerId;
     assert.match(await readFile(join(worktree, '.agent-containers-git-common-dir'), 'utf8'), /worktrees|\.git/);
   } finally {
     if (containerId) spawnSync('docker', ['rm', '-f', containerId]);

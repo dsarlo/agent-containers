@@ -27,18 +27,20 @@ const readDevcontainerConfig: ConfigReader = (path) => readFile(path, 'utf8');
 const resolveSyntheticPath: PathResolver = async (path) => path;
 
 /** Run the remote lifecycle under its durable workspace lock and recovery guard. */
-export async function execWorkspaceLifecycle(metadata: WorkspaceMetadata, command: string[], runner: ProcessRunner, save: (metadata: WorkspaceMetadata) => Promise<void>, stateDir: string, readConfig: ConfigReader = readDevcontainerConfig): Promise<ProcessResult> {
+export async function execWorkspaceLifecycle(metadata: WorkspaceMetadata, command: string[], runner: ProcessRunner, _save: (metadata: WorkspaceMetadata) => Promise<void>, stateDir: string, readConfig: ConfigReader = readDevcontainerConfig): Promise<ProcessResult> {
   return withWorkspaceLock(stateDir, metadata.name, async (signal) => {
+    const recorded = await loadMetadata(stateDir, metadata.name);
+    if (!recorded) throw new Error(`No Agent Containers workspace named "${metadata.name}".`);
     await requireInitializedRecoveryJournal(stateDir, metadata.name);
     return execWorkspace(
-    metadata,
-    command,
-    runner,
-    save,
-    readConfig,
-    signal,
-    (recovery) => recordManualRecovery(stateDir, metadata.name, recovery),
-    () => clearManualRecovery(stateDir, metadata.name),
+      recorded,
+      command,
+      runner,
+      (next) => saveMetadata(stateDir, next),
+      readConfig,
+      signal,
+      (recovery) => recordManualRecovery(stateDir, recorded.name, recovery),
+      () => clearManualRecovery(stateDir, recorded.name),
     );
   });
 }
@@ -78,7 +80,13 @@ export async function execWorkspace(metadata: WorkspaceMetadata, command: string
   if (up.code !== 0) return ambiguousUpRecovery(metadata, runner, save, recordRecovery, devcontainerUpFailureDetail(up));
   const containerId = containerIdFromOutput(up.stdout);
   if (!containerId) return ambiguousUpRecovery(metadata, runner, save, recordRecovery, 'devcontainer up completed without a trustworthy terminal containerId');
-  const ownership = await inspectOwnedContainer(metadata, containerId, runner, signal);
+  let ownership: boolean;
+  try {
+    ownership = await inspectOwnedContainer(metadata, containerId, runner, signal);
+  } catch (error: unknown) {
+    const detail = error instanceof Error ? error.message : String(error);
+    return recordAmbiguousUp(recordRecovery, metadata, metadata.containerId === undefined ? [containerId] : [metadata.containerId, containerId], `Docker could not verify Dev Containers returned container ${containerId}: ${detail}`);
+  }
   if (!ownership) return recordAmbiguousUp(recordRecovery, metadata, [], `Docker could not prove that Dev Containers returned container ${containerId} with the exact recorded worktree label`);
   if (metadata.containerId !== undefined && metadata.containerId !== containerId) {
     return recordAmbiguousUp(recordRecovery, metadata, [metadata.containerId, containerId], `Recorded container ${metadata.containerId} does not match Dev Containers returned container ${containerId}; an exact worktree label does not authorize replacing a recorded workspace resource`);
