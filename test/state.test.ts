@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { lstat, mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve, sep } from 'node:path';
 import test from 'node:test';
 import * as state from '../src/state.js';
 import { acknowledgeUnconfirmedProcessReap, bootstrapManualRecoveryJournal, listMetadata, loadManualRecovery, loadMetadata, recordManualRecovery, releaseStaleWorkspaceLock, saveMetadata, setStateDurabilityAdapterForTesting, setStateDurableRenameForTesting, setStateJournalStagingWriteForTesting, withWorkspaceLock, type WorkspaceLockOptions, type WorkspaceMetadata } from '../src/state.js';
@@ -18,14 +18,17 @@ const testDurabilityAdapter: StateDurabilityAdapter = {
 setStateDurabilityAdapterForTesting(testDurabilityAdapter);
 test.after(() => setStateDurabilityAdapterForTesting(undefined));
 
-const metadata: WorkspaceMetadata = { version: 1, name: 'safe', repoRoot: '/repo', worktree: '/repo/worktrees/safe', branch: 'agent-containers/safe', baseRef: 'refs/heads/main', devcontainerPath: '.devcontainer/devcontainer.json', createdAt: '2026-01-01T00:00:00.000Z' };
+const repoRoot = resolve(tmpdir(), 'agent-containers-repo');
+const worktreeRoot = join(repoRoot, 'worktrees');
+const metadata: WorkspaceMetadata = { version: 1, name: 'safe', repoRoot, worktree: join(worktreeRoot, 'safe'), branch: 'agent-containers/safe', baseRef: 'refs/heads/main', devcontainerPath: '.devcontainer/devcontainer.json', createdAt: '2026-01-01T00:00:00.000Z' };
 
 test('metadata rejects a filename/name mismatch and non-canonical paths', async () => {
   const stateDir = await mkdtemp(join(tmpdir(), 'agent-containers-state-'));
   await saveMetadata(stateDir, metadata);
   await rename(join(stateDir, 'workspaces', 'safe.json'), join(stateDir, 'workspaces', 'other.json'));
   await assert.rejects(() => loadMetadata(stateDir, 'other'), /does not match/);
-  await assert.rejects(() => saveMetadata(stateDir, { ...metadata, worktree: '/repo/worktrees/../safe' }), /invalid/);
+  const nonCanonicalWorktree = `${metadata.worktree}${sep}..${sep}${metadata.name}`;
+  await assert.rejects(() => saveMetadata(stateDir, { ...metadata, worktree: nonCanonicalWorktree }), /invalid/);
   await assert.rejects(() => saveMetadata(stateDir, { ...metadata, name: 'two--hyphens', branch: 'agent-containers/two--hyphens' }), /invalid/);
 });
 
@@ -60,7 +63,7 @@ test('metadata writes are atomic and never expose a predictable temporary file',
 
 test('listMetadata reads in bounded batches and returns deterministic workspace-name order', async () => {
   const stateDir = await mkdtemp(join(tmpdir(), 'agent-containers-list-metadata-'));
-  for (const name of ['zeta', 'alpha', 'middle']) await saveMetadata(stateDir, { ...metadata, name, branch: `agent-containers/${name}`, worktree: `/repo/worktrees/${name}` });
+  for (const name of ['zeta', 'alpha', 'middle']) await saveMetadata(stateDir, { ...metadata, name, branch: `agent-containers/${name}`, worktree: join(worktreeRoot, name) });
   assert.deepEqual((await listMetadata(stateDir)).map((entry) => entry.name), ['alpha', 'middle', 'zeta']);
 });
 
