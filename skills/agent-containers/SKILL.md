@@ -52,7 +52,7 @@ ac status [task-name]
 ac remove <task-name> --yes [--force-worktree]
 ```
 
-For experimental Codespaces setup only, use `ac init --backends codespaces` (or `both` with an explicit `--default-backend`), `ac configure --interactive` or `ac configure --non-interactive (--from <nonsecret-config-file>|--stdin)`, and `ac doctor --backend codespaces [--json]`. These commands do not create a Codespace or transport an agent. Do not enter API keys, tokens, SSH keys, or secret values: Agent Containers never owns those credentials, and the local harness remains the orchestrator.
+For experimental Codespaces configuration only, first set `AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES=1`, then use `ac init --non-interactive (--from <nonsecret-config-file>|--stdin)`, `ac configure --non-interactive (--from <nonsecret-config-file>|--stdin)`, or `ac doctor --backend codespaces [--json]`. These commands do not create a Codespace or transport an agent; Codespaces lifecycle is not implemented in this release. Do not enter API keys, tokens, SSH keys, or secret values: Agent Containers never owns those credentials, and the local harness remains the orchestrator.
 
 `agent-containers` is the full executable name and is interchangeable with `ac`.
 

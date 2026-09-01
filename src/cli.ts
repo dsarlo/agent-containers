@@ -24,11 +24,24 @@ export async function runCli(args: string[], cwd = process.cwd(), write: (messag
           write(`Wrote ${join(root, '.agent-containers.yml')}`);
           return 0;
         }
-        ensureOptions(rest, ['--backends', '--default-backend', '--interactive'], ['--interactive']);
+        ensureOptions(rest, ['--backends', '--default-backend', '--interactive', '--non-interactive', '--from', '--stdin'], ['--interactive', '--non-interactive', '--stdin']);
         const root = await findGitRoot(cwd, nodeProcessRunner);
         const selection = optionValue(rest, '--backends');
+        if (selection === 'codespaces' || selection === 'both') requireCodespacesExperimental();
+        const source = optionValue(rest, '--from');
+        const stdin = rest.includes('--stdin');
+        const nonInteractive = rest.includes('--non-interactive');
+        if ((source || stdin) && !nonInteractive) throw new UsageError('Noninteractive init imports require --non-interactive.');
+        if (source && stdin) throw new UsageError('Use only one of --from FILE or --stdin.');
         if (rest.includes('--interactive')) {
+          if (nonInteractive || source || stdin) throw new UsageError('Interactive init cannot be combined with noninteractive input.');
           const next = await interactiveConfig();
+          await initConfigV2(root, next);
+        } else if (source || stdin) {
+          const next = await loadConfigFromSource(source ? resolve(cwd, source) : undefined, stdin);
+          if (next.version !== 2) throw new Error('Noninteractive init accepts strict schema-v2 nonsecret configuration only.');
+          if (next.backends.enabled.includes('codespaces')) requireCodespacesExperimental();
+          write(configurationDiff(null, next));
           await initConfigV2(root, next);
         } else if (!selection) await initConfig(root, false);
         else await initConfigV2(root, setupConfig(selection, optionValue(rest, '--default-backend')));
@@ -46,6 +59,7 @@ export async function runCli(args: string[], cwd = process.cwd(), write: (messag
         const root = await findGitRoot(cwd, nodeProcessRunner);
         const next = interactive ? await interactiveConfig() : await loadConfigFromSource(source ? resolve(cwd, source) : undefined, stdin);
         if (next.version !== 2) throw new Error('ac configure accepts strict schema-v2 nonsecret configuration only.');
+        if (next.backends.enabled.includes('codespaces')) requireCodespacesExperimental();
         const path = join(root, '.agent-containers.yml');
         let current = null;
         let expectedCurrentHash: string | undefined;
@@ -65,6 +79,7 @@ export async function runCli(args: string[], cwd = process.cwd(), write: (messag
         const requestedBackend = optionValue(rest, '--backend') ?? 'all';
         if (requestedBackend !== 'local' && requestedBackend !== 'codespaces' && requestedBackend !== 'all') throw new UsageError('--backend must be local, codespaces, or all.');
         const backend = requestedBackend === 'all' ? 'both' : requestedBackend;
+        if (backend === 'codespaces' || backend === 'both') requireCodespacesExperimental();
         const root = await findGitRoot(cwd, nodeProcessRunner);
         const report = await doctor(await loadConfig(join(root, '.agent-containers.yml')), backend, nodeProcessRunner);
         if (rest.includes('--json')) write(JSON.stringify(report, null, 2));
@@ -89,6 +104,7 @@ export async function runCli(args: string[], cwd = process.cwd(), write: (messag
           const root = await findGitRoot(cwd, nodeProcessRunner, signal, 'lifecycle');
           const config = await loadConfig(join(root, '.agent-containers.yml'));
           recoveryWorktree = resolve(root, config.workspace.worktreeRoot, name);
+          assertLocalBackendEnabled(config);
           const baseBranch = optionValue(rest.slice(1), '--base');
           await assertDevcontainerPathCommittedOnBaseBranch(config, root, nodeProcessRunner, undefined, 'lifecycle', signal);
           if (baseBranch && baseBranch !== config.workspace.baseBranch) {
@@ -198,7 +214,15 @@ function ensureOptions(args: string[], allowed: string[], flags: string[] = []):
 }
 
 function usage(): string {
-  return 'Usage: agent-containers <init|configure|doctor|validate|create|exec|run|recover|unlock|status|remove> [options]\n  init [--interactive] [--backends local|codespaces|both] [--default-backend local|codespaces]\n  configure --interactive | --non-interactive (--from FILE|--stdin)\n  doctor [--backend local|codespaces|all] [--workspace NAME] [--json]';
+  return 'Usage: agent-containers <init|configure|doctor|validate|create|exec|run|recover|unlock|status|remove> [options]\n  init [--interactive] [--backends local|codespaces|both] [--default-backend local|codespaces]\n       [--non-interactive (--from FILE|--stdin)]\n  configure --interactive | --non-interactive (--from FILE|--stdin)\n  doctor [--backend local|codespaces|all] [--json]';
+}
+
+function requireCodespacesExperimental(): void {
+  if (process.env.AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES !== '1') throw new Error('Codespaces setup is experimental; set AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES=1 to enable it.');
+}
+
+function assertLocalBackendEnabled(config: import('./types.js').AgentContainersConfig): void {
+  if (config.version === 2 && !config.backends.enabled.includes('local')) throw new Error('Local backend is disabled by this configuration; Codespaces lifecycle is not implemented in this release.');
 }
 
 function setupConfig(selection: string, defaultBackend?: string): CodespacesAgentContainersConfig {

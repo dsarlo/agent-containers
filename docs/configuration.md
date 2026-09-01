@@ -25,9 +25,9 @@ Defaults are merged before validation. Supplied empty values, wrong types, unkno
 
 ## Schema v2 Codespaces setup
 
-Schema v1 remains local-only and unchanged. Schema v2 is opt-in through `ac init --backends codespaces` or `ac init --backends both --default-backend local|codespaces`. It is a nonsecret policy document: unknown fields, credential-like fields, public ports, invalid paths, and invalid limits are rejected before any side effect.
+Schema v1 remains local-only and unchanged. Schema v2 is experimental and requires `AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES=1`. Import a complete v2 document with `ac init --non-interactive --from FILE` or `ac init --non-interactive --stdin`; configuration updates use `ac configure --non-interactive --from FILE` or `ac configure --non-interactive --stdin`. It is a nonsecret policy document: unknown fields, public ports, invalid paths, and invalid limits are rejected before any side effect.
 
-`ac configure --interactive` accepts a complete schema-v2 document through a keyboard-only terminal flow. For automation, use the behaviorally equivalent `ac configure --non-interactive --from FILE` or `ac configure --non-interactive --stdin`. Each path validates the same schema, shows a complete nonsecret diff that calls out machine, idle timeout, retention, and capacity, then atomically saves or reports no change. No configuration command accepts, displays, stores, or reads tokens, API keys, SSH keys, or secret values.
+`ac configure --interactive` currently accepts a complete schema-v2 document from standard input; use the explicit noninteractive form for automation. Each path validates the same schema, shows a complete nonsecret diff that calls out machine, idle timeout, retention, and capacity, then atomically saves or reports no change. No configuration command accepts, displays, stores, or reads tokens, API keys, SSH keys, or secret values. Codespaces lifecycle is intentionally unavailable in this release.
 
 ```yaml
 version: 2
@@ -59,7 +59,7 @@ backends:
     secrets: { allowedRemoteSecretNames: [], allowCodespaceGitCredential: false }
 ```
 
-`ac doctor --backend local|codespaces|all [--workspace NAME] [--json]` is noninteractive and read-only. Its Codespaces provider calls are pinned-version, machine-readable `gh api` GET requests only; it never retrieves a token, alters authentication, creates an SSH key, changes a resource/configuration/secret/port, or starts a Codespace. Runtime checks are action-required until an exact running workspace is available to a later execution phase.
+`ac doctor --backend local|codespaces|all [--json]` is noninteractive and read-only. Codespaces setup and diagnosis require `AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES=1`. Its Codespaces provider calls are pinned-version, machine-readable `gh api` GET requests only; it never retrieves a token, alters authentication, creates an SSH key, changes a resource/configuration/secret/port, or starts a Codespace. Runtime checks are action-required until an exact running workspace is available to a later execution phase.
 
 ## v0.1 Dev Container compatibility
 

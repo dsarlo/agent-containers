@@ -79,9 +79,10 @@ jobs:
           node-version: 20.19.0
           cache: npm
       - run: npm ci
-      - run: npm run test:native
-        env:
-          EXPECTED_NATIVE_PUBLICATION_MODE: ${{ matrix.publication_mode }}
+       - run: npm run test:native
+         env:
+           EXPECTED_NATIVE_PUBLICATION_MODE: ${{ matrix.publication_mode }}
+       - run: npm test
       - run: npm run native:prebuild
       # actions/upload-artifact v5
       - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4

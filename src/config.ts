@@ -1,4 +1,4 @@
-import { lstat, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { lstat, readFile, rename, rm, unlink, writeFile } from 'node:fs/promises';
 import { createHash, randomUUID } from 'node:crypto';
 import { basename, dirname, isAbsolute, join, posix, win32 } from 'node:path';
 import { parse } from 'yaml';
@@ -184,6 +184,8 @@ function parseV2Config(input: Record<string, unknown>): CodespacesAgentContainer
   const codespaces = parseCodespaces(backends.codespaces);
   if (codespaces.enabled !== enabled.includes('codespaces')) throw new Error('Invalid configuration: codespaces.enabled must agree with backends.enabled');
   const config: CodespacesAgentContainersConfig = { version: 2, workspace: { worktreeRoot: requiredString(workspace.worktreeRoot, 'workspace.worktreeRoot'), baseBranch: requiredString(workspace.baseBranch, 'workspace.baseBranch') }, project: { repository: repository(project.repository), ref: optionalString(project.ref, 'project.ref') }, environment: { devcontainerPath: requiredString(environment.devcontainerPath, 'environment.devcontainerPath') }, backends: { enabled: [...enabled] as ('local' | 'codespaces')[], default: backends.default as 'local' | 'codespaces', local: {}, codespaces } };
+  if (enabled.includes('codespaces') && !config.project.repository) throw new Error('Invalid configuration: project.repository is required when Codespaces is enabled');
+  if (enabled.includes('codespaces') && !config.project.ref) throw new Error('Invalid configuration: project.ref is required when Codespaces is enabled');
   const devcontainerPath = safeRepositoryPath(config.environment.devcontainerPath);
   if (!devcontainerPath) throw new Error('Invalid configuration: environment.devcontainerPath must be a safe repository-relative path.');
   config.environment.devcontainerPath = devcontainerPath;
@@ -214,11 +216,31 @@ export function configurationDiff(current: AgentContainersConfig | null, next: A
 export function hashConfig(source: string): string { return createHash('sha256').update(source).digest('hex'); }
 export async function saveConfigAtomic(path: string, next: AgentContainersConfig, expectedCurrentHash?: string): Promise<'saved' | 'no-change'> {
   const source = `${JSON.stringify(next, null, 2)}\n`;
-  try { const current = await readFile(path, 'utf8'); if (current === source) return 'no-change'; if (expectedCurrentHash && hashConfig(current) !== expectedCurrentHash) throw new Error('Configuration changed concurrently; reload and review the new diff.'); } catch (error: unknown) { if (!isNodeError(error, 'ENOENT')) throw error; if (expectedCurrentHash) throw new Error('Configuration changed concurrently; it no longer exists.', { cause: error }); }
-  const temporary = join(dirname(path), `.${basename(path)}.${randomUUID()}.tmp`);
-  await writeFile(temporary, source, { encoding: 'utf8', flag: 'wx', mode: 0o600 });
-  try { await rename(temporary, path); } catch (error) { await rm(temporary, { force: true }); throw error; }
-  return 'saved';
+  // Reparse the serialized candidate at the publication boundary so callers
+  // cannot bypass the strict schema by constructing an object directly.
+  parseConfig(source);
+  const lock = `${path}.lock`;
+  await acquireConfigLock(lock);
+  try {
+    try { const current = await readFile(path, 'utf8'); if (current === source) return 'no-change'; if (expectedCurrentHash && hashConfig(current) !== expectedCurrentHash) throw new Error('Configuration changed concurrently; reload and review the new diff.'); } catch (error: unknown) { if (!isNodeError(error, 'ENOENT')) throw error; if (expectedCurrentHash) throw new Error('Configuration changed concurrently; it no longer exists.', { cause: error }); }
+    const temporary = join(dirname(path), `.${basename(path)}.${randomUUID()}.tmp`);
+    await writeFile(temporary, source, { encoding: 'utf8', flag: 'wx', mode: 0o600 });
+    try { await rename(temporary, path); } catch (error) { await rm(temporary, { force: true }); throw error; }
+    return 'saved';
+  } finally {
+    await unlink(lock).catch((error: unknown) => { if (!isNodeError(error, 'ENOENT')) throw new Error(`Could not release configuration lock ${lock}.`, { cause: error }); });
+  }
+}
+async function acquireConfigLock(lock: string): Promise<void> {
+  const deadline = Date.now() + 5_000;
+  for (;;) {
+    try { await writeFile(lock, `${process.pid}\n`, { encoding: 'utf8', flag: 'wx', mode: 0o600 }); return; }
+    catch (error: unknown) {
+      if (!isNodeError(error, 'EEXIST')) throw new Error(`Could not acquire configuration lock ${lock}.`, { cause: error });
+      if (Date.now() >= deadline) throw new Error('Configuration is being updated by another process; retry after reviewing the latest configuration.', { cause: error });
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, 10));
+    }
+  }
 }
 function requiredString(value: unknown, label: string): string { if (!nonEmptyString(value)) throw new Error(`Invalid configuration: ${label} must be a non-empty string`); return value; }
 function optionalString(value: unknown, label: string): string | undefined { return value === undefined ? undefined : requiredString(value, label); }

@@ -18,6 +18,16 @@ test('provider rejects incomplete identity and never adopts by name', async () =
   await assert.rejects(() => provider.get('same-name'), /complete Codespace identity/);
 });
 
+test('provider requires the observed Codespace name to equal the exact requested name', async () => {
+  const provider = new GhCodespacesProvider({ async run() { return { code: 0, stdout: JSON.stringify({ id: '42', name: 'other', environment_id: 'env', state: 'Available' }), stderr: '' }; } });
+  await assert.rejects(() => provider.get('requested'), /requested Codespace name/);
+});
+
+test('provider diagnostics redact URLs, query strings, and credential-shaped values', async () => {
+  const provider = new GhCodespacesProvider({ async run() { return { code: 1, stdout: '', stderr: 'GET https://api.example.test/path?token=abc Authorization: Bearer secret-value ghp_abcdefghijklmnopqrstuvwxyz123456' }; } });
+  await assert.rejects(() => provider.actor(), (error: Error) => !error.message.includes('https://') && !error.message.includes('secret-value') && !error.message.includes('ghp_'));
+});
+
 test('remote execution requests reject shell-shaped unsafe inputs before transport', () => {
   assert.throws(() => assertSafeExecuteRequest({ commandId: 'x', argv: ['echo', 'x\u0000y'], mode: 'pipe', stdin: 'closed' }), /NUL/);
   assert.throws(() => assertSafeExecuteRequest({ commandId: 'x', argv: ['echo'], cwd: '../outside', mode: 'pipe', stdin: 'closed' }), /repository-relative/);

@@ -319,3 +319,23 @@ test('init and implicit validation resolve the repository root from a subdirecto
   assert.equal(spawnSync('git', ['-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '-m', 'config'], { cwd: root }).status, 0);
   assert.equal(await runCli(['validate'], nested, () => undefined), 0);
 });
+
+test('Codespaces setup commands are unavailable without the explicit experimental gate', async () => {
+  const messages: string[] = [];
+  const previous = process.env.AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES;
+  delete process.env.AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES;
+  try {
+    assert.equal(await runCli(['init', '--backends', 'codespaces'], process.cwd(), (message) => messages.push(message)), 1);
+  } finally {
+    if (previous === undefined) delete process.env.AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES;
+    else process.env.AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES = previous;
+  }
+  assert.match(messages.at(-1) ?? '', /AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES=1/);
+});
+
+test('local create fails closed when schema v2 disables the local backend', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agent-containers-cli-local-disabled-'));
+  assert.equal(spawnSync('git', ['init', '-b', 'main'], { cwd: root }).status, 0);
+  await writeFile(join(root, '.agent-containers.yml'), JSON.stringify({ version: 2, workspace: { worktreeRoot: 'worktrees', baseBranch: 'main' }, project: { repository: 'owner/repo', ref: 'refs/heads/main' }, environment: { devcontainerPath: '.devcontainer/devcontainer.json' }, backends: { enabled: ['codespaces'], default: 'codespaces', local: {}, codespaces: { enabled: true, machine: null, geo: 'auto', idleTimeoutMinutes: 30, retentionPeriodMinutes: 1, maxTotal: 1, maxRunning: 1, maxCreating: 1, maxParallelCommandsPerWorkspace: 1, readiness: { providerTimeoutSeconds: 1, sshTimeoutSeconds: 1, command: [], commandTimeoutSeconds: 1 }, transport: { reconnectWindowSeconds: 1, cancelGraceSeconds: 1, remoteLogBytesPerStream: 1, remoteLogRetentionHours: 1 }, ports: { allowVisibilityChanges: false, allowPublic: false }, secrets: { allowedRemoteSecretNames: [], allowCodespaceGitCredential: false } } } }));
+  await assert.rejects(() => runCli(['create', 'blocked'], root, () => undefined), /Local backend is disabled/);
+});
