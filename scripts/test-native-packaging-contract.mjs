@@ -26,13 +26,14 @@ const sourceBuildSteps = `
         with:
           name: native-prebuild-${'${{ matrix.artifact }}'}
           path: prebuilds`;
-const assemblySteps = `
+function assemblySteps(downloadPath) {
+  return `
     needs: native-durability
     steps:
       - uses: actions/download-artifact@v4
         with:
           pattern: native-prebuild-*
-          path: prebuilds
+          path: ${downloadPath}
           merge-multiple: true
       - run: npm run native:verify-prebuilds
       - run: mkdir .pack && npm pack --pack-destination .pack
@@ -40,6 +41,7 @@ const assemblySteps = `
       - uses: actions/upload-artifact@v4
         with:
           name: native-package`;
+}
 const packageSmokeSteps = `
     needs: assemble-native-package
     steps:
@@ -53,7 +55,7 @@ const packageSmokeSteps = `
           PACKED_NATIVE_PACKAGE_DIR: .packed-native/node_modules/@dsarlo/agent-containers
           EXPECTED_NATIVE_PUBLICATION_MODE: ${'${{ matrix.publication_mode }}'}`;
 
-function workflowFor(entries) {
+function workflowFor(entries, assemblyDownloadPath = '.') {
   const matrixEntries = entries.map((entry) => `        - runner: ${entry.runner}\n          artifact: ${entry.artifact}\n          publication_mode: ${entry.publicationMode}`).join('\n');
   return `name: CI
 jobs:
@@ -65,7 +67,7 @@ jobs:
 ${matrixEntries}
 ${sourceBuildSteps}
   assemble-native-package:
-${assemblySteps}
+${assemblySteps(assemblyDownloadPath)}
   native-package-smoke:
     runs-on: ${'${{ matrix.runner }}'}
     strategy:
@@ -119,6 +121,14 @@ try {
     x64OnlyResult.status,
     0,
     'the static packaging contract must reject an x64-only native matrix that omits Linux, macOS, and Windows arm64 prebuilds',
+  );
+
+  await writeFixture(workflowFor(allSupportedArchitectures, 'prebuilds'));
+  const nestedPrebuildsResult = verifyFixture();
+  assert.notEqual(
+    nestedPrebuildsResult.status,
+    0,
+    'the static packaging contract must reject downloading artifacts at prebuilds when each artifact already contains prebuilds/<tuple>/*.node',
   );
 
   await writeFixture(workflowFor(allSupportedArchitectures));

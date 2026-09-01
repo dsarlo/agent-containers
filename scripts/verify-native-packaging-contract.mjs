@@ -47,6 +47,14 @@ function assertAllNativeBuilds(jobName) {
   );
 }
 
+function artifactStep(jobName, action) {
+  const job = workflowDefinition.jobs?.[jobName];
+  assert.ok(job, `workflow must define the ${jobName} job`);
+  const step = job.steps?.find(({ uses }) => uses === action);
+  assert.ok(step, `${jobName} must use ${action}`);
+  return step;
+}
+
 assert.ok(packageJson.files.includes('prebuilds'), 'published files must include bundled native prebuilds');
 assert.ok(packageJson.scripts['native:verify-prebuilds'], 'package must verify all bundled prebuilds before packing');
 assert.match(packageJson.scripts.prepack, /native:verify-prebuilds/, 'prepack must fail closed when the cross-platform prebuild matrix is incomplete');
@@ -58,13 +66,16 @@ for (const lifecycle of ['preinstall', 'install', 'postinstall']) {
 assertAllNativeBuilds('native-durability');
 requireMatch(/npm run test:native/, 'each native platform must source-build and smoke-test the addon');
 requireMatch(/npm run native:prebuild/, 'each native platform must produce its own prebuild');
-requireMatch(/name:\s*native-prebuild-\$\{\{ matrix\.artifact \}\}/, 'each native build must upload a named prebuild artifact');
-requireMatch(/path:\s*prebuilds/, 'native build artifacts must contain the prebuilds directory');
+const nativePrebuildUpload = artifactStep('native-durability', 'actions/upload-artifact@v4');
+assert.equal(nativePrebuildUpload.with?.name, 'native-prebuild-${{ matrix.artifact }}', 'each native build must upload a named prebuild artifact');
+assert.equal(nativePrebuildUpload.with?.path, 'prebuilds', 'each native prebuild artifact must preserve prebuilds/<tuple>/*.node as its archive root');
 
 assert.ok(workflowDefinition.jobs?.['assemble-native-package'], 'workflow must assemble one cross-platform package after native builds');
 requireMatch(/needs:\s*native-durability/, 'package assembly must wait for every native build');
-requireMatch(/pattern:\s*native-prebuild-\*/, 'package assembly must download every native prebuild artifact');
-requireMatch(/merge-multiple:\s*true/, 'package assembly must merge native prebuild artifacts into one matrix');
+const nativePrebuildDownload = artifactStep('assemble-native-package', 'actions/download-artifact@v4');
+assert.equal(nativePrebuildDownload.with?.pattern, 'native-prebuild-*', 'package assembly must download every native prebuild artifact');
+assert.equal(nativePrebuildDownload.with?.path, '.', 'package assembly must download artifacts at its workspace root so their prebuilds/<tuple>/*.node archive roots are not nested');
+assert.equal(nativePrebuildDownload.with?.['merge-multiple'], true, 'package assembly must merge native prebuild artifacts into one matrix');
 requireMatch(/npm run native:verify-prebuilds/, 'package assembly must reject incomplete native prebuild matrices');
 requireMatch(/npm pack --pack-destination \.pack/, 'package assembly must create the distributable tarball');
 requireMatch(/node scripts\/verify-native-package-tarball\.mjs \.pack\/\*\.tgz/, 'package assembly must verify every required prebuild was actually packaged');

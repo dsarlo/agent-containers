@@ -85,7 +85,7 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           pattern: native-prebuild-*
-          path: prebuilds
+          path: .
           merge-multiple: true
       - run: npm run native:verify-prebuilds
       - run: mkdir .pack && npm pack --pack-destination .pack

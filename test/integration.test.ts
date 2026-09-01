@@ -212,7 +212,10 @@ test('production execWorkspace lifecycle exposes the Git common directory inside
     git('add', '.');
     git('commit', '-m', 'initial');
     git('worktree', 'add', '--relative-paths', '-b', 'agent-containers/integration', worktree, 'main');
-    await execWorkspaceLifecycle({ version: 1, name: 'integration', repoRoot: repo, worktree, branch: 'agent-containers/integration', baseRef: 'refs/heads/main', devcontainerPath: '.devcontainer.json', createdAt: new Date().toISOString() }, ['sh', '-lc', 'git rev-parse --git-common-dir > .agent-containers-git-common-dir'], nodeProcessRunner, async (next) => { containerId = next.containerId; }, stateDir);
+    const metadata = { version: 1 as const, name: 'integration', repoRoot: repo, worktree, branch: 'agent-containers/integration', baseRef: 'refs/heads/main', devcontainerPath: '.devcontainer.json', createdAt: new Date().toISOString() };
+    const runCommonDirectoryCheck = () => execWorkspaceLifecycle(metadata, ['sh', '-lc', 'git rev-parse --git-common-dir > .agent-containers-git-common-dir'], nodeProcessRunner, async (next) => { containerId = next.containerId; }, stateDir);
+    await assert.rejects(runCommonDirectoryCheck, /Initialized the durable manual-recovery journal for workspace "integration"\. No Dev Containers command was dispatched; retry this invocation before remote work can begin\./);
+    await runCommonDirectoryCheck();
     assert.match(await readFile(join(worktree, '.agent-containers-git-common-dir'), 'utf8'), /worktrees|\.git/);
   } finally {
     if (containerId) spawnSync('docker', ['rm', '-f', containerId]);
