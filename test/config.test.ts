@@ -193,5 +193,8 @@ test('loadConfig rejects unknown schema keys while allowing arbitrary command na
     await assert.rejects(() => loadConfig(path), /unknown key/);
   }
   await writeFile(path, 'commands:\n  any-user-defined-name: npm test\n');
-  assert.equal((await loadConfig(path)).commands['any-user-defined-name'], 'npm test');
+  const config = await loadConfig(path);
+  assert.equal(config.version, 1);
+  if (config.version !== 1) throw new Error('expected legacy local configuration');
+  assert.equal(config.commands['any-user-defined-name'], 'npm test');
 });

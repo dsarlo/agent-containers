@@ -23,6 +23,44 @@ commands:
 
 Defaults are merged before validation. Supplied empty values, wrong types, unknown keys, or non-mapping root/section values are errors.
 
+## Schema v2 Codespaces setup
+
+Schema v1 remains local-only and unchanged. Schema v2 is opt-in through `ac init --backends codespaces` or `ac init --backends both --default-backend local|codespaces`. It is a nonsecret policy document: unknown fields, credential-like fields, public ports, invalid paths, and invalid limits are rejected before any side effect.
+
+`ac configure --interactive` accepts a complete schema-v2 document through a keyboard-only terminal flow. For automation, use the behaviorally equivalent `ac configure --non-interactive --from FILE` or `ac configure --non-interactive --stdin`. Each path validates the same schema, shows a complete nonsecret diff that calls out machine, idle timeout, retention, and capacity, then atomically saves or reports no change. No configuration command accepts, displays, stores, or reads tokens, API keys, SSH keys, or secret values.
+
+```yaml
+version: 2
+workspace:
+  worktreeRoot: ../.agent-containers-worktrees
+  baseBranch: main
+project:
+  repository: OWNER/REPOSITORY
+  ref: refs/heads/main
+environment:
+  devcontainerPath: .devcontainer/devcontainer.json
+backends:
+  enabled: [codespaces]
+  default: codespaces
+  local: {}
+  codespaces:
+    enabled: true
+    machine: null # Required later before any paid create operation.
+    geo: auto
+    idleTimeoutMinutes: 30
+    retentionPeriodMinutes: 10080
+    maxTotal: 4
+    maxRunning: 2
+    maxCreating: 1
+    maxParallelCommandsPerWorkspace: 1
+    readiness: { providerTimeoutSeconds: 1200, sshTimeoutSeconds: 120, command: [], commandTimeoutSeconds: 600 }
+    transport: { reconnectWindowSeconds: 60, cancelGraceSeconds: 10, remoteLogBytesPerStream: 67108864, remoteLogRetentionHours: 168 }
+    ports: { allowVisibilityChanges: false, allowPublic: false }
+    secrets: { allowedRemoteSecretNames: [], allowCodespaceGitCredential: false }
+```
+
+`ac doctor --backend local|codespaces|all [--workspace NAME] [--json]` is noninteractive and read-only. Its Codespaces provider calls are pinned-version, machine-readable `gh api` GET requests only; it never retrieves a token, alters authentication, creates an SSH key, changes a resource/configuration/secret/port, or starts a Codespace. Runtime checks are action-required until an exact running workspace is available to a later execution phase.
+
 ## v0.1 Dev Container compatibility
 
 The referenced JSON/JSONC configuration must not define `dockerComposeFile`, `workspaceMount`, or `workspaceFolder`. These modes are intentionally unsupported in v0.1 because Agent Containers needs to control the worktree folder and mount for safe lifecycle cleanup. Comments and comment-like text inside JSON strings are accepted.

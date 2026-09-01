@@ -1,4 +1,4 @@
-export interface AgentContainersConfig {
+export interface LocalAgentContainersConfig {
   version: 1;
   workspace: {
     worktreeRoot: string;
@@ -8,6 +8,54 @@ export interface AgentContainersConfig {
     devcontainerPath: string;
   };
   commands: Record<string, string>;
+}
+
+export type BackendKind = 'local' | 'codespaces';
+export type BackendSelection = BackendKind | 'both';
+export type SetupState = 'ready' | 'action-required' | 'unsupported';
+export type DoctorPhase = 'pre-provision' | 'provisioned-runtime';
+
+export interface CodespacesConfig {
+  enabled: boolean;
+  machine: string | null;
+  geo: string;
+  idleTimeoutMinutes: number;
+  retentionPeriodMinutes: number;
+  maxTotal: number;
+  maxRunning: number;
+  maxCreating: number;
+  maxParallelCommandsPerWorkspace: number;
+  readiness: { providerTimeoutSeconds: number; sshTimeoutSeconds: number; command: string[]; commandTimeoutSeconds: number };
+  transport: { reconnectWindowSeconds: number; cancelGraceSeconds: number; remoteLogBytesPerStream: number; remoteLogRetentionHours: number };
+  ports: { allowVisibilityChanges: boolean; allowPublic: boolean };
+  secrets: { allowedRemoteSecretNames: string[]; allowCodespaceGitCredential: boolean };
+}
+
+export interface CodespacesAgentContainersConfig {
+  version: 2;
+  workspace: { worktreeRoot: string; baseBranch: string };
+  project: { repository?: string; ref?: string };
+  environment: { devcontainerPath: string };
+  backends: { enabled: BackendKind[]; default: BackendKind; local: Record<string, never>; codespaces: CodespacesConfig };
+}
+
+export type AgentContainersConfig = LocalAgentContainersConfig | CodespacesAgentContainersConfig;
+
+export interface DoctorCheck {
+  id: string;
+  backend: BackendKind;
+  phase: DoctorPhase;
+  state: SetupState;
+  summary: string;
+  remediation: readonly string[];
+  evidence?: Readonly<Record<string, string | number | boolean | null>>;
+}
+
+export interface DoctorReport {
+  schemaVersion: 1;
+  selectedBackends: readonly BackendKind[];
+  overall: SetupState;
+  checks: readonly DoctorCheck[];
 }
 
 export interface ProcessResult {

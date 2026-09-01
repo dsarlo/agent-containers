@@ -1,5 +1,8 @@
 import { join, resolve } from 'node:path';
-import { assertDevcontainerPathCommittedOnBaseBranch, initConfig, loadConfig } from './config.js';
+import { readFile } from 'node:fs/promises';
+import { assertDevcontainerPathCommittedOnBaseBranch, configurationDiff, hashConfig, initConfig, initConfigV2, loadConfig, parseConfig, saveConfigAtomic } from './config.js';
+import { doctor } from './setup.js';
+import type { CodespacesAgentContainersConfig } from './types.js';
 import { acknowledgeUnconfirmedProcessReap, clearManualRecoveryIfCurrent, defaultStateDir, deleteMetadata, listMetadata, loadManualRecovery, loadMetadata, recordManualRecovery, releaseStaleWorkspaceLock, saveMetadata, withWorkspaceLock } from './state.js';
 import { execNamedWorkspaceLifecycle } from './runtime.js';
 import { createWorkspace, findGitRoot, nodeProcessRunner, removeWorkspace } from './workspaces.js';
@@ -14,11 +17,59 @@ export async function runCli(args: string[], cwd = process.cwd(), write: (messag
     const stateDir = defaultStateDir();
     switch (command) {
       case 'init': {
-        ensureOnly(rest, ['--force']);
+        if (rest.includes('--force')) {
+          ensureOnly(rest, ['--force']);
+          const root = await findGitRoot(cwd, nodeProcessRunner);
+          await initConfig(root, true);
+          write(`Wrote ${join(root, '.agent-containers.yml')}`);
+          return 0;
+        }
+        ensureOptions(rest, ['--backends', '--default-backend', '--interactive'], ['--interactive']);
         const root = await findGitRoot(cwd, nodeProcessRunner);
-        await initConfig(root, rest.includes('--force'));
+        const selection = optionValue(rest, '--backends');
+        if (rest.includes('--interactive')) {
+          const next = await interactiveConfig();
+          await initConfigV2(root, next);
+        } else if (!selection) await initConfig(root, false);
+        else await initConfigV2(root, setupConfig(selection, optionValue(rest, '--default-backend')));
         write(`Wrote ${join(root, '.agent-containers.yml')}`);
         return 0;
+      }
+      case 'configure': {
+        ensureOptions(rest, ['--non-interactive', '--interactive', '--from', '--stdin'], ['--non-interactive', '--interactive', '--stdin']);
+        const interactive = rest.includes('--interactive');
+        const stdin = rest.includes('--stdin');
+        if (interactive === stdin && !optionValue(rest, '--from')) throw new UsageError('Use exactly one of --interactive, --from FILE, or --stdin.');
+        if (interactive && !process.stdin.isTTY) throw new UsageError('Interactive configuration requires a TTY; use --non-interactive --stdin for unattended setup.');
+        if (!interactive && !rest.includes('--non-interactive')) throw new UsageError('Noninteractive configuration requires --non-interactive.');
+        const source = optionValue(rest, '--from');
+        const root = await findGitRoot(cwd, nodeProcessRunner);
+        const next = interactive ? await interactiveConfig() : await loadConfigFromSource(source ? resolve(cwd, source) : undefined, stdin);
+        if (next.version !== 2) throw new Error('ac configure accepts strict schema-v2 nonsecret configuration only.');
+        const path = join(root, '.agent-containers.yml');
+        let current = null;
+        let expectedCurrentHash: string | undefined;
+        try {
+          const currentSource = await readFile(path, 'utf8');
+          current = parseConfig(currentSource);
+          expectedCurrentHash = hashConfig(currentSource);
+        } catch (error: unknown) {
+          if (!(typeof error === 'object' && error !== null && 'code' in error && error.code === 'ENOENT')) throw error;
+        }
+        write(configurationDiff(current, next));
+        write((await saveConfigAtomic(path, next, expectedCurrentHash)) === 'saved' ? `Saved ${path}` : 'No configuration changes.');
+        return 0;
+      }
+      case 'doctor': {
+        ensureOptions(rest, ['--backend', '--workspace', '--json'], ['--json']);
+        const requestedBackend = optionValue(rest, '--backend') ?? 'all';
+        if (requestedBackend !== 'local' && requestedBackend !== 'codespaces' && requestedBackend !== 'all') throw new UsageError('--backend must be local, codespaces, or all.');
+        const backend = requestedBackend === 'all' ? 'both' : requestedBackend;
+        const root = await findGitRoot(cwd, nodeProcessRunner);
+        const report = await doctor(await loadConfig(join(root, '.agent-containers.yml')), backend, nodeProcessRunner);
+        if (rest.includes('--json')) write(JSON.stringify(report, null, 2));
+        else write(renderDoctor(report));
+        return report.overall === 'ready' ? 0 : 1;
       }
       case 'validate': {
         ensureOptions(rest, ['--config']);
@@ -137,14 +188,47 @@ function ensureOnly(args: string[], allowed: string[]): void {
   if (args.some((arg) => !allowed.includes(arg))) throw new UsageError(usage());
 }
 
-function ensureOptions(args: string[], allowed: string[]): void {
+function ensureOptions(args: string[], allowed: string[], flags: string[] = []): void {
   for (let index = 0; index < args.length; index += 1) {
     if (!allowed.includes(args[index])) throw new UsageError(usage());
+    if (flags.includes(args[index])) continue;
     index += 1;
     if (!args[index]) throw new UsageError(`${args[index - 1]} requires a value.`);
   }
 }
 
 function usage(): string {
-  return 'Usage: agent-containers <init|validate|create|exec|run|recover|unlock|status|remove> [options]';
+  return 'Usage: agent-containers <init|configure|doctor|validate|create|exec|run|recover|unlock|status|remove> [options]\n  init [--interactive] [--backends local|codespaces|both] [--default-backend local|codespaces]\n  configure --interactive | --non-interactive (--from FILE|--stdin)\n  doctor [--backend local|codespaces|all] [--workspace NAME] [--json]';
+}
+
+function setupConfig(selection: string, defaultBackend?: string): CodespacesAgentContainersConfig {
+  if (selection !== 'local' && selection !== 'codespaces' && selection !== 'both') throw new UsageError('--backends must be local, codespaces, or both.');
+  const enabled: Array<'local' | 'codespaces'> = selection === 'both' ? ['local', 'codespaces'] : [selection];
+  if (selection === 'both' && !defaultBackend) throw new UsageError('--default-backend is required when --backends both is selected.');
+  const selectedDefault = defaultBackend ?? (selection === 'codespaces' ? 'codespaces' : 'local');
+  if ((selectedDefault !== 'local' && selectedDefault !== 'codespaces') || !enabled.includes(selectedDefault)) throw new UsageError('--default-backend must be an enabled backend.');
+  return { version: 2, workspace: { worktreeRoot: '../.agent-containers-worktrees', baseBranch: 'main' }, project: {}, environment: { devcontainerPath: '.devcontainer/devcontainer.json' }, backends: { enabled: [...enabled], default: selectedDefault as 'local' | 'codespaces', local: {}, codespaces: { enabled: enabled.includes('codespaces'), machine: null, geo: 'auto', idleTimeoutMinutes: 30, retentionPeriodMinutes: 10080, maxTotal: 4, maxRunning: 2, maxCreating: 1, maxParallelCommandsPerWorkspace: 1, readiness: { providerTimeoutSeconds: 1200, sshTimeoutSeconds: 120, command: [], commandTimeoutSeconds: 600 }, transport: { reconnectWindowSeconds: 60, cancelGraceSeconds: 10, remoteLogBytesPerStream: 67108864, remoteLogRetentionHours: 168 }, ports: { allowVisibilityChanges: false, allowPublic: false }, secrets: { allowedRemoteSecretNames: [], allowCodespaceGitCredential: false } } } };
+}
+
+async function loadConfigFromSource(source: string | undefined, stdin: boolean): Promise<CodespacesAgentContainersConfig | import('./types.js').LocalAgentContainersConfig> {
+  if (source) return loadConfig(source);
+  if (!stdin) throw new UsageError('Usage: agent-containers configure --non-interactive (--from FILE|--stdin)');
+  return parseConfig(await readStdin());
+}
+
+async function interactiveConfig(): Promise<CodespacesAgentContainersConfig> {
+  process.stdout.write('Paste a complete nonsecret schema-v2 configuration, then end input (Ctrl-D/Ctrl-Z Enter). No tokens, keys, or secret values are accepted.\n');
+  const config = await loadConfigFromSource(undefined, true);
+  if (config.version !== 2) throw new Error('Interactive configuration requires strict schema-v2 nonsecret configuration.');
+  return config;
+}
+
+async function readStdin(): Promise<string> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of process.stdin) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  return Buffer.concat(chunks).toString('utf8');
+}
+
+function renderDoctor(report: import('./types.js').DoctorReport): string {
+  return report.checks.map((check) => `${check.backend}/${check.phase} ${check.state} ${check.id}: ${check.summary}${check.remediation.length ? `\n  ${check.remediation.join('\n  ')}` : ''}`).join('\n');
 }

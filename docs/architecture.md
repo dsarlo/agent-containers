@@ -19,3 +19,9 @@ Metadata records the name, canonical Git paths, `agent-containers/<name>` branch
 ## Non-goals
 
 Agent Containers is not an agent scheduler, authorization layer, or container sandbox. It does not inspect agent output, select an agent, alter target Dev Container security settings, or mount Docker sockets, credentials, or host homes.
+
+## Codespaces setup boundary
+
+Schema v2 has a strict backend selection and a provider adapter boundary. The adapter invokes `gh api` with fixed argument arrays, an explicit GitHub API version header, and JSON responses; it never reads a token or parses human-oriented output. Discovery and `doctor` are read-only; configuration publication is the one explicit local atomic write after a complete nonsecret preview. They do not create/start/stop/delete Codespaces, generate SSH keys, upload helpers, modify ports or secrets, or adopt an existing Codespace. Runtime checks remain explicit until an exact recorded running resource exists.
+
+The local harness remains the orchestrator and retains provider credentials and its agent loop. Any future Codespaces execution backend must send a framed argv protocol to a package-owned helper over a verified exact Codespace identity; it must not forward host files, environment, credentials, or use a shell command string.

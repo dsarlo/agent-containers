@@ -69,10 +69,21 @@ commands:
 
 The defaults are `version: 1`, `workspace.worktreeRoot: ../.agent-containers-worktrees`, `workspace.baseBranch: main`, and `environment.devcontainerPath: .devcontainer/devcontainer.json`. `commands` is descriptive only; Agent Containers never evaluates these command strings. `devcontainerPath` is a safe repository-relative **regular file** (symlinks are rejected): it resolves within each worktree, and both `validate` and `create` require it to be tracked on `baseBranch`. When `create --base <branch>` is used, the same file must also be tracked on that effective local base before any worktree side effect. An untracked configuration in the source checkout does not appear in a new worktree. `.agent-containers.yml` itself is read from the primary Git root and may remain untracked. If you place a copied `devcontainer.json` in a deeper directory, remember that `build.context` and `build.dockerfile` resolve independently relative to that config; for example use `"build": { "context": "..", "dockerfile": "../Dockerfile" }` when appropriate. See the [configuration reference](docs/configuration.md).
 
+### Experimental Codespaces setup
+
+Schema v2 introduces an opt-in Codespaces configuration surface without changing local v1 behavior. Run `ac init --backends codespaces` or `ac init --backends both`, then use `ac configure --non-interactive --from <nonsecret-config-file>` to preview and atomically save a complete v2 configuration. The setup file contains policy only: repository/ref, committed Dev Container path, machine, geo, timeouts, capacity, readiness argv, port policy, and named remote-secret capabilities. It never accepts, displays, or persists tokens, provider keys, SSH keys, secret values, or GitHub authentication.
+
+`ac doctor --backend local|codespaces|all [--workspace NAME] [--json]` is read-only. It uses `gh --version` and machine-readable GET API identity/preflight checks with a pinned GitHub API version, never calls `gh auth token`, creates a key, prompts, creates or starts a Codespace, uploads a helper, or changes ports/secrets/configuration. It explicitly reports runtime checks as action-required until an exact recorded running workspace can be safely assessed.
+
+Codespaces creation and command execution are intentionally not exposed by this setup foundation. A later gated release must provide the packaged remote helper, exact provider readback/no-adoption lifecycle, and fake-provider plus separately authorized live E2E evidence before enabling those operations.
+
 ## Lifecycle commands
 
 ```text
 agent-containers init [--force]
+agent-containers init [--backends local|codespaces|both] [--default-backend local|codespaces]
+agent-containers configure --non-interactive --from <nonsecret-config-file>
+agent-containers doctor [--backend local|codespaces|all] [--workspace NAME] [--json]
 agent-containers validate [--config path]
 agent-containers create <name> [--base branch]
 agent-containers exec <name> -- <command...>
