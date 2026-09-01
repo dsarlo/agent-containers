@@ -341,6 +341,8 @@ export interface WorkspaceLockOptions {
   onStateDirectoryDurability?: (step: StateDirectoryDurabilityStep) => void | Promise<void>;
   /** Explicit adapter injection for tests and embedders that provide equivalent native durability. */
   durabilityAdapter?: StateDurabilityAdapter;
+  /** Persist a recovery boundary before releasing this lock after a lifecycle child cannot be reaped. */
+  onUnconfirmedProcessReap?: (error: Error) => Promise<void>;
 }
 
 export type LockPublicationStep = 'owner-file-synced' | 'staging-directory-synced' | 'published' | 'locks-directory-synced';
@@ -350,9 +352,9 @@ export interface StateDirectoryDurabilityStep {
 }
 
 export async function withWorkspaceLock<T>(stateDir: string, name: string, action: (signal: AbortSignal) => Promise<T>, options: number | WorkspaceLockOptions = 30_000): Promise<T> {
-  const { timeoutMs, abortSignal, allowManualRecovery, onLockPublication, onStateDirectoryDurability, durabilityAdapter } = typeof options === 'number'
-    ? { timeoutMs: options, abortSignal: undefined, allowManualRecovery: false, onLockPublication: undefined, onStateDirectoryDurability: undefined, durabilityAdapter: undefined }
-    : { timeoutMs: options.timeoutMs ?? 30_000, abortSignal: options.abortSignal, allowManualRecovery: options.allowManualRecovery ?? false, onLockPublication: options.onLockPublication, onStateDirectoryDurability: options.onStateDirectoryDurability, durabilityAdapter: options.durabilityAdapter };
+  const { timeoutMs, abortSignal, allowManualRecovery, onLockPublication, onStateDirectoryDurability, durabilityAdapter, onUnconfirmedProcessReap } = typeof options === 'number'
+    ? { timeoutMs: options, abortSignal: undefined, allowManualRecovery: false, onLockPublication: undefined, onStateDirectoryDurability: undefined, durabilityAdapter: undefined, onUnconfirmedProcessReap: undefined }
+    : { timeoutMs: options.timeoutMs ?? 30_000, abortSignal: options.abortSignal, allowManualRecovery: options.allowManualRecovery ?? false, onLockPublication: options.onLockPublication, onStateDirectoryDurability: options.onStateDirectoryDurability, durabilityAdapter: options.durabilityAdapter, onUnconfirmedProcessReap: options.onUnconfirmedProcessReap };
   const durability = stateDurability(durabilityAdapter);
   await durability.assertStateWriteSupport();
   const lockName = validateWorkspaceName(name);
@@ -372,6 +374,7 @@ export async function withWorkspaceLock<T>(stateDir: string, name: string, actio
     throw error;
   }
   const cancellation = new AbortController();
+  let releaseLock = true;
   let receivedSignal: NodeJS.Signals | undefined;
   const cancel = () => cancellation.abort();
   const onSignal = (signal: NodeJS.Signals) => {
@@ -388,13 +391,29 @@ export async function withWorkspaceLock<T>(stateDir: string, name: string, actio
   try {
     if (cancellation.signal.aborted) throw abortError();
     return await action(cancellation.signal);
+  } catch (error: unknown) {
+    if (isUnconfirmedProcessReapError(error) && onUnconfirmedProcessReap) {
+      try {
+        await onUnconfirmedProcessReap(error);
+      } catch (recoveryError: unknown) {
+        // A retained durable lock is safer than releasing a lifecycle whose
+        // local process tree cannot be proven gone without a recovery record.
+        releaseLock = false;
+        throw recoveryError;
+      }
+    }
+    throw error;
   } finally {
     process.off('SIGINT', onInterrupt);
     process.off('SIGTERM', onTerminate);
     abortSignal?.removeEventListener('abort', cancel);
-    await durableRemove(lockPath, locksDir, true, durability);
+    if (releaseLock) await durableRemove(lockPath, locksDir, true, durability);
     if (receivedSignal) process.kill(process.pid, receivedSignal);
   }
+}
+
+function isUnconfirmedProcessReapError(error: unknown): error is Error {
+  return error instanceof Error && error.name === 'UnconfirmedProcessReapError';
 }
 
 /** Release only a lock whose recorded local owner PID is proven no longer alive. */

@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import test from 'node:test';
-import { createNodeProcessRunner, createWorkspace, nodeProcessRunner, PROCESS_OUTPUT_LIMIT } from '../src/workspaces.js';
+import { createNodeProcessRunner, createWorkspace, nodeProcessRunner, PROCESS_OUTPUT_LIMIT, UnconfirmedProcessReapError } from '../src/workspaces.js';
 import { execWorkspaceLifecycle } from '../src/runtime.js';
 import { isLiveIntegrationEnabled, probeLiveIntegrationPrerequisites } from '../src/live-integration.js';
 
@@ -66,7 +66,7 @@ test('nodeProcessRunner does not invoke an output callback for inherited stdio',
   assert.equal(observed, false);
 });
 
-test('nodeProcessRunner directly reaps the Windows root when taskkill errors without closing, while awaiting the managed child', async () => {
+test('nodeProcessRunner rejects a Windows lifecycle cancellation when taskkill errors even after the root closes', async () => {
   const calls: Array<{ command: string; args: string[]; options: Record<string, unknown> }> = [];
   const killers: EventEmitter[] = [];
   const rootKillSignals: NodeJS.Signals[] = [];
@@ -85,9 +85,9 @@ test('nodeProcessRunner directly reaps the Windows root when taskkill errors wit
     return killer as ChildProcess;
   }) as typeof spawn;
   const controller = new AbortController();
-  const runner = createNodeProcessRunner({ platform: 'win32', spawn: spawnForTest });
+  const runner = createNodeProcessRunner({ platform: 'win32', spawn: spawnForTest, windowsReapTimeoutMs: 0 });
   let settled = false;
-  const running = runner.run('managed-command', [], { signal: controller.signal }).then((result) => { settled = true; return result; });
+  const running = runner.run('managed-command', [], { kind: 'lifecycle', signal: controller.signal }).then((result) => { settled = true; return result; }, (error: unknown) => { settled = true; return error; });
 
   controller.abort();
   await new Promise((resolveTick) => setImmediate(resolveTick));
@@ -99,12 +99,11 @@ test('nodeProcessRunner directly reaps the Windows root when taskkill errors wit
   await new Promise((resolveTick) => setImmediate(resolveTick));
   try {
     assert.deepEqual(rootKillSignals, ['SIGKILL'], 'a taskkill error gets one direct root fallback without a shell');
-    assert.equal(settled, false, 'the managed child is still awaited after cancellation');
   } finally {
     managedChild.emit('close', 1);
   }
 
-  assert.equal((await running).code, 1);
+  assert.ok(await running instanceof UnconfirmedProcessReapError);
   assert.equal(settled, true);
 });
 
@@ -133,8 +132,79 @@ test('nodeProcessRunner rejects through Windows reaping recovery when taskkill a
   controller.abort();
   await new Promise((resolveDelay) => setTimeout(resolveDelay, 0));
   assert.equal(settled, true, 'a Windows child that never closes must enter recovery instead of retaining the lifecycle lock');
-  assert.match(failure?.message ?? '', /Windows process reaping timed out/);
+  assert.match(failure?.message ?? '', /Windows process-tree reaping could not be confirmed/);
   assert.deepEqual(rootKillSignals, ['SIGKILL'], 'the timed-out recovery makes one shell-free root termination attempt');
+});
+
+test('nodeProcessRunner drives the bounded Windows failure path through its injected reaping timer', async () => {
+  const managedChild = Object.assign(new EventEmitter(), { pid: 9753, kill: () => true }) as unknown as ChildProcess;
+  const timerCallbacks: Array<() => void> = [];
+  const runner = createNodeProcessRunner({
+    platform: 'win32',
+    spawn: ((command: string) => command === 'taskkill' ? new EventEmitter() as ChildProcess : managedChild) as typeof spawn,
+    setTimeout: ((callback: () => void) => { timerCallbacks.push(callback); return {} as NodeJS.Timeout; }) as typeof setTimeout,
+    clearTimeout: (() => undefined) as typeof clearTimeout,
+  });
+  const controller = new AbortController();
+  const running = runner.run('managed-command', [], { kind: 'lifecycle', signal: controller.signal });
+  controller.abort();
+  assert.equal(timerCallbacks.length, 1);
+  timerCallbacks[0]();
+  await assert.rejects(running, UnconfirmedProcessReapError);
+});
+
+test('nodeProcessRunner does not treat a cancelled POSIX root close as process-group reaping proof', async () => {
+  const managedChild = Object.assign(new EventEmitter(), {
+    pid: 2468,
+    kill: () => true,
+  }) as unknown as ChildProcess;
+  const signals: NodeJS.Signals[] = [];
+  let groupGone = false;
+  const processKill = ((pid: number, signal?: NodeJS.Signals | 0) => {
+    if (pid !== -2468) throw new Error(`unexpected PID ${pid}`);
+    if (signal === 0 && !groupGone) return true;
+    if (signal === 0) throw Object.assign(new Error('gone'), { code: 'ESRCH' });
+    signals.push(signal as NodeJS.Signals);
+    if (signal === 'SIGKILL') groupGone = true;
+    return true;
+  }) as typeof process.kill;
+  const runner = createNodeProcessRunner({
+    platform: 'linux',
+    spawn: (() => managedChild) as typeof spawn,
+    processKill,
+    posixGraceMs: 0,
+    posixVerificationTimeoutMs: 50,
+    reapPollMs: 0,
+  } as never);
+  const controller = new AbortController();
+  let settled = false;
+  const running = runner.run('managed-command', [], { signal: controller.signal }).then((result) => { settled = true; return result; });
+
+  controller.abort();
+  managedChild.emit('close', 1);
+  await new Promise((resolveTick) => setImmediate(resolveTick));
+  assert.equal(settled, false, 'root close alone cannot prove descendants were reaped');
+  await new Promise((resolveDelay) => setTimeout(resolveDelay, 5));
+  assert.deepEqual(signals, ['SIGTERM', 'SIGKILL']);
+  assert.equal((await running).code, 1);
+});
+
+test('nodeProcessRunner returns an unconfirmed lifecycle failure when POSIX process-group death cannot be proven', async () => {
+  const managedChild = Object.assign(new EventEmitter(), { pid: 1357, kill: () => true }) as unknown as ChildProcess;
+  const processKill = (() => true) as typeof process.kill;
+  const runner = createNodeProcessRunner({
+    platform: 'linux',
+    spawn: (() => managedChild) as typeof spawn,
+    processKill,
+    posixGraceMs: 0,
+    posixVerificationTimeoutMs: 0,
+    reapPollMs: 0,
+  } as never);
+  const controller = new AbortController();
+  const running = runner.run('managed-command', [], { kind: 'lifecycle', signal: controller.signal });
+  controller.abort();
+  managedChild.emit('close', 1);
+  await assert.rejects(running, UnconfirmedProcessReapError);
 });
 
 test('nodeProcessRunner abort terminates spawned process-group descendants before settling', { skip: process.platform === 'win32' }, async () => {

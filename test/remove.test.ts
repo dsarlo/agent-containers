@@ -3,8 +3,8 @@ import { mkdtemp, symlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
-import { removeWorkspace } from '../src/workspaces.js';
-import type { WorkspaceMetadata } from '../src/state.js';
+import { removeWorkspace, UnconfirmedProcessReapError } from '../src/workspaces.js';
+import { bootstrapManualRecoveryJournal, loadManualRecovery, recordManualRecovery, withWorkspaceLock, type WorkspaceMetadata } from '../src/state.js';
 
 const containerId = 'abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789';
 const inspection = `${containerId}\n/repo/worktrees/safe\n`;
@@ -22,11 +22,34 @@ test('removeWorkspace requires confirmation and records every safe destructive c
     { command: 'git', args: ['rev-parse', '--verify', 'refs/heads/main'], cwd: '/repo' },
     { command: 'git', args: ['merge-base', '--is-ancestor', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'], cwd: '/repo' },
     { command: 'git', args: ['status', '--porcelain=v1', '--untracked-files=all'], cwd: '/repo/worktrees/safe' },
-    { command: 'docker', args: ['inspect', '--format', '{{.Id}}\n{{ index .Config.Labels "devcontainer.local_folder" }}', containerId], kind: 'probe' },
-    { command: 'docker', args: ['rm', '-f', containerId], kind: 'probe' },
+    { command: 'docker', args: ['inspect', '--format', '{{.Id}}\n{{ index .Config.Labels "devcontainer.local_folder" }}', containerId] },
+    { command: 'docker', args: ['rm', '-f', containerId] },
     { command: 'git', args: ['worktree', 'remove', '/repo/worktrees/safe'], cwd: '/repo' },
     { command: 'git', args: ['update-ref', '--stdin'], cwd: '/repo', input: 'start\nverify refs/heads/main aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\ndelete refs/heads/agent-containers/safe aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nprepare\ncommit\n' },
-  ]);
+  ].map((call) => ({ ...call, kind: 'lifecycle' })));
+});
+
+test('remove lifecycle records durable recovery before its workspace lock releases an unconfirmed local reap', async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), 'agent-containers-remove-unconfirmed-reap-'));
+  await bootstrapManualRecoveryJournal(stateDir, metadata.name);
+  const runner = {
+    async run(_command: string, _args: string[], options?: { kind?: string }) {
+      assert.equal(options?.kind, 'lifecycle');
+      throw new UnconfirmedProcessReapError();
+    },
+  };
+
+  await assert.rejects(
+    () => withWorkspaceLock(
+      stateDir,
+      metadata.name,
+      (signal) => removeWorkspace(metadata, { confirmed: true, signal }, runner, async () => undefined, async () => undefined),
+      { onUnconfirmedProcessReap: () => recordManualRecovery(stateDir, metadata.name, { reason: 'local-process-reap-unconfirmed', containerIds: [], worktree: metadata.worktree }) },
+    ),
+    UnconfirmedProcessReapError,
+  );
+  assert.equal((await loadManualRecovery(stateDir, metadata.name))?.reason, 'local-process-reap-unconfirmed');
+  await assert.rejects(() => withWorkspaceLock(stateDir, metadata.name, async () => undefined), /manual recovery/);
 });
 
 test('removeWorkspace passes --force only for the verified recorded worktree after confirmation', async () => {

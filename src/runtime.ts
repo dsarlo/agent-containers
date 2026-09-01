@@ -87,7 +87,7 @@ export async function execWorkspace(metadata: WorkspaceMetadata, command: string
     const cleanupSignal = AbortSignal.timeout(5_000);
     let inspection: ProcessResult;
     try {
-      inspection = await runner.run('docker', ['inspect', '--format', '{{.Id}}\n{{ index .Config.Labels "devcontainer.local_folder" }}', containerId], withSignal({ kind: 'probe' }, cleanupSignal));
+      inspection = await runner.run('docker', ['inspect', '--format', '{{.Id}}\n{{ index .Config.Labels "devcontainer.local_folder" }}', containerId], withSignal({ kind: 'readonly-probe' }, cleanupSignal));
     } catch (inspectionError: unknown) {
       const inspectionDetail = inspectionError instanceof Error ? inspectionError.message : String(inspectionError);
       throw new Error(`Could not persist container metadata (${detail}); did not remove unverified container ${containerId} because Docker inspection failed: ${inspectionDetail}. The manual recovery block remains in place.`, { cause: inspectionError });
@@ -98,7 +98,7 @@ export async function execWorkspace(metadata: WorkspaceMetadata, command: string
     }
     let cleanup: ProcessResult;
     try {
-      cleanup = await runner.run('docker', ['rm', '-f', containerId], withSignal({ kind: 'probe' }, cleanupSignal));
+      cleanup = await runner.run('docker', ['rm', '-f', containerId], withSignal({ kind: 'lifecycle' }, cleanupSignal));
     } catch (cleanupError: unknown) {
       const cleanupDetail = cleanupError instanceof Error ? cleanupError.message : String(cleanupError);
       throw new Error(`Could not persist container metadata (${detail}) and could not remove untracked container ${containerId}: ${cleanupDetail}.`, { cause: cleanupError });
@@ -138,7 +138,7 @@ async function ambiguousUpRecovery(metadata: WorkspaceMetadata, runner: ProcessR
   for (let attempt = 0; attempt < zeroCandidatePolls; attempt += 1) {
     let candidates: string[];
     try {
-      const listed = await runner.run('docker', ['ps', '--all', '--quiet', '--no-trunc', '--filter', `label=devcontainer.local_folder=${metadata.worktree}`], withSignal({ kind: 'probe' }, inspectionSignal));
+        const listed = await runner.run('docker', ['ps', '--all', '--quiet', '--no-trunc', '--filter', `label=devcontainer.local_folder=${metadata.worktree}`], withSignal({ kind: 'readonly-probe' }, inspectionSignal));
       if (listed.code !== 0) return recordAmbiguousUp(recordRecovery, metadata, [], `Docker could not list candidate containers: ${commandDetail(listed)}`);
       candidates = listed.stdout.split(/\r?\n/).map((id) => id.trim()).filter(isDockerContainerId);
     } catch (error: unknown) {
@@ -148,7 +148,7 @@ async function ambiguousUpRecovery(metadata: WorkspaceMetadata, runner: ProcessR
     matching = [];
     for (const candidate of candidates) {
       try {
-        const inspected = await runner.run('docker', ['inspect', '--format', '{{.Id}}\n{{ index .Config.Labels "devcontainer.local_folder" }}', candidate], withSignal({ kind: 'probe' }, inspectionSignal));
+        const inspected = await runner.run('docker', ['inspect', '--format', '{{.Id}}\n{{ index .Config.Labels "devcontainer.local_folder" }}', candidate], withSignal({ kind: 'readonly-probe' }, inspectionSignal));
         if (inspected.code !== 0) return recordAmbiguousUp(recordRecovery, metadata, candidates, `Docker could not verify candidate ${candidate}: ${commandDetail(inspected)}`);
         if (isOwnedContainerInspection(inspected.stdout, candidate, metadata.worktree)) matching.push(candidate);
       } catch (error: unknown) {
@@ -182,7 +182,7 @@ async function recordAmbiguousUp(recordRecovery: RecoveryRecorder, metadata: Wor
 function isDockerContainerId(value: string): boolean { return isCanonicalContainerId(value); }
 
 async function inspectOwnedContainer(metadata: WorkspaceMetadata, containerId: string, runner: ProcessRunner, signal?: AbortSignal): Promise<boolean> {
-  const inspection = await runner.run('docker', ['inspect', '--format', '{{.Id}}\n{{ index .Config.Labels "devcontainer.local_folder" }}', containerId], withSignal({ kind: 'probe' }, signal));
+  const inspection = await runner.run('docker', ['inspect', '--format', '{{.Id}}\n{{ index .Config.Labels "devcontainer.local_folder" }}', containerId], withSignal({ kind: 'readonly-probe' }, signal));
   return inspection.code === 0 && isOwnedContainerInspection(inspection.stdout, containerId, metadata.worktree);
 }
 

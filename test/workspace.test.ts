@@ -65,7 +65,7 @@ test('createWorkspace uses relative Git directory pointers when Git supports the
     },
   };
   await createWorkspace({ cwd: directory, name: 'relative', config: { version: 1, workspace: { worktreeRoot: 'worktrees', baseBranch: 'main' }, environment: { devcontainerPath: '.devcontainer/devcontainer.json' }, commands: {} }, stateDir: join(directory, 'state'), runner });
-  assert.deepEqual(calls.at(-1), { command: 'git', args: ['worktree', 'add', '--relative-paths', '-b', 'agent-containers/relative', join(directory, 'worktrees', 'relative'), 'refs/heads/main'], cwd: directory });
+  assert.deepEqual(calls.at(-1), { command: 'git', args: ['worktree', 'add', '--relative-paths', '-b', 'agent-containers/relative', join(directory, 'worktrees', 'relative'), 'refs/heads/main'], cwd: directory, kind: 'lifecycle' });
 });
 
 test('createWorkspace refuses to create a linked worktree when Git lacks relative Git directory pointers', async () => {
