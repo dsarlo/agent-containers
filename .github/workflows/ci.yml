@@ -17,8 +17,10 @@ jobs:
       matrix:
         node: [20, 22, 24]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      # actions/checkout v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      # actions/setup-node v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: ${{ matrix.node }}
           cache: npm
@@ -55,8 +57,10 @@ jobs:
             artifact: win32-arm64
             publication_mode: recoverable
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      # actions/checkout v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      # actions/setup-node v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: 20.19.0
           cache: npm
@@ -65,7 +69,8 @@ jobs:
         env:
           EXPECTED_NATIVE_PUBLICATION_MODE: ${{ matrix.publication_mode }}
       - run: npm run native:prebuild
-      - uses: actions/upload-artifact@v4
+      # actions/upload-artifact v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: native-prebuild-${{ matrix.artifact }}
           path: prebuilds
@@ -76,24 +81,28 @@ jobs:
     needs: native-durability
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      # actions/checkout v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      # actions/setup-node v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: 20.19.0
           cache: npm
       - run: npm ci
-      - uses: actions/download-artifact@v4
+      # actions/download-artifact v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           pattern: native-prebuild-*
           path: .
           merge-multiple: true
       - run: npm run native:verify-prebuilds
-      - run: mkdir .pack && npm pack --pack-destination .pack
-      - run: node scripts/verify-native-package-tarball.mjs .pack/*.tgz
-      - uses: actions/upload-artifact@v4
+      - run: mkdir native-package && npm pack --pack-destination native-package
+      - run: node scripts/verify-native-package-tarball.mjs native-package/*.tgz
+      # actions/upload-artifact v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: native-package
-          path: .pack/*.tgz
+          path: native-package/*.tgz
           if-no-files-found: error
 
   native-package-smoke:
@@ -123,18 +132,21 @@ jobs:
             artifact: win32-arm64
             publication_mode: recoverable
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      # actions/checkout v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      # actions/setup-node v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: 20.19.0
           cache: npm
-      - uses: actions/download-artifact@v4
+      # actions/download-artifact v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           name: native-package
-          path: .pack
+          path: native-package
       - name: Install assembled package without lifecycle downloads
         shell: bash
-        run: mkdir .packed-native && npm install --prefix .packed-native .pack/*.tgz
+        run: mkdir .packed-native && npm install --prefix .packed-native native-package/*.tgz
       - name: Load and smoke-test installed production native adapter
         run: node scripts/test-native.mjs
         env:
@@ -145,12 +157,15 @@ jobs:
     name: Live Dev Containers lifecycle
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      # actions/checkout v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      # actions/setup-node v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: 20.19.0
           cache: npm
       - run: npm ci
+      - run: npm run build:native
       - run: npm install --global @devcontainers/cli@0.89.0
       - name: Require Docker, Dev Containers, and relative linked-worktree support
         run: |
