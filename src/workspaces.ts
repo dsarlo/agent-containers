@@ -4,6 +4,7 @@ import { resolve, win32 } from 'node:path';
 import type { AgentContainersConfig, ProcessResult, ProcessRunner, ProcessRunOptions } from './types.js';
 import { validateWorkspaceName } from './names.js';
 import { bootstrapManualRecoveryJournal, deleteMetadata, isAgentContainersWorkspace, isCanonicalContainerId, loadMetadata, saveMetadata, type WorkspaceMetadata } from './state.js';
+import { getAuthoritativeWindowsDirectory } from './durability.js';
 
 export type { ProcessRunner } from './types.js';
 
@@ -27,8 +28,8 @@ export interface NodeProcessRunnerDependencies {
   posixVerificationTimeoutMs?: number;
   /** Override process-group signalling only for focused process-runner tests. */
   processKill?: typeof process.kill;
-  /** Override the trusted Windows system root for focused process-runner tests. */
-  systemRoot?: string;
+  /** Override the native Windows-directory bridge for focused process-runner tests. */
+  windowsDirectory?: () => string | undefined;
   /** Override cancellation timers only for focused process-runner tests. */
   setTimeout?: typeof setTimeout;
   clearTimeout?: typeof clearTimeout;
@@ -49,7 +50,7 @@ export function createNodeProcessRunner({
   posixGraceMs = POSIX_REAP_GRACE_MS,
   posixVerificationTimeoutMs = POSIX_REAP_VERIFICATION_TIMEOUT_MS,
   processKill = process.kill,
-  systemRoot = process.env.SystemRoot,
+  windowsDirectory = getAuthoritativeWindowsDirectory,
   setTimeout: schedule = setTimeout,
   clearTimeout: cancelTimer = clearTimeout,
 }: NodeProcessRunnerDependencies = {}): ProcessRunner {
@@ -72,6 +73,8 @@ export function createNodeProcessRunner({
         let cancellationDeadline: NodeJS.Timeout | undefined;
         let cancellationStarted = false;
         let windowsReaper: ChildProcess | undefined;
+        let windowsReaperLive = false;
+        let rootClosed = false;
         let rootTerminationAttempted = false;
         const terminateRootOnce = () => {
           if (rootTerminationAttempted) return;
@@ -147,9 +150,11 @@ export function createNodeProcessRunner({
           } else {
             let killer: ChildProcess;
             try {
-              if (!Number.isSafeInteger(child.pid) || child.pid <= 0 || !isTrustedWindowsSystemRoot(systemRoot)) throw new Error('trusted taskkill path unavailable');
-              killer = spawnProcess(win32.join(systemRoot, 'System32', 'taskkill.exe'), ['/PID', String(child.pid), '/T', '/F'], { shell: false, stdio: 'ignore', windowsHide: true });
+              const directory = windowsDirectory();
+              if (!Number.isSafeInteger(child.pid) || child.pid <= 0 || directory === undefined) throw new Error('authoritative taskkill path unavailable');
+              killer = spawnProcess(win32.join(directory, 'System32', 'taskkill.exe'), ['/PID', String(child.pid), '/T', '/F'], { shell: false, stdio: 'ignore', windowsHide: true });
               windowsReaper = killer;
+              windowsReaperLive = true;
             } catch {
               try { terminateRootOnce(); } catch { unconfirmed(); }
               return;
@@ -158,18 +163,22 @@ export function createNodeProcessRunner({
             const fallback = () => {
               if (killerSettled) return;
               killerSettled = true;
+              windowsReaperLive = false;
               try { terminateRootOnce(); } catch { unconfirmed(); }
+              if (rootClosed) finishCancellation();
             };
             killer.once('error', fallback);
             killer.once('close', (code) => {
               if (killerSettled) return;
               killerSettled = true;
+              windowsReaperLive = false;
               if (code === 0) {
                 // taskkill and root close do not prove an adversarial descendant
                 // remained in the Windows tree boundary.
                 unconfirmed();
               } else {
                 try { terminateRootOnce(); } catch { unconfirmed(); }
+                if (rootClosed) finishCancellation();
               }
             });
           }
@@ -190,11 +199,12 @@ export function createNodeProcessRunner({
           else fail(error);
         });
         child.on('close', (code) => {
+          rootClosed = true;
           receive('stdout', Buffer.alloc(0), true);
           receive('stderr', Buffer.alloc(0), true);
           const rootResult = { code: code ?? 1, stdout, stderr };
           if (!cancellationStarted) settle(rootResult);
-          else {
+          else if (platform !== 'win32' || !windowsReaperLive) {
             finishCancellation();
           }
         });
@@ -202,10 +212,6 @@ export function createNodeProcessRunner({
       });
     },
   };
-}
-
-function isTrustedWindowsSystemRoot(value: string | undefined): value is string {
-  return typeof value === 'string' && win32.isAbsolute(value) && !/[\0\r\n]/.test(value);
 }
 
 export const nodeProcessRunner: ProcessRunner = createNodeProcessRunner();

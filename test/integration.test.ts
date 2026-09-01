@@ -85,7 +85,7 @@ test('nodeProcessRunner rejects a Windows lifecycle cancellation when taskkill e
     return killer as ChildProcess;
   }) as typeof spawn;
   const controller = new AbortController();
-  const runner = createNodeProcessRunner({ platform: 'win32', spawn: spawnForTest, windowsReapTimeoutMs: 0, systemRoot: 'C:\\Windows' });
+  const runner = createNodeProcessRunner({ platform: 'win32', spawn: spawnForTest, windowsReapTimeoutMs: 0, windowsDirectory: () => 'C:\\Windows' });
   let settled = false;
   const running = runner.run('managed-command', [], { kind: 'lifecycle', signal: controller.signal }).then((result) => { settled = true; return result; }, (error: unknown) => { settled = true; return error; });
 
@@ -151,6 +151,69 @@ test('nodeProcessRunner drives the bounded Windows failure path through its inje
   assert.equal(timerCallbacks.length, 1);
   timerCallbacks[0]();
   await assert.rejects(running, UnconfirmedProcessReapError);
+});
+
+test('nodeProcessRunner keeps the Windows reaper deadline when the root closes before taskkill', async () => {
+  const rootKillSignals: NodeJS.Signals[] = [];
+  const reaperKillSignals: NodeJS.Signals[] = [];
+  const root = Object.assign(new EventEmitter(), {
+    pid: 9754,
+    kill: (signal: NodeJS.Signals) => { rootKillSignals.push(signal); return true; },
+  }) as unknown as ChildProcess;
+  const taskkill = Object.assign(new EventEmitter(), {
+    kill: (signal: NodeJS.Signals) => { reaperKillSignals.push(signal); return true; },
+  }) as unknown as ChildProcess;
+  const timers: Array<() => void> = [];
+  const runner = createNodeProcessRunner({
+    platform: 'win32',
+    windowsDirectory: () => 'C:\\Windows',
+    spawn: ((command: string) => command.endsWith('taskkill.exe') ? taskkill : root) as typeof spawn,
+    setTimeout: ((callback: () => void) => { timers.push(callback); return {} as NodeJS.Timeout; }) as typeof setTimeout,
+    clearTimeout: (() => undefined) as typeof clearTimeout,
+  });
+  const controller = new AbortController();
+  const running = runner.run('managed-command', [], { kind: 'lifecycle', signal: controller.signal });
+  controller.abort();
+  root.emit('close', 1);
+
+  assert.equal(timers.length, 1, 'root close must not cancel the deadline while taskkill remains live');
+  timers[0]?.();
+  await assert.rejects(running, UnconfirmedProcessReapError);
+  assert.deepEqual(reaperKillSignals, ['SIGKILL']);
+  assert.deepEqual(rootKillSignals, ['SIGKILL']);
+});
+
+test('nodeProcessRunner ignores custom and UNC SystemRoot values without an authoritative Windows directory', async () => {
+  const originalSystemRoot = process.env.SystemRoot;
+  try {
+    for (const systemRoot of ['C:\\attacker-controlled', '\\\\attacker\\share\\Windows']) {
+      const calls: string[] = [];
+      const rootKillSignals: NodeJS.Signals[] = [];
+      const root = Object.assign(new EventEmitter(), {
+        pid: 9755,
+        kill: (signal: NodeJS.Signals) => { rootKillSignals.push(signal); return true; },
+      }) as unknown as ChildProcess;
+      const timers: Array<() => void> = [];
+      process.env.SystemRoot = systemRoot;
+      const runner = createNodeProcessRunner({
+        platform: 'win32',
+        spawn: ((command: string) => { calls.push(command); return root; }) as typeof spawn,
+        setTimeout: ((callback: () => void) => { timers.push(callback); return {} as NodeJS.Timeout; }) as typeof setTimeout,
+        clearTimeout: (() => undefined) as typeof clearTimeout,
+      });
+      const controller = new AbortController();
+      const running = runner.run('managed-command', [], { kind: 'lifecycle', signal: controller.signal });
+      controller.abort();
+
+      assert.deepEqual(calls, ['managed-command']);
+      assert.deepEqual(rootKillSignals, ['SIGKILL']);
+      timers[0]?.();
+      await assert.rejects(running, UnconfirmedProcessReapError);
+    }
+  } finally {
+    if (originalSystemRoot === undefined) delete process.env.SystemRoot;
+    else process.env.SystemRoot = originalSystemRoot;
+  }
 });
 
 test('nodeProcessRunner turns Windows post-cancellation fallback failures into lifecycle recovery errors', async () => {
@@ -220,7 +283,7 @@ test('nodeProcessRunner never treats Windows taskkill success and root close as 
   const calls: string[] = [];
   const runner = createNodeProcessRunner({
     platform: 'win32',
-    systemRoot: 'C:\\Windows',
+    windowsDirectory: () => 'C:\\Windows',
     spawn: ((command: string) => {
       calls.push(command);
       return command.endsWith('taskkill.exe') ? taskkill : root;

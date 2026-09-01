@@ -1,10 +1,10 @@
 import assert from 'node:assert/strict';
-import { chmod, lstat, mkdtemp, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { chmod, lstat, mkdtemp, mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import test from 'node:test';
-import { loadManualRecovery, loadMetadata, recordManualRecovery, saveMetadata, withWorkspaceLock } from '../src/state.js';
+import { loadManualRecovery, loadMetadata, recordManualRecovery, saveMetadata, setStateDurableRenameForTesting, withWorkspaceLock } from '../src/state.js';
 import { exitCodeForError, runCli } from '../src/cli.js';
 import { nodeProcessRunner, UnconfirmedProcessReapError } from '../src/workspaces.js';
 
@@ -119,6 +119,33 @@ test('recover explicitly clears an unconfirmed-reap quarantine without removing 
   let acquired = false;
   await withWorkspaceLock(stateDir, 'safe', async () => { acquired = true; });
   assert.equal(acquired, true, 'the explicit acknowledgement permits a later lifecycle operation');
+});
+
+test('recover retires a retained lock when quarantine rename fails before moving it', async (t) => {
+  const stateHome = await mkdtemp(join(tmpdir(), 'agent-containers-cli-retained-recover-'));
+  const stateDir = join(stateHome, 'agent-containers');
+  const previousStateHome = process.env.XDG_STATE_HOME;
+  t.after(async () => {
+    setStateDurableRenameForTesting(undefined);
+    if (previousStateHome === undefined) delete process.env.XDG_STATE_HOME;
+    else process.env.XDG_STATE_HOME = previousStateHome;
+    await rm(stateHome, { recursive: true, force: true });
+  });
+  process.env.XDG_STATE_HOME = stateHome;
+  setStateDurableRenameForTesting(async (source, destination) => {
+    if (source.endsWith('safe.lock') && destination.endsWith('safe.reap-unconfirmed')) throw new Error('pre-move rename failure');
+    await rename(source, destination);
+  });
+  await assert.rejects(() => withWorkspaceLock(stateDir, 'safe', async () => { throw new UnconfirmedProcessReapError(); }, {
+    onUnconfirmedProcessReap: async () => { throw new Error('journal unavailable'); },
+  }), /journal unavailable/);
+  const messages: string[] = [];
+  assert.equal(await runCli(['unlock', 'safe', '--yes'], process.cwd(), (message) => messages.push(message)), 1);
+  assert.match(messages.at(-1) ?? '', /quarantined.*Ordinary unlock never clears/i);
+  assert.equal(await runCli(['recover', 'safe', '--yes', '--remote-command-stopped'], process.cwd(), () => undefined), 0);
+  let acquired = false;
+  await withWorkspaceLock(stateDir, 'safe', async () => { acquired = true; });
+  assert.equal(acquired, true);
 });
 
 test('validate refuses a Dev Container config absent from the configured local base branch', async () => {

@@ -49,10 +49,16 @@ export interface ManualRecoveryInput {
 }
 
 let testDurabilityAdapter: StateDurabilityAdapter | undefined;
+let testDurableRename: ((source: string, destination: string) => Promise<void>) | undefined;
 
 /** Test-only injection point so state behavior can be exercised without a compiled host addon. */
 export function setStateDurabilityAdapterForTesting(adapter: StateDurabilityAdapter | undefined): void {
   testDurabilityAdapter = adapter;
+}
+
+/** Test-only seam for a filesystem move that fails before changing either path. */
+export function setStateDurableRenameForTesting(renameForTest: ((source: string, destination: string) => Promise<void>) | undefined): void {
+  testDurableRename = renameForTest;
 }
 
 function stateDurability(adapter?: StateDurabilityAdapter): StateDurabilityAdapter {
@@ -343,6 +349,8 @@ export interface WorkspaceLockOptions {
   durabilityAdapter?: StateDurabilityAdapter;
   /** Persist a recovery boundary before releasing this lock after a lifecycle child cannot be reaped. */
   onUnconfirmedProcessReap?: (error: Error) => Promise<void>;
+  /** Test seam for marker open/write failures; production uses the durable marker writer. */
+  writeUnconfirmedReapMarker?: (lockPath: string, durability: StateDurabilityAdapter) => Promise<void>;
 }
 
 export type LockPublicationStep = 'owner-file-synced' | 'staging-directory-synced' | 'published' | 'locks-directory-synced';
@@ -352,9 +360,9 @@ export interface StateDirectoryDurabilityStep {
 }
 
 export async function withWorkspaceLock<T>(stateDir: string, name: string, action: (signal: AbortSignal) => Promise<T>, options: number | WorkspaceLockOptions = 30_000): Promise<T> {
-  const { timeoutMs, abortSignal, allowManualRecovery, onLockPublication, onStateDirectoryDurability, durabilityAdapter, onUnconfirmedProcessReap } = typeof options === 'number'
-    ? { timeoutMs: options, abortSignal: undefined, allowManualRecovery: false, onLockPublication: undefined, onStateDirectoryDurability: undefined, durabilityAdapter: undefined, onUnconfirmedProcessReap: undefined }
-    : { timeoutMs: options.timeoutMs ?? 30_000, abortSignal: options.abortSignal, allowManualRecovery: options.allowManualRecovery ?? false, onLockPublication: options.onLockPublication, onStateDirectoryDurability: options.onStateDirectoryDurability, durabilityAdapter: options.durabilityAdapter, onUnconfirmedProcessReap: options.onUnconfirmedProcessReap };
+  const { timeoutMs, abortSignal, allowManualRecovery, onLockPublication, onStateDirectoryDurability, durabilityAdapter, onUnconfirmedProcessReap, writeUnconfirmedReapMarker } = typeof options === 'number'
+    ? { timeoutMs: options, abortSignal: undefined, allowManualRecovery: false, onLockPublication: undefined, onStateDirectoryDurability: undefined, durabilityAdapter: undefined, onUnconfirmedProcessReap: undefined, writeUnconfirmedReapMarker: undefined }
+    : { timeoutMs: options.timeoutMs ?? 30_000, abortSignal: options.abortSignal, allowManualRecovery: options.allowManualRecovery ?? false, onLockPublication: options.onLockPublication, onStateDirectoryDurability: options.onStateDirectoryDurability, durabilityAdapter: options.durabilityAdapter, onUnconfirmedProcessReap: options.onUnconfirmedProcessReap, writeUnconfirmedReapMarker: options.writeUnconfirmedReapMarker };
   const durability = stateDurability(durabilityAdapter);
   await durability.assertStateWriteSupport();
   const lockName = validateWorkspaceName(name);
@@ -363,17 +371,25 @@ export async function withWorkspaceLock<T>(stateDir: string, name: string, actio
   const quarantinePath = join(locksDir, `${lockName}.reap-unconfirmed`);
   const recoveryPath = join(locksDir, `${lockName}.recovery`);
   await ensureDurableDirectory(locksDir, durability, onStateDirectoryDurability);
-  if (await pathExists(quarantinePath) || await pathExists(unconfirmedReapMarkerPath(lockPath))) throw unconfirmedReapLockError(name);
   const deadline = Date.now() + timeoutMs;
-  while (true) {
-    if (await pathExists(quarantinePath) || await pathExists(unconfirmedReapMarkerPath(lockPath))) throw unconfirmedReapLockError(name);
-    await waitForRecoveryToFinish(recoveryPath, deadline, name, durability);
-    if (await acquireOwnedDirectory(lockPath, locksDir, lockName, deadline, name, durability, onLockPublication)) break;
+  // Hold this durable boundary for the entire lifecycle. A stale unlock or
+  // recovery acknowledgement therefore cannot validate a normal lock while it
+  // is being converted into a fail-closed uncertain-reap representation.
+  await acquireRecoveryLock(recoveryPath, locksDir, lockName, deadline, name, localPidIsAlive, durability);
+  try {
+    if (await hasUnconfirmedReapBarrier(lockPath, quarantinePath)) throw unconfirmedReapLockError(name);
+    while (!await acquireOwnedDirectory(lockPath, locksDir, lockName, deadline, name, durability, onLockPublication)) {
+      if (await hasUnconfirmedReapBarrier(lockPath, quarantinePath)) throw unconfirmedReapLockError(name);
+    }
+  } catch (error) {
+    await durableRemove(recoveryPath, locksDir, true, durability);
+    throw error;
   }
   try {
     if (!allowManualRecovery && await loadManualRecovery(stateDir, lockName)) throw manualRecoveryError(name);
   } catch (error) {
     await durableRemove(lockPath, locksDir, true, durability);
+    await durableRemove(recoveryPath, locksDir, true, durability);
     throw error;
   }
   const cancellation = new AbortController();
@@ -402,7 +418,13 @@ export async function withWorkspaceLock<T>(stateDir: string, name: string, actio
         // Preserve the published lock before attempting a move whose durability
         // result may be unknown. Ordinary unlock must never erase this boundary.
         releaseLock = false;
-        await markUnconfirmedReap(lockPath, durability);
+        try {
+          await (writeUnconfirmedReapMarker ?? markUnconfirmedReap)(lockPath, durability);
+        } catch {
+          // A marker open, file flush, or parent publication failure cannot
+          // skip quarantine. The recovery boundary remains held until the
+          // retained lock has been moved or explicitly acknowledged.
+        }
         try {
           await durableRename(lockPath, quarantinePath, locksDir, durability);
         } catch {
@@ -418,6 +440,7 @@ export async function withWorkspaceLock<T>(stateDir: string, name: string, actio
     process.off('SIGTERM', onTerminate);
     abortSignal?.removeEventListener('abort', cancel);
     if (releaseLock) await durableRemove(lockPath, locksDir, true, durability);
+    await durableRemove(recoveryPath, locksDir, true, durability);
     if (receivedSignal) process.kill(process.pid, receivedSignal);
   }
 }
@@ -436,10 +459,10 @@ export async function releaseStaleWorkspaceLock(stateDir: string, name: string, 
   const quarantinePath = join(locksDir, `${lockName}.reap-unconfirmed`);
   const recoveryPath = join(locksDir, `${lockName}.recovery`);
   await ensureDurableDirectory(locksDir, durability);
-  if (await pathExists(quarantinePath) || await pathExists(unconfirmedReapMarkerPath(lockPath))) throw unconfirmedReapLockError(name);
-  if (await loadManualRecovery(stateDir, lockName)) throw manualRecoveryError(name);
   await acquireRecoveryLock(recoveryPath, locksDir, lockName, Date.now() + timeoutMs, name, isPidAlive, durability);
   try {
+    if (await hasUnconfirmedReapBarrier(lockPath, quarantinePath)) throw unconfirmedReapLockError(name);
+    if (await loadManualRecovery(stateDir, lockName)) throw manualRecoveryError(name);
     let owner: unknown;
     try {
       owner = JSON.parse(await readFile(join(lockPath, 'owner.json'), 'utf8'));
@@ -469,12 +492,23 @@ export async function acknowledgeUnconfirmedProcessReap(stateDir: string, name: 
   const recoveryPath = join(locksDir, `${lockName}.recovery`);
   const quarantinePath = join(locksDir, `${lockName}.reap-unconfirmed`);
   await ensureDurableDirectory(locksDir, durability);
-  const retainedMarker = unconfirmedReapMarkerPath(join(locksDir, `${lockName}.lock`));
-  if (!await pathExists(quarantinePath) && !await pathExists(retainedMarker)) return;
+  const lockPath = join(locksDir, `${lockName}.lock`);
+  const retainedMarker = unconfirmedReapMarkerPath(lockPath);
+  const retainedGuard = reapGuardPath(lockPath);
   await acquireRecoveryLock(recoveryPath, locksDir, lockName, Date.now() + timeoutMs, name, localPidIsAlive, durability);
   try {
-    if (await pathExists(quarantinePath)) await durableRemove(quarantinePath, locksDir, false, durability);
-    else await durableRemove(retainedMarker, join(locksDir, `${lockName}.lock`), false, durability);
+    if (await pathExists(quarantinePath)) {
+      await durableRemove(quarantinePath, locksDir, false, durability);
+      return;
+    }
+    if (!await pathExists(retainedMarker) && !await pathExists(retainedGuard)) return;
+    const owner = await readLockOwner(lockPath);
+    if (!owner) throw malformedLockError(name, lockPath);
+    // The marker is inside a retained ordinary lock after a pre-move failure.
+    // Explicit acknowledgement, not unlock, deliberately retires both.
+    const retiredPath = join(locksDir, `.${lockName}.${owner.token}.recovery-acknowledged`);
+    await durableRename(lockPath, retiredPath, locksDir, durability);
+    await durableRemove(retiredPath, locksDir, false, durability);
   } finally {
     await durableRemove(recoveryPath, locksDir, true, durability);
   }
@@ -482,6 +516,17 @@ export async function acknowledgeUnconfirmedProcessReap(stateDir: string, name: 
 
 function unconfirmedReapMarkerPath(lockPath: string): string {
   return join(lockPath, 'reap-unconfirmed');
+}
+
+// Published with every lifecycle lock. It makes a failed attempt to replace it
+// with the more specific marker fail closed even when that replacement cannot
+// be opened, flushed, or published.
+function reapGuardPath(lockPath: string): string {
+  return join(lockPath, 'reap-guard');
+}
+
+async function hasUnconfirmedReapBarrier(lockPath: string, quarantinePath: string): Promise<boolean> {
+  return await pathExists(quarantinePath) || await pathExists(unconfirmedReapMarkerPath(lockPath)) || await pathExists(reapGuardPath(lockPath));
 }
 
 async function markUnconfirmedReap(lockPath: string, durability: StateDurabilityAdapter): Promise<void> {
@@ -556,6 +601,12 @@ async function acquireOwnedDirectory(path: string, locksDir: string, temporarySt
     await ownerFile.close();
     ownerFile = undefined;
     await durability.syncFile(ownerPath);
+    if (path.endsWith('.lock')) {
+      const guardPath = reapGuardPath(temporaryPath);
+      const guard = await open(guardPath, 'wx', 0o600);
+      await guard.close();
+      await durability.syncFile(guardPath);
+    }
     await onLockPublication?.('owner-file-synced');
     await syncDirectory(temporaryPath, durability);
     await onLockPublication?.('staging-directory-synced');
@@ -621,7 +672,7 @@ async function syncDirectory(directory: string, durability: StateDurabilityAdapt
 
 async function durableRename(source: string, destination: string, directory: string, durability: StateDurabilityAdapter): Promise<void> {
   if (await durability.publicationMode() === 'recoverable') await durability.moveFileWriteThrough(source, destination);
-  else await rename(source, destination);
+  else await (testDurableRename ?? rename)(source, destination);
   await syncDirectory(directory, durability);
 }
 

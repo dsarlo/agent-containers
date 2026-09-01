@@ -290,7 +290,7 @@ test('an injected abort keeps the lifecycle lock until its active child is reape
   assert.equal(contenderRan, true);
 });
 
-test('stale lock recovery refuses an active owner and releases a proven-dead owner', async () => {
+test('stale lock recovery refuses an active owner and releases a proven-dead legacy owner', async () => {
   const stateDir = await mkdtemp(join(tmpdir(), 'agent-containers-stale-lock-'));
   const lockPath = join(stateDir, 'locks', 'safe.lock');
   await mkdir(lockPath, { recursive: true });
@@ -343,6 +343,35 @@ test('failed recovery publication and failed quarantine preserve the marked life
   let ran = false;
   await assert.rejects(() => withWorkspaceLock(stateDir, 'safe', async () => { ran = true; }, { timeoutMs: 0 }), /lock|uncertain/i);
   assert.equal(ran, false, 'a later lifecycle cannot proceed after both recovery persistence paths fail');
+});
+
+test('marker open, file sync, and parent publication failures still quarantine the lifecycle lock', async () => {
+  for (const failure of ['open', 'file sync', 'parent publication'] as const) {
+    const stateDir = await mkdtemp(join(tmpdir(), `agent-containers-marker-${failure.replace(' ', '-')}-`));
+    let failMarker = false;
+    const adapter: StateDurabilityAdapter = {
+      ...testDurabilityAdapter,
+      syncFile: async (path) => {
+        if (failMarker && failure === 'file sync' && path.endsWith('reap-unconfirmed')) throw new Error('marker file sync failed');
+      },
+      syncDirectory: async (path) => {
+        if (failMarker && failure === 'parent publication' && path.endsWith('safe.lock')) throw new Error('marker parent publication failed');
+      },
+    };
+    await assert.rejects(() => withWorkspaceLock(stateDir, 'safe', async () => {
+      failMarker = true;
+      throw new (await import('../src/workspaces.js')).UnconfirmedProcessReapError();
+    }, {
+      durabilityAdapter: adapter,
+      onUnconfirmedProcessReap: async () => { throw new Error('journal unavailable'); },
+      writeUnconfirmedReapMarker: failure === 'open' ? async () => { throw new Error('marker open failed'); } : undefined,
+    }), /journal unavailable/);
+    await assert.rejects(() => releaseStaleWorkspaceLock(stateDir, 'safe', () => false), /quarantined.*Ordinary unlock never clears/i);
+    await acknowledgeUnconfirmedProcessReap(stateDir, 'safe');
+    let acquired = false;
+    await withWorkspaceLock(stateDir, 'safe', async () => { acquired = true; });
+    assert.equal(acquired, true);
+  }
 });
 
 test('unlock preserves malformed published lifecycle locks and directs verified manual filesystem repair', async () => {

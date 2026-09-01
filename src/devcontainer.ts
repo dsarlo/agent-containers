@@ -1,5 +1,5 @@
 import { createRequire } from 'node:module';
-import { existsSync } from 'node:fs';
+import { readFileSync, statSync } from 'node:fs';
 import { win32 } from 'node:path';
 
 export interface DevcontainerInvocation {
@@ -13,6 +13,10 @@ export interface DevcontainerResolverDependencies {
   environment?: NodeJS.ProcessEnv;
   /** Resolve the command from PATH without invoking a command shell. */
   resolveCommand?: (command: string) => string | undefined;
+  /** Confirm a resolved PATH command is an ordinary file rather than a directory or special object. */
+  isRegularFile?: (path: string) => boolean;
+  /** Read a Windows command shim without executing it. */
+  readCommandShim?: (path: string) => string;
   resolveModule?: (specifier: string, paths: string[]) => string;
 }
 
@@ -21,7 +25,9 @@ export function resolveDevcontainerInvocation({
   platform = process.platform,
   nodePath = process.execPath,
   environment = process.env,
-  resolveCommand = resolveWindowsCommandFromPath(environment),
+  isRegularFile = isRegularWindowsFile,
+  readCommandShim = (path) => readFileSync(path, 'utf8'),
+  resolveCommand = resolveWindowsCommandFromPath(environment, isRegularFile),
   resolveModule = (specifier, paths) => createRequire(import.meta.url).resolve(specifier, { paths }),
 }: DevcontainerResolverDependencies = {}): DevcontainerInvocation {
   if (platform !== 'win32') return { command: 'devcontainer', prefixArgs: [] };
@@ -29,7 +35,19 @@ export function resolveDevcontainerInvocation({
   if (!commandPath || !win32.isAbsolute(commandPath) || win32.basename(commandPath).toLowerCase() !== 'devcontainer.cmd') {
     throw new Error('Could not resolve devcontainer.cmd from PATH. Install @devcontainers/cli with the active npm prefix (or expose its devcontainer.cmd on PATH) before running Agent Containers.');
   }
+  if (!isRegularFile(commandPath)) throw new Error(`Resolved devcontainer.cmd is not a regular command shim: ${commandPath}`);
   const commandPrefix = win32.dirname(commandPath);
+  const expectedEntry = win32.join(commandPrefix, 'node_modules', '@devcontainers', 'cli', 'devcontainer.js');
+  let shim: string;
+  try {
+    shim = readCommandShim(commandPath);
+  } catch (error: unknown) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(`Could not read the resolved devcontainer.cmd command shim: ${detail}`, { cause: error });
+  }
+  if (!referencesPublicDevcontainerEntry(shim)) {
+    throw new Error(`Resolved devcontainer.cmd does not reference @devcontainers\\cli\\devcontainer.js: ${commandPath}`);
+  }
   const paths = [win32.join(commandPrefix, 'node_modules')];
   let entryPoint: string;
   try {
@@ -38,22 +56,36 @@ export function resolveDevcontainerInvocation({
     const detail = error instanceof Error ? error.message : String(error);
     throw new Error(`Could not locate @devcontainers/cli/devcontainer.js for the global npm Dev Containers installation: ${detail}`, { cause: error });
   }
-  if (!isPublicDevcontainerEntry(entryPoint)) throw new Error(`Resolved Dev Containers entry is not the public @devcontainers/cli/devcontainer.js package entry: ${entryPoint}`);
+  if (!sameWindowsPath(entryPoint, expectedEntry)) {
+    throw new Error(`Resolved Dev Containers entry is not contained in the selected command shim npm prefix: ${entryPoint}`);
+  }
   return { command: nodePath, prefixArgs: [entryPoint] };
 }
 
-function isPublicDevcontainerEntry(path: string): boolean {
-  return win32.isAbsolute(path) && win32.normalize(path).toLowerCase().endsWith('\\@devcontainers\\cli\\devcontainer.js');
+function isRegularWindowsFile(path: string): boolean {
+  try {
+    return statSync(path).isFile();
+  } catch {
+    return false;
+  }
 }
 
-function resolveWindowsCommandFromPath(environment: NodeJS.ProcessEnv): (command: string) => string | undefined {
+function referencesPublicDevcontainerEntry(shim: string): boolean {
+  return shim.replaceAll('/', '\\').toLowerCase().includes('node_modules\\@devcontainers\\cli\\devcontainer.js');
+}
+
+function sameWindowsPath(left: string, right: string): boolean {
+  return win32.isAbsolute(left) && win32.normalize(left).toLowerCase() === win32.normalize(right).toLowerCase();
+}
+
+function resolveWindowsCommandFromPath(environment: NodeJS.ProcessEnv, isRegularFile: (path: string) => boolean): (command: string) => string | undefined {
   return (command) => {
     const path = environment.Path ?? environment.PATH;
     if (!path) return undefined;
     for (const directory of path.split(';')) {
       if (!directory || !win32.isAbsolute(directory)) continue;
       const candidate = win32.join(directory, command);
-      if (existsSync(candidate)) return candidate;
+      if (isRegularFile(candidate)) return candidate;
     }
     return undefined;
   };

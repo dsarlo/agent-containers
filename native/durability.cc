@@ -88,6 +88,15 @@ std::string WinError(DWORD error) {
   const DWORD count = FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, nullptr, error, 0, buffer, sizeof(buffer), nullptr);
   return count == 0 ? "Windows error " + std::to_string(error) : std::string(buffer, count);
 }
+
+std::string ToUtf8(const std::wstring& value) {
+  if (value.empty()) return {};
+  const int required = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, value.c_str(), static_cast<int>(value.size()), nullptr, 0, nullptr, nullptr);
+  if (required == 0) return {};
+  std::string result(required, '\0');
+  if (WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, value.c_str(), static_cast<int>(value.size()), result.data(), required, nullptr, nullptr) == 0) return {};
+  return result;
+}
 #endif
 
 napi_value Capabilities(napi_env env, napi_callback_info) {
@@ -158,11 +167,32 @@ napi_value MoveFileWriteThrough(napi_env env, napi_callback_info info) {
 #endif
 }
 
+napi_value WindowsDirectory(napi_env env, napi_callback_info) {
+#ifdef _WIN32
+  std::vector<wchar_t> buffer(MAX_PATH);
+  while (true) {
+    const UINT length = GetWindowsDirectoryW(buffer.data(), static_cast<UINT>(buffer.size()));
+    if (length == 0) {
+      napi_value undefined;
+      napi_get_undefined(env, &undefined);
+      return undefined;
+    }
+    if (length < buffer.size()) return String(env, ToUtf8(std::wstring(buffer.data(), length)));
+    buffer.resize(static_cast<size_t>(length) + 1);
+  }
+#else
+  napi_value undefined;
+  napi_get_undefined(env, &undefined);
+  return undefined;
+#endif
+}
+
 napi_value Init(napi_env env, napi_value exports) {
   napi_property_descriptor properties[] = {
       {"capabilities", nullptr, Capabilities, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"syncPath", nullptr, SyncPath, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"moveFileWriteThrough", nullptr, MoveFileWriteThrough, nullptr, nullptr, nullptr, napi_default, nullptr},
+      {"windowsDirectory", nullptr, WindowsDirectory, nullptr, nullptr, nullptr, napi_default, nullptr},
   };
   napi_define_properties(env, exports, sizeof(properties) / sizeof(properties[0]), properties);
   return exports;
