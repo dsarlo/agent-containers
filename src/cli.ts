@@ -1,6 +1,6 @@
 import { join, resolve } from 'node:path';
 import { assertDevcontainerPathCommittedOnBaseBranch, initConfig, loadConfig } from './config.js';
-import { clearManualRecovery, defaultStateDir, deleteMetadata, listMetadata, loadMetadata, recordManualRecovery, releaseStaleWorkspaceLock, saveMetadata, withWorkspaceLock } from './state.js';
+import { acknowledgeUnconfirmedProcessReap, clearManualRecovery, defaultStateDir, deleteMetadata, listMetadata, loadManualRecovery, loadMetadata, recordManualRecovery, releaseStaleWorkspaceLock, saveMetadata, withWorkspaceLock } from './state.js';
 import { execNamedWorkspaceLifecycle } from './runtime.js';
 import { createWorkspace, findGitRoot, nodeProcessRunner, removeWorkspace } from './workspaces.js';
 
@@ -33,9 +33,11 @@ export async function runCli(args: string[], cwd = process.cwd(), write: (messag
       case 'create': {
         const name = requiredPositional(rest, 'workspace name');
         ensureOptions(rest.slice(1), ['--base']);
+        let recoveryWorktree = cwd;
         return withWorkspaceLock(stateDir, name, async (signal) => {
           const root = await findGitRoot(cwd, nodeProcessRunner, signal, 'lifecycle');
           const config = await loadConfig(join(root, '.agent-containers.yml'));
+          recoveryWorktree = resolve(root, config.workspace.worktreeRoot, name);
           const baseBranch = optionValue(rest.slice(1), '--base');
           await assertDevcontainerPathCommittedOnBaseBranch(config, root, nodeProcessRunner, undefined, 'lifecycle', signal);
           if (baseBranch && baseBranch !== config.workspace.baseBranch) {
@@ -44,7 +46,7 @@ export async function runCli(args: string[], cwd = process.cwd(), write: (messag
           const workspace = await createWorkspace({ cwd, name, config, stateDir, runner: nodeProcessRunner, baseBranch, signal });
           write(`Created ${workspace.name} at ${workspace.worktree}`);
           return 0;
-        }, { onUnconfirmedProcessReap: () => recordManualRecovery(stateDir, name, { reason: 'local-process-reap-unconfirmed', containerIds: [], worktree: cwd }) });
+        }, { onUnconfirmedProcessReap: () => recordManualRecovery(stateDir, name, { reason: 'local-process-reap-unconfirmed', containerIds: [], worktree: recoveryWorktree }) });
       }
       case 'exec':
       case 'run': {
@@ -60,7 +62,8 @@ export async function runCli(args: string[], cwd = process.cwd(), write: (messag
         if (!rest.includes('--yes') || !rest.includes('--remote-command-stopped')) {
           throw new UsageError('Usage: agent-containers recover <name> --yes --remote-command-stopped');
         }
-        await withWorkspaceLock(stateDir, name, async () => clearManualRecovery(stateDir, name), { allowManualRecovery: true });
+        await acknowledgeUnconfirmedProcessReap(stateDir, name);
+        if (await loadManualRecovery(stateDir, name)) await withWorkspaceLock(stateDir, name, async () => clearManualRecovery(stateDir, name), { allowManualRecovery: true });
         write(`Cleared manual recovery block for ${name}; this acknowledgement did not stop or remove any remote container.`);
         return 0;
       }

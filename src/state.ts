@@ -360,10 +360,13 @@ export async function withWorkspaceLock<T>(stateDir: string, name: string, actio
   const lockName = validateWorkspaceName(name);
   const locksDir = join(stateDir, 'locks');
   const lockPath = join(locksDir, `${lockName}.lock`);
+  const quarantinePath = join(locksDir, `${lockName}.reap-unconfirmed`);
   const recoveryPath = join(locksDir, `${lockName}.recovery`);
   await ensureDurableDirectory(locksDir, durability, onStateDirectoryDurability);
+  if (await pathExists(quarantinePath)) throw unconfirmedReapLockError(name);
   const deadline = Date.now() + timeoutMs;
   while (true) {
+    if (await pathExists(quarantinePath)) throw unconfirmedReapLockError(name);
     await waitForRecoveryToFinish(recoveryPath, deadline, name, durability);
     if (await acquireOwnedDirectory(lockPath, locksDir, lockName, deadline, name, durability, onLockPublication)) break;
   }
@@ -396,8 +399,9 @@ export async function withWorkspaceLock<T>(stateDir: string, name: string, actio
       try {
         await onUnconfirmedProcessReap(error);
       } catch (recoveryError: unknown) {
-        // A retained durable lock is safer than releasing a lifecycle whose
-        // local process tree cannot be proven gone without a recovery record.
+        // Move the published owner into a state ordinary stale-PID unlock never
+        // reclaims before surfacing the failed recovery publication.
+        await durableRename(lockPath, quarantinePath, locksDir, durability);
         releaseLock = false;
         throw recoveryError;
       }
@@ -423,8 +427,10 @@ export async function releaseStaleWorkspaceLock(stateDir: string, name: string, 
   const lockName = validateWorkspaceName(name);
   const locksDir = join(stateDir, 'locks');
   const lockPath = join(locksDir, `${lockName}.lock`);
+  const quarantinePath = join(locksDir, `${lockName}.reap-unconfirmed`);
   const recoveryPath = join(locksDir, `${lockName}.recovery`);
   await ensureDurableDirectory(locksDir, durability);
+  if (await pathExists(quarantinePath)) throw unconfirmedReapLockError(name);
   if (await loadManualRecovery(stateDir, lockName)) throw manualRecoveryError(name);
   await acquireRecoveryLock(recoveryPath, locksDir, lockName, Date.now() + timeoutMs, name, isPidAlive, durability);
   try {
@@ -443,6 +449,24 @@ export async function releaseStaleWorkspaceLock(stateDir: string, name: string, 
     const reclaimedPath = join(locksDir, `.${lockName}.${owner.token}.reclaimed`);
     await durableRename(lockPath, reclaimedPath, locksDir, durability);
     await durableRemove(reclaimedPath, locksDir, false, durability);
+  } finally {
+    await durableRemove(recoveryPath, locksDir, true, durability);
+  }
+}
+
+/** Explicit operator acknowledgement is the only automated path that clears a failed reap-recovery quarantine. */
+export async function acknowledgeUnconfirmedProcessReap(stateDir: string, name: string, timeoutMs = 30_000): Promise<void> {
+  const durability = stateDurability();
+  await durability.assertStateWriteSupport();
+  const lockName = validateWorkspaceName(name);
+  const locksDir = join(stateDir, 'locks');
+  const recoveryPath = join(locksDir, `${lockName}.recovery`);
+  const quarantinePath = join(locksDir, `${lockName}.reap-unconfirmed`);
+  await ensureDurableDirectory(locksDir, durability);
+  if (!await pathExists(quarantinePath)) return;
+  await acquireRecoveryLock(recoveryPath, locksDir, lockName, Date.now() + timeoutMs, name, localPidIsAlive, durability);
+  try {
+    if (await pathExists(quarantinePath)) await durableRemove(quarantinePath, locksDir, false, durability);
   } finally {
     await durableRemove(recoveryPath, locksDir, true, durability);
   }
@@ -589,6 +613,16 @@ async function readLockOwner(path: string): Promise<LockOwner | undefined> {
   }
 }
 
+async function pathExists(path: string): Promise<boolean> {
+  try {
+    await lstat(path);
+    return true;
+  } catch (error: unknown) {
+    if (isNodeError(error, 'ENOENT')) return false;
+    throw error;
+  }
+}
+
 function abortError(): Error {
   const error = new Error('Lifecycle action was aborted.');
   error.name = 'AbortError';
@@ -601,6 +635,10 @@ function lockTimeout(name: string, cause?: unknown): Error {
 
 function malformedLockError(name: string, lockPath: string, cause?: unknown): Error {
   return new Error(`Lifecycle lock for workspace "${name}" has malformed owner metadata. Agent Containers cannot identify a PID and will not remove it. After independently verifying no Agent Containers process can still own the workspace, perform manual filesystem repair: remove ${lockPath}, then retry the original lifecycle operation.`, cause === undefined ? undefined : { cause });
+}
+
+function unconfirmedReapLockError(name: string): Error {
+  return new Error(`Lifecycle lock for workspace "${name}" is quarantined because local process reaping could not be confirmed and its recovery record could not be published. Ordinary unlock never clears this state. After independently verifying the local process tree and remote state are stopped, run agent-containers recover ${name} --yes --remote-command-stopped.`);
 }
 
 function delay(): Promise<void> {

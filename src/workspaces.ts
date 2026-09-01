@@ -144,6 +144,8 @@ export function createNodeProcessRunner({
         };
         const reapPosixProcessGroup = () => {
           try {
+            // Bound even an initial ESRCH race: the root may never emit close.
+            cancellationDeadline = schedule(unconfirmed, posixGraceMs + posixVerificationTimeoutMs);
             treeConfirmed = signalGroup('SIGTERM');
             if (treeConfirmed) {
               terminationOperationCompleted = true;
@@ -159,7 +161,6 @@ export function createNodeProcessRunner({
                 } else verifyPosixGroup();
               } catch { unconfirmed(); }
             }, posixGraceMs);
-            cancellationDeadline = schedule(unconfirmed, posixGraceMs + posixVerificationTimeoutMs);
           } catch { unconfirmed(); }
         };
         const reapWindowsProcessTree = () => {
@@ -466,11 +467,17 @@ async function worktreeAddRecoveryError(cause: unknown, repoRoot: string, worktr
   try {
     const branchResult = await runner.run('git', ['show-ref', '--verify', '--quiet', branchRef], withSignal({ cwd: repoRoot, kind: 'lifecycle' }, inspectionSignal));
     branchState = branchResult.code === 0 ? 'present' : branchResult.code === 1 ? 'absent' : `inspection failed (${branchResult.code})`;
-  } catch { branchState = 'inspection failed'; }
+  } catch (error: unknown) {
+    if (error instanceof UnconfirmedProcessReapError) throw error;
+    branchState = 'inspection failed';
+  }
   try {
     const worktrees = await runner.run('git', ['worktree', 'list', '--porcelain'], withSignal({ cwd: repoRoot, kind: 'lifecycle' }, inspectionSignal));
     worktreeState = worktrees.code === 0 && worktrees.stdout.split('\n').some((line) => line === `worktree ${worktree}`) ? 'present' : worktrees.code === 0 ? 'absent' : `inspection failed (${worktrees.code})`;
-  } catch { worktreeState = 'inspection failed'; }
+  } catch (error: unknown) {
+    if (error instanceof UnconfirmedProcessReapError) throw error;
+    worktreeState = 'inspection failed';
+  }
   const detail = cause instanceof Error ? cause.message : String(cause);
   return new Error(`${detail}. A failed or interrupted git worktree add may have created data; Agent Containers left it intact. Inspect with git worktree list: expected worktree ${worktree} is ${worktreeState}; expected local branch ${branchRef} is ${branchState}. Do not delete either until you have reviewed it.`, { cause });
 }

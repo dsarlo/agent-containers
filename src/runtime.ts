@@ -84,30 +84,9 @@ export async function execWorkspace(metadata: WorkspaceMetadata, command: string
     await save({ ...metadata, containerId });
   } catch (error: unknown) {
     const detail = error instanceof Error ? error.message : String(error);
-    const cleanupSignal = AbortSignal.timeout(5_000);
-    let inspection: ProcessResult;
-    try {
-      inspection = await runner.run('docker', ['inspect', '--format', '{{.Id}}\n{{ index .Config.Labels "devcontainer.local_folder" }}', containerId], withSignal({ kind: 'readonly-probe' }, cleanupSignal));
-    } catch (inspectionError: unknown) {
-      const inspectionDetail = inspectionError instanceof Error ? inspectionError.message : String(inspectionError);
-      throw new Error(`Could not persist container metadata (${detail}); did not remove unverified container ${containerId} because Docker inspection failed: ${inspectionDetail}. The manual recovery block remains in place.`, { cause: inspectionError });
-    }
-    if (inspection.code !== 0 || !isOwnedContainerInspection(inspection.stdout, containerId, metadata.worktree)) {
-      const inspectionDetail = inspection.code !== 0 ? commandDetail(inspection) : 'its full Docker .Id and devcontainer.local_folder label do not exactly match the recorded container and worktree';
-      throw new Error(`Could not persist container metadata (${detail}); did not remove unverified container ${containerId} because ${inspectionDetail}. The manual recovery block remains in place.`, { cause: error });
-    }
-    let cleanup: ProcessResult;
-    try {
-      cleanup = await runner.run('docker', ['rm', '-f', containerId], withSignal({ kind: 'lifecycle' }, cleanupSignal));
-    } catch (cleanupError: unknown) {
-      const cleanupDetail = cleanupError instanceof Error ? cleanupError.message : String(cleanupError);
-      throw new Error(`Could not persist container metadata (${detail}) and could not remove untracked container ${containerId}: ${cleanupDetail}.`, { cause: cleanupError });
-    }
-    if (cleanup.code !== 0) {
-      const cleanupDetail = cleanup.stderr.trim() || cleanup.stdout.trim() || `exit code ${cleanup.code}`;
-      throw new Error(`Could not persist container metadata (${detail}) and could not remove untracked container ${containerId}: ${cleanupDetail}.`, { cause: error });
-    }
-    throw new Error(`Could not persist container metadata (${detail}); removed untracked container ${containerId}. Retry the command after fixing state storage.`, { cause: error });
+    // A matching local-folder label associates a container with this worktree,
+    // but does not prove this invocation created it. Preserve it as a hint only.
+    return recordAmbiguousUp(recordRecovery, metadata, [containerId], `Could not persist container metadata (${detail}); preserved container ${containerId} without adopting or removing it`);
   }
   // The CLI can only terminate its local transport. If it was interrupted, it
   // cannot truthfully assert that the command inside the container stopped.
@@ -131,7 +110,7 @@ export async function execWorkspace(metadata: WorkspaceMetadata, command: string
  * An aborted local `up` has no trustworthy terminal container ID. Query Docker
  * by the exact Dev Containers local-folder label, but never remove a result.
  */
-async function ambiguousUpRecovery(metadata: WorkspaceMetadata, runner: ProcessRunner, save: (metadata: WorkspaceMetadata) => Promise<void>, recordRecovery: RecoveryRecorder, outcome: string): Promise<never> {
+async function ambiguousUpRecovery(metadata: WorkspaceMetadata, runner: ProcessRunner, _save: (metadata: WorkspaceMetadata) => Promise<void>, recordRecovery: RecoveryRecorder, outcome: string): Promise<never> {
   const inspectionSignal = AbortSignal.timeout(5_000);
   const zeroCandidatePolls = 3;
   let matching: string[] = [];
@@ -162,15 +141,8 @@ async function ambiguousUpRecovery(metadata: WorkspaceMetadata, runner: ProcessR
   if (matching.length === 0) {
     return recordAmbiguousUp(recordRecovery, metadata, [], `${outcome} and Docker found no container whose devcontainer.local_folder label exactly matches ${metadata.worktree}; provisioning may still be starting`);
   }
-  if (matching.length === 1) {
-    try {
-      if (metadata.containerId !== matching[0]) await save({ ...metadata, containerId: matching[0] });
-    } catch (error: unknown) {
-      return recordAmbiguousUp(recordRecovery, metadata, matching, `Found and preserved container ${matching[0]}, but could not persist its ID: ${error instanceof Error ? error.message : String(error)}`);
-    }
-  }
   return recordAmbiguousUp(recordRecovery, metadata, matching, matching.length === 1
-    ? `${outcome}. Found and recorded container ${matching[0]} with the exact worktree label, but the terminal outcome is ambiguous`
+    ? `${outcome}. Found container ${matching[0]} with the exact worktree label, but the terminal outcome is ambiguous and it was not adopted`
     : `${outcome}. Found ${matching.length} containers with the exact worktree label; ownership is ambiguous`);
 }
 

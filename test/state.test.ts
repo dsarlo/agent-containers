@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import * as state from '../src/state.js';
-import { bootstrapManualRecoveryJournal, loadManualRecovery, loadMetadata, recordManualRecovery, releaseStaleWorkspaceLock, saveMetadata, setStateDurabilityAdapterForTesting, withWorkspaceLock, type WorkspaceLockOptions, type WorkspaceMetadata } from '../src/state.js';
+import { acknowledgeUnconfirmedProcessReap, bootstrapManualRecoveryJournal, loadManualRecovery, loadMetadata, recordManualRecovery, releaseStaleWorkspaceLock, saveMetadata, setStateDurabilityAdapterForTesting, withWorkspaceLock, type WorkspaceLockOptions, type WorkspaceMetadata } from '../src/state.js';
 import type { ProcessRunner } from '../src/types.js';
 import type { StateDurabilityAdapter } from '../src/durability.js';
 
@@ -284,6 +284,22 @@ test('stale lock recovery refuses an active owner and releases a proven-dead own
   await writeFile(join(lockPath, 'owner.json'), JSON.stringify({ pid: 424242, token: '11111111-1111-4111-8111-111111111111', createdAt: '2026-01-01T00:00:00.000Z' }));
   await assert.rejects(() => releaseStaleWorkspaceLock(stateDir, 'safe', () => true), /active PID 424242/);
   await releaseStaleWorkspaceLock(stateDir, 'safe', () => false);
+  let acquired = false;
+  await withWorkspaceLock(stateDir, 'safe', async () => { acquired = true; });
+  assert.equal(acquired, true);
+});
+
+test('failed uncertain-reap recovery publication quarantines the lock from stale unlock until explicit acknowledgement', async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), 'agent-containers-quarantined-lock-'));
+  const { UnconfirmedProcessReapError } = await import('../src/workspaces.js');
+  await assert.rejects(
+    () => withWorkspaceLock(stateDir, 'safe', async () => { throw new UnconfirmedProcessReapError(); }, {
+      onUnconfirmedProcessReap: async () => { throw new Error('recovery disk full'); },
+    }),
+    /recovery disk full/,
+  );
+  await assert.rejects(() => releaseStaleWorkspaceLock(stateDir, 'safe', () => false), /quarantined.*Ordinary unlock never clears/i);
+  await acknowledgeUnconfirmedProcessReap(stateDir, 'safe');
   let acquired = false;
   await withWorkspaceLock(stateDir, 'safe', async () => { acquired = true; });
   assert.equal(acquired, true);

@@ -274,10 +274,10 @@ test('an interruption during zero-candidate verification retains manual recovery
   assert.deepEqual(records.at(-1), { reason: 'devcontainer-up-ambiguous', containerIds: [], worktree: metadata.worktree });
 });
 
-test('execWorkspace reconciles an interrupted up through an exact worktree label and then blocks for manual recovery', async () => {
+test('execWorkspace retains a single exact-label interrupted-up candidate as a recovery hint without adopting it', async () => {
   const lifecycle = new AbortController();
   const calls: Array<{ command: string; args: string[]; signal?: AbortSignal }> = [];
-  let saved: WorkspaceMetadata | undefined;
+  let saves = 0;
   let recovery: unknown;
   const discoveredId = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
   const runner: ProcessRunner = {
@@ -294,10 +294,10 @@ test('execWorkspace reconciles an interrupted up through an exact worktree label
     },
   };
   await assert.rejects(
-    () => (execWorkspace as (...args: unknown[]) => Promise<unknown>)(metadata, ['true'], runner, async (next: WorkspaceMetadata) => { saved = next; }, async () => '{}', lifecycle.signal, async (next: unknown) => { recovery = next; }),
+    () => (execWorkspace as (...args: unknown[]) => Promise<unknown>)({ ...metadata, containerId: knownContainerId }, ['true'], runner, async () => { saves += 1; }, async () => '{}', lifecycle.signal, async (next: unknown) => { recovery = next; }),
     /manual recovery/,
   );
-  assert.equal(saved?.containerId, discoveredId);
+  assert.equal(saves, 0, 'ambiguous discovery cannot replace a recorded canonical ID');
   assert.deepEqual(recovery, { reason: 'devcontainer-up-ambiguous', containerIds: [discoveredId], worktree: metadata.worktree });
   const discovery = calls.filter((call) => call.command === 'docker');
   assert.deepEqual(discovery.map((call) => call.args[0]), ['ps', 'inspect']);
@@ -454,7 +454,8 @@ test('execWorkspace retains a new container when its Docker ownership inspection
   }
 });
 
-test('execWorkspace removes exactly the untracked container when saving its ID fails', async () => {
+test('execWorkspace preserves a returned reused ID when metadata persistence fails and records durable recovery', async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), 'agent-containers-save-failure-recovery-'));
   const calls: Array<{ command: string; args: string[] }> = [];
   const runner: ProcessRunner = {
     async run(command, args) {
@@ -465,13 +466,11 @@ test('execWorkspace removes exactly the untracked container when saving its ID f
     },
   };
   await assert.rejects(
-    () => execWorkspace(metadata, ['true'], runner, async () => { throw new Error('state disk full'); }, async () => '{}', undefined, noOpRecovery, noOpRecovery),
-    new RegExp(`state disk full.*removed untracked container ${untrackedContainerId}`,'s'),
+    () => execWorkspace(metadata, ['true'], runner, async () => { throw new Error('state disk full'); }, async () => '{}', undefined, (recovery) => recordManualRecovery(stateDir, metadata.name, recovery), noOpRecovery),
+    new RegExp(`state disk full.*preserved container ${untrackedContainerId}`, 's'),
   );
-  assert.deepEqual(calls.slice(-2), [
-    { command: 'docker', args: ['inspect', '--format', '{{.Id}}\n{{ index .Config.Labels "devcontainer.local_folder" }}', untrackedContainerId] },
-    { command: 'docker', args: ['rm', '-f', untrackedContainerId] },
-  ]);
+  assert.equal(calls.some((call) => call.command === 'docker' && call.args[0] === 'rm'), false);
+  assert.equal((await loadManualRecovery(stateDir, metadata.name))?.containerIds[0], untrackedContainerId);
 });
 
 test('execWorkspace never removes a reused recorded container when persisting it would fail', async () => {
@@ -488,26 +487,6 @@ test('execWorkspace never removes a reused recorded container when persisting it
   await execWorkspace({ ...metadata, containerId: knownContainerId }, ['true'], runner, async () => { throw new Error('must not rewrite known container'); }, async () => '{}', undefined, noOpRecovery, noOpRecovery);
   assert.equal(calls.some((call) => call.command === 'docker' && call.args[0] === 'rm'), false);
   assert.equal(calls.filter((call) => call.command === 'devcontainer').length, 2);
-});
-
-test('execWorkspace cleanup uses a fresh bounded signal after the lifecycle signal is aborted', async () => {
-  const lifecycle = new AbortController();
-  let cleanupSignal: AbortSignal | undefined;
-  const runner: ProcessRunner = {
-    async run(_command, args, options) {
-      if (args[0] === 'up') return { code: 0, stdout: `{"outcome":"success","containerId":"${untrackedContainerId}"}\n`, stderr: '' };
-      if (args[0] === 'inspect') return { code: 0, stdout: ownedInspection(untrackedContainerId), stderr: '' };
-      cleanupSignal = options?.signal;
-      return { code: 0, stdout: '', stderr: '' };
-    },
-  };
-  await assert.rejects(
-    () => execWorkspace(metadata, ['true'], runner, async () => { lifecycle.abort(); throw new Error('state disk full'); }, async () => '{}', lifecycle.signal, noOpRecovery, noOpRecovery),
-    new RegExp(`removed untracked container ${untrackedContainerId}`),
-  );
-  assert.ok(cleanupSignal, 'cleanup receives its own bounded signal');
-  assert.notEqual(cleanupSignal, lifecycle.signal);
-  assert.equal(cleanupSignal.aborted, false);
 });
 
 test('execWorkspace forwards interruption to the local Dev Containers CLI but refuses to claim remote cancellation', async () => {
@@ -576,32 +555,4 @@ test('a cancelled remote exec records one durable block and prevents a concurren
   await clearManualRecovery(stateDir, 'safe-name');
   await withWorkspaceLock(stateDir, 'safe-name', async () => { removalRan = true; });
   assert.equal(removalRan, true);
-});
-
-test('execWorkspace reports both metadata and exact container cleanup failures', async () => {
-  const runner: ProcessRunner = {
-    async run(_command, args) {
-      if (args[0] === 'up') return { code: 0, stdout: `{"outcome":"success","containerId":"${untrackedContainerId}"}\n`, stderr: '' };
-      if (args[0] === 'inspect') return { code: 0, stdout: ownedInspection(untrackedContainerId), stderr: '' };
-      return { code: 1, stdout: '', stderr: 'permission denied' };
-    },
-  };
-  await assert.rejects(
-    () => execWorkspace(metadata, ['true'], runner, async () => { throw new Error('state disk full'); }, async () => '{}', undefined, noOpRecovery, noOpRecovery),
-    new RegExp(`state disk full.*could not remove untracked container ${untrackedContainerId}: permission denied`, 's'),
-  );
-});
-
-test('execWorkspace preserves recovery context when exact container cleanup throws', async () => {
-  const runner: ProcessRunner = {
-    async run(_command, args) {
-      if (args[0] === 'up') return { code: 0, stdout: `{"outcome":"success","containerId":"${untrackedContainerId}"}\n`, stderr: '' };
-      if (args[0] === 'inspect') return { code: 0, stdout: ownedInspection(untrackedContainerId), stderr: '' };
-      throw new Error('docker executable missing');
-    },
-  };
-  await assert.rejects(
-    () => execWorkspace(metadata, ['true'], runner, async () => { throw new Error('state disk full'); }, async () => '{}', undefined, noOpRecovery, noOpRecovery),
-    new RegExp(`state disk full.*could not remove untracked container ${untrackedContainerId}: docker executable missing`, 's'),
-  );
 });

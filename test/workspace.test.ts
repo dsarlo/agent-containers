@@ -148,6 +148,29 @@ test('create lifecycle preserves unconfirmed worktree-add reaping without probes
   assert.equal((await loadManualRecovery(stateDir, 'partial'))?.reason, 'local-process-reap-unconfirmed');
 });
 
+test('create preserves an unconfirmed reap from the branch recovery probe without launching the worktree probe', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'agent-containers-add-probe-unconfirmed-'));
+  const calls: string[][] = [];
+  let addAttempted = false;
+  const runner: ProcessRunner = {
+    async run(_command, args) {
+      calls.push(args);
+      if (args[0] === 'rev-parse') return { code: 0, stdout: `${directory}\n`, stderr: '' };
+      if (args[0] === 'show-ref' && args.at(-1) === 'refs/heads/main') return { code: 0, stdout: '', stderr: '' };
+      if (args[0] === 'show-ref' && !addAttempted) return { code: 1, stdout: '', stderr: '' };
+      if (args.at(-1) === '-h') return { code: 129, stdout: '', stderr: '--[no-]relative-paths\n' };
+      if (args[0] === 'worktree' && args[1] === 'add') { addAttempted = true; return { code: 1, stdout: '', stderr: 'add failed' }; }
+      if (args[0] === 'show-ref') throw new UnconfirmedProcessReapError();
+      throw new Error(`worktree probe must not run after uncertain branch probe: ${args.join(' ')}`);
+    },
+  };
+  await assert.rejects(
+    () => createWorkspace({ cwd: directory, name: 'partial', config: { version: 1, workspace: { worktreeRoot: 'worktrees', baseBranch: 'main' }, environment: { devcontainerPath: '.devcontainer/devcontainer.json' }, commands: {} }, stateDir: join(directory, 'state'), runner }),
+    UnconfirmedProcessReapError,
+  );
+  assert.equal(calls.some((args) => args[0] === 'worktree' && args[1] === 'list'), false);
+});
+
 
 test('createWorkspace preserves its worktree and branch if metadata persistence fails rather than force-deleting user data', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'agent-containers-workspace-'));

@@ -235,6 +235,25 @@ test('nodeProcessRunner returns an unconfirmed lifecycle failure when POSIX proc
   await assert.rejects(running, UnconfirmedProcessReapError);
 });
 
+test('nodeProcessRunner bounds initial POSIX SIGTERM ESRCH when the root never closes', async () => {
+  const managedChild = Object.assign(new EventEmitter(), { pid: 8642, kill: () => true }) as unknown as ChildProcess;
+  const timers: Array<() => void> = [];
+  const processKill = (() => { throw Object.assign(new Error('gone'), { code: 'ESRCH' }); }) as typeof process.kill;
+  const runner = createNodeProcessRunner({
+    platform: 'linux',
+    spawn: (() => managedChild) as typeof spawn,
+    processKill,
+    setTimeout: ((callback: () => void) => { timers.push(callback); return {} as NodeJS.Timeout; }) as typeof setTimeout,
+    clearTimeout: (() => undefined) as typeof clearTimeout,
+  });
+  const controller = new AbortController();
+  const running = runner.run('managed-command', [], { kind: 'lifecycle', signal: controller.signal });
+  controller.abort();
+  assert.equal(timers.length, 1, 'the deadline starts before SIGTERM can report ESRCH');
+  timers[0]();
+  await assert.rejects(running, UnconfirmedProcessReapError);
+});
+
 test('nodeProcessRunner abort terminates spawned process-group descendants before settling', { skip: process.platform === 'win32' }, async () => {
   const directory = await mkdtemp(join(tmpdir(), 'agent-containers-process-group-'));
   const marker = join(directory, 'grandchild-survived');
