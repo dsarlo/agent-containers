@@ -304,9 +304,10 @@ export async function clearManualRecoveryIfCurrent(stateDir: string, name: strin
     const failsafePath = manualRecoveryClearFailsafePath(stateDir, name);
     await durableReplace(join(directory, `.${randomUUID()}.manual-recovery.clear-failsafe.tmp`), failsafePath, directory, `${JSON.stringify(current)}\n`, durability);
     await appendManualRecoveryJournalEvent(manualRecoveryJournalPath(stateDir, name), { event: 'clear' }, durability);
-    // The clear is now durable. Retiring the redundant copy afterward cannot
-    // turn an uncertain clear into permission to run lifecycle work.
-    await durableRemove(failsafePath, directory, false, durability);
+    // The clear is now durable. Once unlink succeeds, only its strict
+    // directory-sync uncertainty remains, so acknowledge the clear rather
+    // than error-returning after lifecycle has become admissible.
+    await retireClearFailsafeAfterCommittedJournalClear(failsafePath, directory, durability);
   });
 }
 
@@ -415,8 +416,8 @@ function normalizeManualRecovery(recovery: ManualRecovery): ManualRecovery {
   const normalized = { ...recovery, containerIds: recovery.containerIds.filter(isCanonicalContainerId) };
   if (typeof normalized.generation === 'string') return normalized;
   // Legacy durable records predate generations. Their content-derived identity
-  // remains stable until a new set record replaces them.
-  return { ...normalized, generation: `00000000-0000-4000-8000-${createHash('sha256').update(JSON.stringify(normalized)).digest('hex').slice(0, 12)}` };
+  // must include stored short hints, even though those hints are never actionable.
+  return { ...normalized, generation: `00000000-0000-4000-8000-${createHash('sha256').update(JSON.stringify(recovery)).digest('hex').slice(0, 12)}` };
 }
 
 function manualRecoveryError(name: string): Error {
@@ -839,6 +840,19 @@ async function retireOwnedLock(path: string, directory: string, owner: LockOwner
 async function durableRemove(path: string, directory: string, force: boolean, durability: StateDurabilityAdapter): Promise<void> {
   await rm(path, { recursive: true, force });
   await syncDirectory(directory, durability);
+}
+
+async function retireClearFailsafeAfterCommittedJournalClear(path: string, directory: string, durability: StateDurabilityAdapter): Promise<void> {
+  await rm(path, { recursive: true, force: false });
+  // Windows write-through publication does not offer a directory flush. Do not
+  // convert adapter capability failures into an acknowledgement either.
+  if (await durability.publicationMode() === 'recoverable') return;
+  try {
+    await durability.syncDirectory(directory);
+  } catch {
+    // The journal clear is already durable and the redundant failsafe is gone.
+    // A crash may retain it, requiring a conservative later acknowledgement.
+  }
 }
 
 async function durableRemoveOwned(path: string, directory: string, owner: LockOwner, durability: StateDurabilityAdapter): Promise<void> {

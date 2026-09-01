@@ -90,6 +90,29 @@ test('legacy recovery journals retain their barrier while discarding short Docke
   });
 });
 
+test('legacy recovery identities bind acknowledgements to the stored short-ID record', async () => {
+  for (const format of ['journal', 'json'] as const) {
+    const stateDir = await mkdtemp(join(tmpdir(), `agent-containers-legacy-recovery-generation-${format}-`));
+    const first = { version: 1, reason: 'operation-may-be-active' as const, containerIds: ['a'.repeat(12)], worktree: metadata.worktree, createdAt: '2026-01-01T00:00:00.000Z' };
+    const second = { ...first, containerIds: ['b'.repeat(12)] };
+    await mkdir(join(stateDir, 'locks'), { recursive: true });
+    const path = join(stateDir, 'locks', `safe.manual-recovery.${format === 'journal' ? 'journal' : 'json'}`);
+    const encode = (recovery: typeof first) => {
+      if (format === 'json') return JSON.stringify(recovery);
+      const event = { event: 'set' as const, recovery };
+      return `${JSON.stringify({ ...event, checksum: createHash('sha256').update(JSON.stringify(event)).digest('hex') })}\n`;
+    };
+    await writeFile(path, encode(first));
+    const observed = await loadManualRecovery(stateDir, 'safe');
+    assert.ok(observed);
+    await writeFile(path, encode(second));
+
+    await assert.rejects(() => state.clearManualRecoveryIfCurrent(stateDir, 'safe', observed.generation), /changed since it was acknowledged/i);
+    assert.notEqual((await loadManualRecovery(stateDir, 'safe'))?.generation, observed.generation);
+    assert.deepEqual((await loadManualRecovery(stateDir, 'safe'))?.containerIds, []);
+  }
+});
+
 test('legacy recovery remains a barrier when every staged journal migration boundary fails', async () => {
   for (const boundary of ['staging write', 'staging sync', 'publication', 'journal parent sync'] as const) {
     const stateDir = await mkdtemp(join(tmpdir(), `agent-containers-legacy-migration-${boundary.replace(' ', '-')}-`));
@@ -297,38 +320,37 @@ test('a journal-clear parent sync failure never admits lifecycle after its visib
   assert.equal(await loadManualRecovery(stateDir, 'safe'), undefined);
 });
 
-test('a post-clear failsafe cleanup sync failure leaves the committed clear authoritative', async () => {
+test('a post-delete failsafe directory-sync failure completes the committed acknowledgement', async () => {
   const stateDir = await mkdtemp(join(tmpdir(), 'agent-containers-recovery-clear-post-delete-'));
   await recordManualRecovery(stateDir, 'safe', { reason: 'operation-may-be-active', containerIds: [], worktree: metadata.worktree });
   const observed = await loadManualRecovery(stateDir, 'safe');
   assert.ok(observed);
   let locksSyncs = 0;
   let failPostDeleteSync = true;
-  const journalPath = join(stateDir, 'locks', 'safe.manual-recovery.journal');
   const failsafePath = join(stateDir, 'locks', 'safe.manual-recovery.clear-failsafe.json');
   setStateDurabilityAdapterForTesting({
     ...testDurabilityAdapter,
     syncDirectory: async (path) => {
       if (path !== join(stateDir, 'locks')) return;
       locksSyncs += 1;
-      if (!failPostDeleteSync) return;
+      if (!failPostDeleteSync || locksSyncs !== 3) return;
       try {
         await lstat(failsafePath);
-        return;
       } catch (error: unknown) {
         if (typeof error !== 'object' || error === null || !('code' in error) || error.code !== 'ENOENT') throw error;
       }
-      const journal = await readFile(journalPath, 'utf8');
-      if (!journal.includes('"event":"clear"')) throw new Error('post-delete failsafe sync failed');
+      throw new Error('post-delete failsafe sync failed');
     },
   });
   try {
     await state.clearManualRecoveryIfCurrent(stateDir, 'safe', observed.generation);
     assert.equal(locksSyncs, 3, 'the journal clear is durably published before failsafe cleanup');
     const retained = await loadManualRecovery(stateDir, 'safe');
-    assert.equal(retained, undefined, 'a durable journal clear is authoritative even if stale failsafe cleanup is retried later');
+    assert.equal(retained, undefined, 'a durable journal clear is authoritative after the final deletion sync becomes uncertain');
     setStateDurabilityAdapterForTesting(testDurabilityAdapter);
-    await withWorkspaceLock(stateDir, 'safe', async () => undefined);
+    let lifecycleRan = false;
+    await withWorkspaceLock(stateDir, 'safe', async () => { lifecycleRan = true; });
+    assert.equal(lifecycleRan, true, 'a successful acknowledgement may admit lifecycle work');
     failPostDeleteSync = false;
   } finally {
     setStateDurabilityAdapterForTesting(testDurabilityAdapter);
