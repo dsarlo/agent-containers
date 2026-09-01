@@ -36,7 +36,7 @@ interface LockOwner {
 
 export interface ManualRecovery {
   version: 1;
-  reason: 'operation-may-be-active' | 'remote-exec-interrupted' | 'devcontainer-up-ambiguous';
+  reason: 'operation-may-be-active' | 'remote-exec-interrupted' | 'devcontainer-up-ambiguous' | 'local-process-reap-unconfirmed';
   containerIds: string[];
   worktree: string;
   createdAt: string;
@@ -250,6 +250,7 @@ export async function loadMetadata(stateDir: string, name: string): Promise<Work
 
 export async function saveMetadata(stateDir: string, metadata: WorkspaceMetadata): Promise<void> {
   if (!isAgentContainersWorkspace(metadata)) throw new Error('Refusing to save invalid Agent Containers workspace metadata.');
+  if (metadata.containerId !== undefined && !isCanonicalContainerId(metadata.containerId)) throw new Error('Refusing to save a non-canonical Docker container ID.');
   const path = metadataPath(stateDir, metadata.name);
   const directory = join(stateDir, 'workspaces');
   const durability = stateDurability();
@@ -257,6 +258,10 @@ export async function saveMetadata(stateDir: string, metadata: WorkspaceMetadata
   await ensureDurableDirectory(directory, durability);
   const temporaryPath = join(directory, `.${metadata.name}.${randomUUID()}.tmp`);
   await durableReplace(temporaryPath, path, directory, `${JSON.stringify(metadata, null, 2)}\n`, durability);
+}
+
+export function isCanonicalContainerId(value: unknown): value is string {
+  return typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
 }
 
 export async function deleteMetadata(stateDir: string, name: string): Promise<void> {
@@ -268,13 +273,20 @@ export async function deleteMetadata(stateDir: string, name: string): Promise<vo
 export async function listMetadata(stateDir: string): Promise<WorkspaceMetadata[]> {
   try {
     const files = await readdir(join(stateDir, 'workspaces'));
-    const entries = await Promise.all(files.filter((file) => file.endsWith('.json')).map((file) => loadMetadata(stateDir, file.slice(0, -5))));
+    const names = files.filter((file) => file.endsWith('.json')).map((file) => file.slice(0, -5));
+    const entries: Array<WorkspaceMetadata | undefined> = [];
+    // Keep status reads bounded while preserving filesystem enumeration order.
+    for (let index = 0; index < names.length; index += METADATA_LIST_CONCURRENCY) {
+      entries.push(...await Promise.all(names.slice(index, index + METADATA_LIST_CONCURRENCY).map((name) => loadMetadata(stateDir, name))));
+    }
     return entries.filter((entry): entry is WorkspaceMetadata => entry !== undefined);
   } catch (error: unknown) {
     if (typeof error === 'object' && error !== null && 'code' in error && error.code === 'ENOENT') return [];
     throw error;
   }
 }
+
+export const METADATA_LIST_CONCURRENCY = 8;
 
 export function isAgentContainersWorkspace(metadata: unknown): metadata is WorkspaceMetadata {
   return typeof metadata === 'object' && metadata !== null &&
@@ -286,7 +298,7 @@ export function isAgentContainersWorkspace(metadata: unknown): metadata is Works
     'baseRef' in metadata && isLocalBranchRef(metadata.baseRef) &&
     'devcontainerPath' in metadata && typeof metadata.devcontainerPath === 'string' &&
     'createdAt' in metadata && typeof metadata.createdAt === 'string' &&
-    (!('containerId' in metadata) || metadata.containerId === undefined || (typeof metadata.containerId === 'string' && metadata.containerId.length > 0)) &&
+    (!('containerId' in metadata) || metadata.containerId === undefined || typeof metadata.containerId === 'string') &&
     (!('cleanup' in metadata) || metadata.cleanup === undefined || isCleanupState(metadata.cleanup));
 }
 
@@ -308,7 +320,7 @@ function isCleanupState(value: unknown): boolean {
 function isManualRecovery(value: unknown): value is ManualRecovery {
   const candidate = typeof value === 'object' && value !== null ? value as Partial<ManualRecovery> : undefined;
   return candidate?.version === 1 &&
-    (candidate.reason === 'operation-may-be-active' || candidate.reason === 'remote-exec-interrupted' || candidate.reason === 'devcontainer-up-ambiguous') &&
+    (candidate.reason === 'operation-may-be-active' || candidate.reason === 'remote-exec-interrupted' || candidate.reason === 'devcontainer-up-ambiguous' || candidate.reason === 'local-process-reap-unconfirmed') &&
     Array.isArray(candidate.containerIds) && candidate.containerIds.every((id) => typeof id === 'string' && id.length > 0) &&
     isCanonicalPath(candidate.worktree) && typeof candidate.createdAt === 'string';
 }

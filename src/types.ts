@@ -31,6 +31,8 @@ export interface ProcessRunOptions {
   onOutput?: (event: ProcessOutputEvent) => void;
   /** Aborts the active process, which is reaped before run() settles. */
   signal?: AbortSignal;
+  /** Lifecycle transports require a durable recovery boundary if local reaping is unconfirmed. */
+  kind?: 'lifecycle' | 'probe';
 }
 
 export interface ProcessRunner {

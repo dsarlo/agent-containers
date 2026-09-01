@@ -3,7 +3,7 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import { resolve } from 'node:path';
 import type { AgentContainersConfig, ProcessResult, ProcessRunner, ProcessRunOptions } from './types.js';
 import { validateWorkspaceName } from './names.js';
-import { bootstrapManualRecoveryJournal, deleteMetadata, isAgentContainersWorkspace, loadMetadata, saveMetadata, type WorkspaceMetadata } from './state.js';
+import { bootstrapManualRecoveryJournal, deleteMetadata, isAgentContainersWorkspace, isCanonicalContainerId, loadMetadata, saveMetadata, type WorkspaceMetadata } from './state.js';
 
 export type { ProcessRunner } from './types.js';
 
@@ -19,6 +19,14 @@ export interface NodeProcessRunnerDependencies {
   spawn?: typeof spawn;
   /** Bound Windows cancellation reaping without making focused tests wait seconds. */
   windowsReapTimeoutMs?: number;
+}
+
+/** A local lifecycle transport could not be confirmed reaped. */
+export class UnconfirmedProcessReapError extends Error {
+  constructor() {
+    super('Local lifecycle process reaping timed out before the managed child closed; operator recovery is required.');
+    this.name = 'UnconfirmedProcessReapError';
+  }
 }
 
 export function createNodeProcessRunner({
@@ -72,7 +80,7 @@ export function createNodeProcessRunner({
               try {
                 // This is a failed recovery, not proof that taskkill stopped descendants.
                 terminateRootOnce();
-                fail(windowsReapTimeoutError());
+                fail(options.kind === 'lifecycle' ? new UnconfirmedProcessReapError() : windowsReapTimeoutError());
               } catch (error: unknown) {
                 fail(error instanceof Error ? error : new Error(String(error)));
               }
@@ -239,6 +247,7 @@ export interface RemoveWorkspaceOptions {
 export async function removeWorkspace(metadata: WorkspaceMetadata, options: RemoveWorkspaceOptions, runner: ProcessRunner, save: (metadata: WorkspaceMetadata) => Promise<void>, removeMetadata: () => Promise<void>): Promise<void> {
   if (!options.confirmed) throw new Error('Refusing to remove a workspace without --yes.');
   if (!isAgentContainersWorkspace(metadata)) throw new Error('Refusing to remove metadata that is not an Agent Containers workspace.');
+  if (metadata.containerId !== undefined && !isCanonicalContainerId(metadata.containerId)) throw new Error('Refusing to inspect or remove a legacy or non-canonical recorded Docker container ID. Verify it manually and repair the metadata first.');
   let current = metadata;
 
   let worktreePresent = false;
@@ -290,14 +299,14 @@ export async function removeWorkspace(metadata: WorkspaceMetadata, options: Remo
   }
 
   if (current.containerId && !current.cleanup?.container && !options.skipContainerCleanup) {
-    const inspect = await runner.run('docker', ['inspect', '--format', '{{ index .Config.Labels "devcontainer.local_folder" }}', current.containerId], withSignal({}, options.signal));
+    const inspect = await runner.run('docker', ['inspect', '--format', '{{.Id}}\n{{ index .Config.Labels "devcontainer.local_folder" }}', current.containerId], withSignal({ kind: 'probe' }, options.signal));
     if (inspect.code !== 0) {
       if (!containerIsAlreadyGone(inspect)) throw commandError('docker inspect', inspect);
-    } else if (resolve(inspect.stdout.trim()) !== current.worktree) {
+    } else if (!isOwnedContainerInspection(inspect.stdout, current.containerId, current.worktree)) {
       throw new Error('Refusing to remove: recorded Dev Container is not bound to the recorded worktree.');
     }
     if (inspect.code === 0) {
-      const container = await runner.run('docker', ['rm', '-f', current.containerId], withSignal({}, options.signal));
+      const container = await runner.run('docker', ['rm', '-f', current.containerId], withSignal({ kind: 'probe' }, options.signal));
       if (container.code !== 0) throw commandError('docker rm', container);
     }
     current = withCleanup(current, 'container');
@@ -326,6 +335,11 @@ export async function removeWorkspace(metadata: WorkspaceMetadata, options: Remo
     await save(current);
   }
   await removeMetadata();
+}
+
+function isOwnedContainerInspection(output: string, containerId: string, worktree: string): boolean {
+  const [id, label, ...extra] = output.replace(/\r/g, '').trimEnd().split('\n');
+  return extra.length === 0 && id === containerId && label === worktree;
 }
 
 export async function removeWorkspaceMetadata(stateDir: string, name: string): Promise<void> {

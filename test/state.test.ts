@@ -29,6 +29,26 @@ test('metadata rejects a filename/name mismatch and non-canonical paths', async 
   await assert.rejects(() => saveMetadata(stateDir, { ...metadata, name: 'two--hyphens', branch: 'agent-containers/two--hyphens' }), /invalid/);
 });
 
+test('metadata only persists lowercase full Docker IDs while retaining legacy records for fail-closed callers', async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), 'agent-containers-container-id-'));
+  await assert.rejects(() => saveMetadata(stateDir, { ...metadata, containerId: 'abcdef012345' }), /non-canonical Docker container ID/);
+  const legacy = { ...metadata, containerId: 'ABCDEF012345' };
+  await mkdir(join(stateDir, 'workspaces'), { recursive: true });
+  await writeFile(join(stateDir, 'workspaces', 'safe.json'), JSON.stringify(legacy));
+  assert.deepEqual(await loadMetadata(stateDir, 'safe'), legacy, 'legacy state remains readable so callers can fail closed with recovery guidance');
+});
+
+test('legacy recorded container IDs fail closed before removal can inspect or delete a container', async () => {
+  const legacy = { ...metadata, containerId: 'abcdef012345' };
+  const { removeWorkspace } = await import('../src/workspaces.js');
+  let invoked = false;
+  await assert.rejects(
+    () => removeWorkspace(legacy, { confirmed: true }, { async run() { invoked = true; return { code: 0, stdout: '', stderr: '' }; } }, async () => undefined, async () => undefined),
+    /legacy or non-canonical recorded Docker container ID/,
+  );
+  assert.equal(invoked, false);
+});
+
 test('metadata writes are atomic and never expose a predictable temporary file', async () => {
   const stateDir = await mkdtemp(join(tmpdir(), 'agent-containers-state-'));
   await saveMetadata(stateDir, metadata);
