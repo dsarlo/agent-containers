@@ -544,31 +544,6 @@ async function markUnconfirmedReap(lockPath: string, durability: StateDurability
   }
 }
 
-async function waitForRecoveryToFinish(recoveryPath: string, deadline: number, name: string, durability: StateDurabilityAdapter): Promise<void> {
-  while (true) {
-    try {
-      await lstat(recoveryPath);
-    } catch (error: unknown) {
-      if (isNodeError(error, 'ENOENT')) return;
-      throw error;
-    }
-    const owner = await readLockOwner(recoveryPath);
-    if (owner && !localPidIsAlive(owner.pid)) {
-      const abandonedPath = `${recoveryPath}.${owner.token}.abandoned`;
-      try {
-        await durableRename(recoveryPath, abandonedPath, dirname(recoveryPath), durability);
-        await durableRemove(abandonedPath, dirname(recoveryPath), false, durability);
-        return;
-      } catch (error: unknown) {
-        if (!isNodeError(error, 'ENOENT')) throw error;
-        continue;
-      }
-    }
-    if (Date.now() >= deadline) throw lockTimeout(name);
-    await delay();
-  }
-}
-
 async function acquireRecoveryLock(recoveryPath: string, locksDir: string, lockName: string, deadline: number, name: string, isPidAlive: (pid: number) => boolean, durability: StateDurabilityAdapter): Promise<void> {
   while (true) {
     await reclaimDeadPublishedLock(recoveryPath, isPidAlive, durability);
