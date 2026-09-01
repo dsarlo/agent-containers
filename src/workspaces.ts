@@ -212,7 +212,7 @@ export function createNodeProcessRunner({
           rootClosed = true;
           receive('stdout', Buffer.alloc(0), true);
           receive('stderr', Buffer.alloc(0), true);
-          const rootResult = { code: code ?? 1, stdout, stderr };
+          const rootResult = { code: code ?? 1, stdout, stderr, terminal: true as const };
           if (!cancellationStarted) settle(rootResult);
           else if (platform !== 'win32' && posixGroupGone) finishCancellation();
           else if (platform === 'win32' && (windowsTaskkillSucceeded || !windowsReaperLive)) {

@@ -114,7 +114,7 @@ test('nodeProcessRunner rejects through Windows reaping recovery when taskkill a
     pid: 8765,
     kill: (signal: NodeJS.Signals) => { rootKillSignals.push(signal); return true; },
   }) as unknown as ChildProcess;
-  const spawnForTest = ((command: string) => command === 'taskkill'
+  const spawnForTest = ((command: string) => command.endsWith('System32\\taskkill.exe')
     ? new EventEmitter() as ChildProcess
     : managedChild) as typeof spawn;
   const controller = new AbortController();
@@ -142,7 +142,8 @@ test('nodeProcessRunner drives the bounded Windows failure path through its inje
   const timerCallbacks: Array<() => void> = [];
   const runner = createNodeProcessRunner({
     platform: 'win32',
-    spawn: ((command: string) => command === 'taskkill' ? new EventEmitter() as ChildProcess : managedChild) as typeof spawn,
+      windowsDirectory: () => 'C:\\Windows',
+      spawn: ((command: string) => command.endsWith('System32\\taskkill.exe') ? new EventEmitter() as ChildProcess : managedChild) as typeof spawn,
     setTimeout: ((callback: () => void) => { timerCallbacks.push(callback); return {} as NodeJS.Timeout; }) as typeof setTimeout,
     clearTimeout: (() => undefined) as typeof clearTimeout,
   });
@@ -228,7 +229,7 @@ test('nodeProcessRunner turns Windows post-cancellation fallback failures into l
     const runner = createNodeProcessRunner({
       platform: 'win32',
       spawn: ((command: string) => {
-        if (command !== 'taskkill') return root;
+        if (!command.endsWith('System32\\taskkill.exe')) return root;
         if (scenario === 'taskkill-sync-throw') throw new Error('taskkill spawn failed');
         return taskkill;
       }) as typeof spawn,
@@ -411,13 +412,17 @@ test('nodeProcessRunner reports bounded readonly cancellation when the POSIX gro
   const marker = join(directory, 'grandchild-survived');
   const controller = new AbortController();
   const grandchild = `require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'survived')`;
-  const program = `require('node:child_process').spawn(process.execPath, ['-e', ${JSON.stringify(`setTimeout(() => ${grandchild}, 250)`)}], { stdio: 'ignore' }); setInterval(() => {}, 1000);`;
-  const running = createNodeProcessRunner({ posixGraceMs: 0, posixVerificationTimeoutMs: 0 }).run(process.execPath, ['-e', program], { signal: controller.signal });
-  await new Promise((resolveDelay) => setTimeout(resolveDelay, 100));
-  controller.abort();
-  await assert.rejects(running, /POSIX process-group reaping could not be confirmed/);
-  await new Promise((resolveDelay) => setTimeout(resolveDelay, 300));
-  await assert.rejects(() => lstat(marker), { code: 'ENOENT' });
+  const program = `const child = require('node:child_process').spawn(process.execPath, ['-e', ${JSON.stringify(`setTimeout(() => ${grandchild}, 250)`)}], { detached: true, stdio: 'ignore' }); child.unref(); setInterval(() => {}, 1000);`;
+  try {
+    const running = createNodeProcessRunner({ posixGraceMs: 0, posixVerificationTimeoutMs: 0 }).run(process.execPath, ['-e', program], { signal: controller.signal });
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 100));
+    controller.abort();
+    await assert.rejects(running, /POSIX process-group reaping could not be confirmed/);
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 300));
+    assert.equal(await readFile(marker, 'utf8'), 'survived');
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 });
 
 test('SIGTERM keeps the lifecycle lock until a cancelled child process has exited', { timeout: 5_000 }, async () => {

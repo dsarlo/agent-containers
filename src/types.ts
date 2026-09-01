@@ -14,6 +14,8 @@ export interface ProcessResult {
   code: number;
   stdout: string;
   stderr: string;
+  /** Set only by runners that observed child close before resolving the result. */
+  terminal?: true;
 }
 
 export interface ProcessOutputEvent {

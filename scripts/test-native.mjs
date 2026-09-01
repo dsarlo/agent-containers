@@ -8,7 +8,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 const packageRoot = process.env.PACKED_NATIVE_PACKAGE_DIR
   ? resolve(process.env.PACKED_NATIVE_PACKAGE_DIR)
   : resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const { getProductionStateDurabilityAdapter } = await import(pathToFileURL(join(packageRoot, 'dist/src/durability.js')).href);
+const { getAuthoritativeWindowsDirectory, getProductionStateDurabilityAdapter } = await import(pathToFileURL(join(packageRoot, 'dist/src/durability.js')).href);
 const {
   clearManualRecovery,
   loadManualRecovery,
@@ -53,6 +53,9 @@ try {
   }
   if (mode === 'recoverable') {
     assert.equal(process.platform, 'win32', 'recoverable publication is the Windows production protocol');
+    const windowsDirectory = getAuthoritativeWindowsDirectory();
+    assert.equal(typeof windowsDirectory, 'string', 'the native Windows-directory bridge must return a string on Windows');
+    assert.ok(windowsDirectory && /^[A-Za-z]:\\/.test(windowsDirectory), 'the native Windows-directory bridge must return an absolute drive path');
     await adapter.moveFileWriteThrough(source, destination);
     assert.equal(await readFile(destination, 'utf8'), payload, 'write-through publication must preserve the exact payload');
   } else {

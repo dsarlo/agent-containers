@@ -47,7 +47,7 @@ test('CLI help returns success and describes public commands', async () => {
   assert.match(recoveryMessages.at(-1) ?? '', /--remote-command-stopped/);
 });
 
-test('recover waits for an active workspace lifecycle lock before clearing manual recovery', async () => {
+test('recover never clears a newer manual recovery barrier published while it waited for a lifecycle lock', async () => {
   const stateHome = await mkdtemp(join(tmpdir(), 'agent-containers-cli-recover-'));
   const stateDir = join(stateHome, 'agent-containers');
   const previousStateHome = process.env.XDG_STATE_HOME;
@@ -57,21 +57,23 @@ test('recover waits for an active workspace lifecycle lock before clearing manua
   let lockHeld!: () => void;
   const lockIsHeld = new Promise<void>((resolve) => { lockHeld = resolve; });
   try {
+    await recordManualRecovery(stateDir, 'safe', { reason: 'operation-may-be-active', containerIds: [], worktree: '/repo/worktrees/safe' });
+    const acknowledged = await loadManualRecovery(stateDir, 'safe');
+    assert.ok(acknowledged);
     const activeLifecycle = withWorkspaceLock(stateDir, 'safe', async () => {
-      await recordManualRecovery(stateDir, 'safe', { reason: 'operation-may-be-active', containerIds: [], worktree: '/repo/worktrees/safe' });
       lockHeld();
       await lockMayRelease;
-    });
+    }, { allowManualRecovery: true });
     await lockIsHeld;
     let recoverSettled = false;
     const recover = runCli(['recover', 'safe', '--yes', '--remote-command-stopped'], process.cwd(), () => undefined).finally(() => { recoverSettled = true; });
     await new Promise((resolve) => setTimeout(resolve, 35));
     assert.equal(recoverSettled, false, 'recover must not clear a guard while another lifecycle holds the workspace lock');
-    assert.ok(await loadManualRecovery(stateDir, 'safe'));
+    await recordManualRecovery(stateDir, 'safe', { reason: 'operation-may-be-active', containerIds: [], worktree: '/repo/worktrees/safe' });
     releaseLock();
     await activeLifecycle;
-    assert.equal(await recover, 0);
-    assert.equal(await loadManualRecovery(stateDir, 'safe'), undefined);
+    assert.equal(await recover, 1);
+    assert.notEqual((await loadManualRecovery(stateDir, 'safe'))?.generation, acknowledged.generation);
   } finally {
     if (previousStateHome === undefined) delete process.env.XDG_STATE_HOME;
     else process.env.XDG_STATE_HOME = previousStateHome;

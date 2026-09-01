@@ -726,7 +726,7 @@ test('a cancelled remote exec records one durable block and prevents a concurren
   finishRemote();
   await assert.rejects(() => executing, /remote command may still be active/);
   assert.match(String(await observedRemove), /manual recovery/);
-  assert.equal(recoveryWrites, 2, 'the pre-dispatch guard is promoted once when the local remote-exec transport is interrupted');
+  assert.equal(recoveryWrites, 3, 'the pre-dispatch guard is promoted with the observed ID, then retained when the local remote-exec transport is interrupted');
   assert.ok(await observedExecution);
   await clearManualRecovery(stateDir, 'safe-name');
   await withWorkspaceLock(stateDir, 'safe-name', async () => { removalRan = true; });

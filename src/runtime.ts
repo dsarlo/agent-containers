@@ -99,6 +99,9 @@ export async function execWorkspace(metadata: WorkspaceMetadata, command: string
     // but does not prove this invocation created it. Preserve it as a hint only.
     return recordAmbiguousUp(recordRecovery, metadata, [containerId], `Could not persist container metadata (${detail}); preserved container ${containerId} without adopting or removing it`);
   }
+  // `up` supplied an exact, inspected terminal ID. Promote that observation
+  // before dispatching `exec`, so a transport failure cannot leave an empty hint.
+  await recordRecovery({ reason: 'operation-may-be-active', containerIds: recoveryHints(metadata, [containerId]), worktree: metadata.worktree });
   // The CLI can only terminate its local transport. If it was interrupted, it
   // cannot truthfully assert that the command inside the container stopped.
   let result: ProcessResult;
@@ -108,7 +111,8 @@ export async function execWorkspace(metadata: WorkspaceMetadata, command: string
     if (error instanceof UnconfirmedProcessReapError) return unconfirmedReapRecovery(metadata, recordRecovery, error.message, [containerId]);
     throw error;
   }
-  if (signal?.aborted) {
+  // Only a runner that observed child close can override a late ambient abort.
+  if (signal?.aborted && result.terminal !== true) {
     await recordRecovery({ reason: 'remote-exec-interrupted', containerIds: [containerId], worktree: metadata.worktree });
     throw new Error(`The local Dev Containers CLI was interrupted; the remote command may still be active in container ${containerId}. Agent Containers recorded a manual-recovery block and will not run lifecycle commands for ${metadata.name} until an operator verifies the remote command is stopped and clears it.`);
   }

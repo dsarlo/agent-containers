@@ -53,6 +53,24 @@ export interface ManualRecoveryInput {
 let testDurabilityAdapter: StateDurabilityAdapter | undefined;
 let testDurableRename: ((source: string, destination: string) => Promise<void>) | undefined;
 let testJournalStagingWrite: ((file: FileHandle, content: string) => Promise<void>) | undefined;
+const journalSerializers = new Map<string, Promise<void>>();
+
+/** Serialize every local journal transition; filesystem durability handles crashes. */
+async function withManualRecoveryJournalSerialization<T>(stateDir: string, name: string, action: () => Promise<T>): Promise<T> {
+  const path = manualRecoveryJournalPath(stateDir, name);
+  const previous = journalSerializers.get(path) ?? Promise.resolve();
+  let release!: () => void;
+  const current = new Promise<void>((resolve) => { release = resolve; });
+  const queued = previous.then(() => current);
+  journalSerializers.set(path, queued);
+  await previous;
+  try {
+    return await action();
+  } finally {
+    release();
+    if (journalSerializers.get(path) === queued) journalSerializers.delete(path);
+  }
+}
 
 /** Test-only injection point so state behavior can be exercised without a compiled host addon. */
 export function setStateDurabilityAdapterForTesting(adapter: StateDurabilityAdapter | undefined): void {
@@ -98,6 +116,10 @@ type CheckedManualRecoveryJournalEvent = ManualRecoveryJournalEvent & { checksum
  * immediately after the journal itself was first published.
  */
 export async function bootstrapManualRecoveryJournal(stateDir: string, name: string): Promise<boolean> {
+  return withManualRecoveryJournalSerialization(stateDir, name, () => bootstrapManualRecoveryJournalUnsafe(stateDir, name));
+}
+
+async function bootstrapManualRecoveryJournalUnsafe(stateDir: string, name: string): Promise<boolean> {
   const lockName = validateWorkspaceName(name);
   const directory = join(stateDir, 'locks');
   const path = manualRecoveryJournalPath(stateDir, lockName);
@@ -153,40 +175,23 @@ export async function bootstrapManualRecoveryJournal(stateDir: string, name: str
 
 /** Persist an append-only, checksummed recovery barrier before remote lifecycle work. */
 export async function recordManualRecovery(stateDir: string, name: string, input: ManualRecoveryInput): Promise<void> {
-  const recovery: ManualRecovery = { version: 1, generation: randomUUID(), ...input, containerIds: [...new Set(input.containerIds.filter(isCanonicalContainerId))], createdAt: new Date().toISOString() };
-  if (!isManualRecovery(recovery)) throw new Error('Refusing to save invalid manual recovery state.');
-  const durability = stateDurability();
-  await durability.assertStateWriteSupport();
-  await bootstrapManualRecoveryJournal(stateDir, name);
-  await appendManualRecoveryJournalEvent(manualRecoveryJournalPath(stateDir, name), { event: 'set', recovery }, durability);
+  await withManualRecoveryJournalSerialization(stateDir, name, async () => {
+    const recovery: ManualRecovery = { version: 1, generation: randomUUID(), ...input, containerIds: [...new Set(input.containerIds.filter(isCanonicalContainerId))], createdAt: new Date().toISOString() };
+    if (!isManualRecovery(recovery)) throw new Error('Refusing to save invalid manual recovery state.');
+    const durability = stateDurability();
+    await durability.assertStateWriteSupport();
+    await bootstrapManualRecoveryJournalUnsafe(stateDir, name);
+    await appendManualRecoveryJournalEvent(manualRecoveryJournalPath(stateDir, name), { event: 'set', recovery }, durability);
+  });
 }
 
 async function appendManualRecoveryJournalEvent(path: string, event: ManualRecoveryJournalEvent, durability: StateDurabilityAdapter): Promise<void> {
-  await repairManualRecoveryJournalTail(path, durability);
-  const entry: CheckedManualRecoveryJournalEvent = { ...event, checksum: journalChecksum(event) };
-  let file: FileHandle | undefined;
-  try {
-    file = await open(path, 'a', 0o600);
-    await file.writeFile(`${JSON.stringify(entry)}\n`, 'utf8');
-    await file.close();
-    file = undefined;
-    // The regular-file flush is the durable recovery guard on macOS and the
-    // Windows old-valid-or-new-valid publication protocol.
-    await durability.syncFile(path);
-  } catch (error: unknown) {
-    await file?.close();
-    throw error;
-  }
-}
-
-async function repairManualRecoveryJournalTail(path: string, durability: StateDurabilityAdapter): Promise<void> {
   const source = await readFile(path, 'utf8');
-  if (source === '' || source.endsWith('\n')) return;
-  // The parser tolerates only an interrupted final record. Publish a complete
-  // replacement before appending so that record can never corrupt the next one.
-  const committed = source.slice(0, source.lastIndexOf('\n') + 1);
-  const directory = dirname(path);
-  await durableReplace(join(directory, `.${randomUUID()}.manual-recovery.journal.tmp`), path, directory, committed, durability);
+  const committed = source.endsWith('\n') ? source : source.slice(0, source.lastIndexOf('\n') + 1);
+  const entry: CheckedManualRecoveryJournalEvent = { ...event, checksum: journalChecksum(event) };
+  // Never append a clear in-place: a write that reaches page cache but fails
+  // its durability boundary must leave the old barrier authoritative.
+  await durableReplace(join(dirname(path), `.${randomUUID()}.manual-recovery.journal.tmp`), path, dirname(path), `${committed}${JSON.stringify(entry)}\n`, durability);
 }
 
 async function durableReplace(temporaryPath: string, path: string, directory: string, content: string, durability: StateDurabilityAdapter): Promise<void> {
@@ -267,13 +272,15 @@ export async function clearManualRecovery(stateDir: string, name: string): Promi
 
 /** Clear only the exact recovery barrier the caller observed while holding its lifecycle lock. */
 export async function clearManualRecoveryIfCurrent(stateDir: string, name: string, generation: string): Promise<void> {
-  const current = await loadManualRecovery(stateDir, name);
-  if (!current) throw new Error(`No manual recovery block exists for workspace "${name}".`);
-  if (current.generation !== generation) throw new Error(`Manual recovery block for workspace "${name}" changed since it was acknowledged; refusing to clear the newer record.`);
-  const durability = stateDurability();
-  await durability.assertStateWriteSupport();
-  await bootstrapManualRecoveryJournal(stateDir, name);
-  await appendManualRecoveryJournalEvent(manualRecoveryJournalPath(stateDir, name), { event: 'clear' }, durability);
+  await withManualRecoveryJournalSerialization(stateDir, name, async () => {
+    const current = await loadManualRecovery(stateDir, name);
+    if (!current) throw new Error(`No manual recovery block exists for workspace "${name}".`);
+    if (current.generation !== generation) throw new Error(`Manual recovery block for workspace "${name}" changed since it was acknowledged; refusing to clear the newer record.`);
+    const durability = stateDurability();
+    await durability.assertStateWriteSupport();
+    await bootstrapManualRecoveryJournalUnsafe(stateDir, name);
+    await appendManualRecoveryJournalEvent(manualRecoveryJournalPath(stateDir, name), { event: 'clear' }, durability);
+  });
 }
 
 export async function loadMetadata(stateDir: string, name: string): Promise<WorkspaceMetadata | undefined> {
@@ -587,8 +594,14 @@ async function retireAcknowledgedLock(path: string, quarantinePath: string, lock
       const barrier = await acquireOwnedDirectory(quarantinePath, locksDir, `${lockName}.reap-unconfirmed`, Date.now() + 30_000, name, durability);
       if (!barrier) throw new Error('Timed out publishing recovery quarantine.');
     }
-    await durableRemove(path, locksDir, false, durability);
-    if (path !== quarantinePath) await durableRemove(quarantinePath, locksDir, false, durability);
+    await durableRemoveOwned(path, locksDir, owner, durability);
+    if (path !== quarantinePath) {
+      // This is a separately created barrier, so validate its own token rather
+      // than ever deleting a replacement owner that won the pathname race.
+      const barrier = await readLockOwner(quarantinePath);
+      if (!barrier) throw malformedLockError(name, quarantinePath);
+      await durableRemoveOwned(quarantinePath, locksDir, barrier, durability);
+    }
   } catch (error: unknown) {
     // A failed remove may have deleted its path before the directory durability
     // boundary. Keep (or republish) the recognized quarantine barrier instead.
@@ -764,6 +777,13 @@ async function retireOwnedLock(path: string, directory: string, owner: LockOwner
 async function durableRemove(path: string, directory: string, force: boolean, durability: StateDurabilityAdapter): Promise<void> {
   await rm(path, { recursive: true, force });
   await syncDirectory(directory, durability);
+}
+
+async function durableRemoveOwned(path: string, directory: string, owner: LockOwner, durability: StateDurabilityAdapter): Promise<void> {
+  if (!sameLockOwner(await readLockOwner(path), owner)) {
+    throw new Error(`Lifecycle lock owner changed before removal; refusing to remove ${path}.`);
+  }
+  await durableRemove(path, directory, false, durability);
 }
 
 async function readLockOwner(path: string): Promise<LockOwner | undefined> {

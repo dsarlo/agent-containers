@@ -62,10 +62,13 @@ export async function runCli(args: string[], cwd = process.cwd(), write: (messag
         if (!rest.includes('--yes') || !rest.includes('--remote-command-stopped')) {
           throw new UsageError('Usage: agent-containers recover <name> --yes --remote-command-stopped');
         }
+        // Bind this acknowledgement to the exact barrier visible before waiting
+        // behind another lifecycle. A later lifecycle must never be cleared by it.
+        const acknowledged = await loadManualRecovery(stateDir, name);
+        if (!acknowledged) throw new Error(`No manual recovery block exists for workspace "${name}".`);
         await acknowledgeUnconfirmedProcessReap(stateDir, name);
         await withWorkspaceLock(stateDir, name, async () => {
-          const recovery = await loadManualRecovery(stateDir, name);
-          if (recovery) await clearManualRecoveryIfCurrent(stateDir, name, recovery.generation);
+          await clearManualRecoveryIfCurrent(stateDir, name, acknowledged.generation);
         }, { allowManualRecovery: true });
         write(`Cleared manual recovery block for ${name}; this acknowledgement did not stop or remove any remote container.`);
         return 0;
