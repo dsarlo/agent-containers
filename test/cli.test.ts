@@ -1,10 +1,10 @@
 import assert from 'node:assert/strict';
-import { chmod, mkdtemp, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { chmod, lstat, mkdtemp, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import test from 'node:test';
-import { loadManualRecovery, recordManualRecovery, withWorkspaceLock } from '../src/state.js';
+import { loadManualRecovery, loadMetadata, recordManualRecovery, saveMetadata, withWorkspaceLock } from '../src/state.js';
 import { exitCodeForError, runCli } from '../src/cli.js';
 import { nodeProcessRunner, UnconfirmedProcessReapError } from '../src/workspaces.js';
 
@@ -76,6 +76,49 @@ test('recover waits for an active workspace lifecycle lock before clearing manua
     if (previousStateHome === undefined) delete process.env.XDG_STATE_HOME;
     else process.env.XDG_STATE_HOME = previousStateHome;
   }
+});
+
+test('recover explicitly clears an unconfirmed-reap quarantine without removing remote workspace state', async (t) => {
+  const stateHome = await mkdtemp(join(tmpdir(), 'agent-containers-cli-quarantine-recover-'));
+  const stateDir = join(stateHome, 'agent-containers');
+  const previousStateHome = process.env.XDG_STATE_HOME;
+  t.after(async () => {
+    if (previousStateHome === undefined) delete process.env.XDG_STATE_HOME;
+    else process.env.XDG_STATE_HOME = previousStateHome;
+    await rm(stateHome, { recursive: true, force: true });
+  });
+  process.env.XDG_STATE_HOME = stateHome;
+  await saveMetadata(stateDir, {
+    version: 1,
+    name: 'safe',
+    repoRoot: '/repo',
+    worktree: '/repo/worktrees/safe',
+    branch: 'agent-containers/safe',
+    baseRef: 'refs/heads/main',
+    devcontainerPath: '.devcontainer/devcontainer.json',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    containerId: '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
+  });
+  await recordManualRecovery(stateDir, 'safe', { reason: 'local-process-reap-unconfirmed', containerIds: [], worktree: '/repo/worktrees/safe' });
+  await assert.rejects(
+    () => withWorkspaceLock(stateDir, 'safe', async () => { throw new UnconfirmedProcessReapError(); }, {
+      allowManualRecovery: true,
+      onUnconfirmedProcessReap: async () => { throw new Error('recovery journal unavailable'); },
+    }),
+    /recovery journal unavailable/,
+  );
+  await assert.equal((await lstat(join(stateDir, 'locks', 'safe.reap-unconfirmed'))).isDirectory(), true);
+
+  const unlockMessages: string[] = [];
+  assert.equal(await runCli(['unlock', 'safe', '--yes'], process.cwd(), (message) => unlockMessages.push(message)), 1);
+  assert.match(unlockMessages.at(-1) ?? '', /quarantined.*Ordinary unlock never clears/i);
+
+  assert.equal(await runCli(['recover', 'safe', '--yes', '--remote-command-stopped'], process.cwd(), () => undefined), 0);
+  assert.equal(await loadManualRecovery(stateDir, 'safe'), undefined);
+  assert.equal((await loadMetadata(stateDir, 'safe'))?.containerId, '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef');
+  let acquired = false;
+  await withWorkspaceLock(stateDir, 'safe', async () => { acquired = true; });
+  assert.equal(acquired, true, 'the explicit acknowledgement permits a later lifecycle operation');
 });
 
 test('validate refuses a Dev Container config absent from the configured local base branch', async () => {

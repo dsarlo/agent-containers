@@ -38,7 +38,7 @@ export interface NodeProcessRunnerDependencies {
 /** A local lifecycle transport could not be confirmed reaped. */
 export class UnconfirmedProcessReapError extends Error {
   constructor() {
-    super('Local lifecycle process reaping timed out before the managed child closed; operator recovery is required.');
+    super('Local lifecycle process-tree or process-group reaping timed out before it could be confirmed; operator recovery is required.');
     this.name = 'UnconfirmedProcessReapError';
   }
 }
