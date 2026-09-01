@@ -47,6 +47,29 @@ test('CLI help returns success and describes public commands', async () => {
   assert.match(recoveryMessages.at(-1) ?? '', /--remote-command-stopped/);
 });
 
+test('recover retires a dead guarded lifecycle lock without a manual recovery record', async (t) => {
+  const stateHome = await mkdtemp(join(tmpdir(), 'agent-containers-cli-guarded-lock-recover-'));
+  const stateDir = join(stateHome, 'agent-containers');
+  const lockPath = join(stateDir, 'locks', 'safe.lock');
+  const previousStateHome = process.env.XDG_STATE_HOME;
+  t.after(async () => {
+    if (previousStateHome === undefined) delete process.env.XDG_STATE_HOME;
+    else process.env.XDG_STATE_HOME = previousStateHome;
+    await rm(stateHome, { recursive: true, force: true });
+  });
+  process.env.XDG_STATE_HOME = stateHome;
+  await mkdir(lockPath, { recursive: true });
+  await writeFile(join(lockPath, 'owner.json'), JSON.stringify({ pid: 2147483647, token: '00000000-0000-4000-8000-000000000001', createdAt: '2026-01-01T00:00:00.000Z' }));
+  await writeFile(join(lockPath, 'reap-guard'), 'guarded\n');
+  assert.equal(await loadManualRecovery(stateDir, 'safe'), undefined);
+
+  const messages: string[] = [];
+  const result = await runCli(['recover', 'safe', '--yes', '--remote-command-stopped'], process.cwd(), (message) => messages.push(message));
+  assert.equal(result, 0, messages.join('\n'));
+  assert.match(messages.at(-1) ?? '', /Acknowledged recovery/);
+  await assert.rejects(() => lstat(lockPath), { code: 'ENOENT' });
+});
+
 test('recover never clears a newer manual recovery barrier published while it waited for a lifecycle lock', async () => {
   const stateHome = await mkdtemp(join(tmpdir(), 'agent-containers-cli-recover-'));
   const stateDir = join(stateHome, 'agent-containers');

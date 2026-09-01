@@ -65,12 +65,13 @@ export async function runCli(args: string[], cwd = process.cwd(), write: (messag
         // Bind this acknowledgement to the exact barrier visible before waiting
         // behind another lifecycle. A later lifecycle must never be cleared by it.
         const acknowledged = await loadManualRecovery(stateDir, name);
-        if (!acknowledged) throw new Error(`No manual recovery block exists for workspace "${name}".`);
         await acknowledgeUnconfirmedProcessReap(stateDir, name);
-        await withWorkspaceLock(stateDir, name, async () => {
-          await clearManualRecoveryIfCurrent(stateDir, name, acknowledged.generation);
-        }, { allowManualRecovery: true });
-        write(`Cleared manual recovery block for ${name}; this acknowledgement did not stop or remove any remote container.`);
+        if (acknowledged) {
+          await withWorkspaceLock(stateDir, name, async () => {
+            await clearManualRecoveryIfCurrent(stateDir, name, acknowledged.generation);
+          }, { allowManualRecovery: true });
+        }
+        write(`Acknowledged recovery for ${name}; this acknowledgement did not stop or remove any remote container.`);
         return 0;
       }
       case 'unlock': {
