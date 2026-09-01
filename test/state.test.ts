@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { lstat, mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve, sep } from 'node:path';
+import { createHash } from 'node:crypto';
 import test from 'node:test';
 import * as state from '../src/state.js';
 import { acknowledgeUnconfirmedProcessReap, bootstrapManualRecoveryJournal, listMetadata, loadManualRecovery, loadMetadata, recordManualRecovery, releaseStaleWorkspaceLock, saveMetadata, setStateDurabilityAdapterForTesting, setStateDurableRenameForTesting, setStateJournalStagingWriteForTesting, withWorkspaceLock, type WorkspaceLockOptions, type WorkspaceMetadata } from '../src/state.js';
@@ -72,6 +73,21 @@ test('manual recovery drops non-canonical container hints rather than persisting
   const canonical = 'a'.repeat(64);
   await recordManualRecovery(stateDir, 'safe', { reason: 'devcontainer-up-ambiguous', containerIds: ['not-a-container', canonical], worktree: metadata.worktree });
   assert.deepEqual((await loadManualRecovery(stateDir, 'safe'))?.containerIds, [canonical]);
+});
+
+test('legacy recovery journals retain their barrier while discarding short Docker ID hints', async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), 'agent-containers-legacy-recovery-id-'));
+  const recovery = { version: 1, reason: 'operation-may-be-active', containerIds: ['abcdef012345'], worktree: metadata.worktree, createdAt: '2026-01-01T00:00:00.000Z' };
+  const event = { event: 'set' as const, recovery };
+  const entry = { ...event, checksum: createHash('sha256').update(JSON.stringify(event)).digest('hex') };
+  await mkdir(join(stateDir, 'locks'), { recursive: true });
+  await writeFile(join(stateDir, 'locks', 'safe.manual-recovery.journal'), `${JSON.stringify(entry)}\n`);
+
+  assert.deepEqual(await loadManualRecovery(stateDir, 'safe'), {
+    ...recovery,
+    generation: (await loadManualRecovery(stateDir, 'safe'))?.generation,
+    containerIds: [],
+  });
 });
 
 test('legacy recovery remains a barrier when every staged journal migration boundary fails', async () => {
@@ -231,13 +247,38 @@ test('a stale recovery observation cannot clear a newer manual recovery record',
   assert.equal((await loadManualRecovery(stateDir, 'safe'))?.reason, 'remote-exec-interrupted');
 });
 
+test('a failed strict clear retains a durable recovery barrier and a retry clears it', async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), 'agent-containers-recovery-clear-failure-'));
+  await recordManualRecovery(stateDir, 'safe', { reason: 'operation-may-be-active', containerIds: [], worktree: metadata.worktree });
+  let failClearSync = true;
+  let locksSyncs = 0;
+  setStateDurabilityAdapterForTesting({
+    ...testDurabilityAdapter,
+    syncDirectory: async (path) => {
+      if (path === join(stateDir, 'locks')) locksSyncs += 1;
+      if (failClearSync && locksSyncs === 2) {
+        failClearSync = false;
+        throw new Error('locks sync failed');
+      }
+    },
+  });
+  try {
+    await assert.rejects(() => state.clearManualRecovery(stateDir, 'safe'), /locks sync failed/);
+  } finally {
+    setStateDurabilityAdapterForTesting(testDurabilityAdapter);
+  }
+  assert.ok(await loadManualRecovery(stateDir, 'safe'), 'a failed clear must retain the recovery barrier');
+  await state.clearManualRecovery(stateDir, 'safe');
+  assert.equal(await loadManualRecovery(stateDir, 'safe'), undefined);
+});
+
 test('a durable manual recovery blocks lifecycle and stale-PID unlock until an explicit operator acknowledgement', async () => {
   const stateDir = await mkdtemp(join(tmpdir(), 'agent-containers-manual-recovery-'));
   const recoveryApi = state as unknown as {
     recordManualRecovery: (stateDir: string, name: string, recovery: { reason: string; containerIds: string[]; worktree: string }) => Promise<void>;
     clearManualRecovery: (stateDir: string, name: string) => Promise<void>;
   };
-  await recoveryApi.recordManualRecovery(stateDir, 'safe', { reason: 'remote-exec-interrupted', containerIds: ['container-1'], worktree: '/repo/worktrees/safe' });
+  await recoveryApi.recordManualRecovery(stateDir, 'safe', { reason: 'remote-exec-interrupted', containerIds: ['container-1'], worktree: metadata.worktree });
   await assert.rejects(() => withWorkspaceLock(stateDir, 'safe', async () => undefined), /manual recovery.*recover safe --yes --remote-command-stopped/i);
   await assert.rejects(() => releaseStaleWorkspaceLock(stateDir, 'safe', () => false), /manual recovery/i);
   await recoveryApi.clearManualRecovery(stateDir, 'safe');

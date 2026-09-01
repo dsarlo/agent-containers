@@ -1,31 +1,34 @@
 import assert from 'node:assert/strict';
 import { mkdtemp, symlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import test from 'node:test';
 import { removeWorkspace, UnconfirmedProcessReapError } from '../src/workspaces.js';
 import { bootstrapManualRecoveryJournal, loadManualRecovery, recordManualRecovery, withWorkspaceLock, type WorkspaceMetadata } from '../src/state.js';
 
 const containerId = 'abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789';
-const inspection = `${containerId}\n/repo/worktrees/safe\n`;
-const metadata: WorkspaceMetadata = { version: 1, name: 'safe', repoRoot: '/repo', worktree: '/repo/worktrees/safe', branch: 'agent-containers/safe', baseRef: 'refs/heads/main', devcontainerPath: '.devcontainer/devcontainer.json', createdAt: '2026-01-01T00:00:00.000Z', containerId };
+const repoRoot = resolve(tmpdir(), 'agent-containers-remove-repo');
+const worktree = join(repoRoot, 'worktrees', 'safe');
+const worktreeListing = `worktree ${worktree}\nbranch refs/heads/agent-containers/safe\n`;
+const inspection = `${containerId}\n${worktree}\n`;
+const metadata: WorkspaceMetadata = { version: 1, name: 'safe', repoRoot, worktree, branch: 'agent-containers/safe', baseRef: 'refs/heads/main', devcontainerPath: '.devcontainer/devcontainer.json', createdAt: '2026-01-01T00:00:00.000Z', containerId };
 
 test('removeWorkspace requires confirmation and records every safe destructive command', async () => {
   const calls: Array<{ command: string; args: string[]; cwd?: string; stdio?: string }> = [];
-  const runner = { async run(command: string, args: string[], options?: { cwd?: string; stdio?: 'inherit' | 'pipe' }) { calls.push({ command, args, ...options }); if (args[1] === 'list') return { code: 0, stdout: 'worktree /repo/worktrees/safe\nbranch refs/heads/agent-containers/safe\n', stderr: '' }; if (args[0] === 'show-ref') return { code: 0, stdout: '', stderr: '' }; if (args[0] === 'rev-parse') return { code: 0, stdout: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n', stderr: '' }; if (args[0] === 'inspect') return { code: 0, stdout: inspection, stderr: '' }; return { code: 0, stdout: '', stderr: '' }; } };
+  const runner = { async run(command: string, args: string[], options?: { cwd?: string; stdio?: 'inherit' | 'pipe' }) { calls.push({ command, args, ...options }); if (args[1] === 'list') return { code: 0, stdout: worktreeListing, stderr: '' }; if (args[0] === 'show-ref') return { code: 0, stdout: '', stderr: '' }; if (args[0] === 'rev-parse') return { code: 0, stdout: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n', stderr: '' }; if (args[0] === 'inspect') return { code: 0, stdout: inspection, stderr: '' }; return { code: 0, stdout: '', stderr: '' }; } };
   await assert.rejects(() => removeWorkspace(metadata, { confirmed: false }, runner, async () => undefined, async () => undefined), /--yes/);
   await removeWorkspace(metadata, { confirmed: true }, runner, async () => undefined, async () => undefined);
   assert.deepEqual(calls, [
-    { command: 'git', args: ['worktree', 'list', '--porcelain'], cwd: '/repo' },
-    { command: 'git', args: ['show-ref', '--verify', '--quiet', 'refs/heads/agent-containers/safe'], cwd: '/repo' },
-    { command: 'git', args: ['rev-parse', '--verify', 'refs/heads/agent-containers/safe'], cwd: '/repo' },
-    { command: 'git', args: ['rev-parse', '--verify', 'refs/heads/main'], cwd: '/repo' },
-    { command: 'git', args: ['merge-base', '--is-ancestor', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'], cwd: '/repo' },
-    { command: 'git', args: ['status', '--porcelain=v1', '--untracked-files=all'], cwd: '/repo/worktrees/safe' },
+    { command: 'git', args: ['worktree', 'list', '--porcelain'], cwd: repoRoot },
+    { command: 'git', args: ['show-ref', '--verify', '--quiet', 'refs/heads/agent-containers/safe'], cwd: repoRoot },
+    { command: 'git', args: ['rev-parse', '--verify', 'refs/heads/agent-containers/safe'], cwd: repoRoot },
+    { command: 'git', args: ['rev-parse', '--verify', 'refs/heads/main'], cwd: repoRoot },
+    { command: 'git', args: ['merge-base', '--is-ancestor', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'], cwd: repoRoot },
+    { command: 'git', args: ['status', '--porcelain=v1', '--untracked-files=all'], cwd: worktree },
     { command: 'docker', args: ['inspect', '--format', '{{.Id}}\n{{ index .Config.Labels "devcontainer.local_folder" }}', containerId] },
     { command: 'docker', args: ['rm', '-f', containerId] },
-    { command: 'git', args: ['worktree', 'remove', '/repo/worktrees/safe'], cwd: '/repo' },
-    { command: 'git', args: ['update-ref', '--stdin'], cwd: '/repo', input: 'start\nverify refs/heads/main aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\ndelete refs/heads/agent-containers/safe aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nprepare\ncommit\n' },
+    { command: 'git', args: ['worktree', 'remove', worktree], cwd: repoRoot },
+    { command: 'git', args: ['update-ref', '--stdin'], cwd: repoRoot, input: 'start\nverify refs/heads/main aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\ndelete refs/heads/agent-containers/safe aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nprepare\ncommit\n' },
   ].map((call) => ({ ...call, kind: 'lifecycle' })));
 });
 
@@ -57,7 +60,7 @@ test('removeWorkspace passes --force only for the verified recorded worktree aft
   const runner = {
     async run(_command: string, args: string[]) {
       calls.push(args);
-      if (args[0] === 'worktree' && args[1] === 'list') return { code: 0, stdout: 'worktree /repo/worktrees/safe\nbranch refs/heads/agent-containers/safe\n', stderr: '' };
+      if (args[0] === 'worktree' && args[1] === 'list') return { code: 0, stdout: worktreeListing, stderr: '' };
       if (args[0] === 'show-ref') return { code: 0, stdout: '', stderr: '' };
       if (args[0] === 'rev-parse') return { code: 0, stdout: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n', stderr: '' };
       return { code: 0, stdout: '', stderr: '' };
@@ -66,7 +69,7 @@ test('removeWorkspace passes --force only for the verified recorded worktree aft
 
   await removeWorkspace({ ...metadata, cleanup: { container: true } }, { confirmed: true, forceWorktree: true }, runner, async () => undefined, async () => undefined);
 
-  assert.deepEqual(calls.find((args) => args[0] === 'worktree' && args[1] === 'remove'), ['worktree', 'remove', '--force', '/repo/worktrees/safe']);
+  assert.deepEqual(calls.find((args) => args[0] === 'worktree' && args[1] === 'remove'), ['worktree', 'remove', '--force', worktree]);
 });
 
 test('removeWorkspace refuses a dirty worktree before deleting its owned container', async () => {
@@ -74,7 +77,7 @@ test('removeWorkspace refuses a dirty worktree before deleting its owned contain
   const runner = {
     async run(_command: string, args: string[]) {
       calls.push(args);
-      if (args[0] === 'worktree' && args[1] === 'list') return { code: 0, stdout: 'worktree /repo/worktrees/safe\nbranch refs/heads/agent-containers/safe\n', stderr: '' };
+      if (args[0] === 'worktree' && args[1] === 'list') return { code: 0, stdout: worktreeListing, stderr: '' };
       if (args[0] === 'show-ref') return { code: 0, stdout: '', stderr: '' };
       if (args[0] === 'rev-parse') return { code: 0, stdout: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n', stderr: '' };
       if (args[0] === 'status') return { code: 0, stdout: '?? important-output.txt\n', stderr: '' };
@@ -94,7 +97,7 @@ test('removeWorkspace refuses a dirty worktree before deleting its owned contain
 test('removeWorkspace names the opt-in remediation when Git refuses a dirty worktree', async () => {
   const runner = {
     async run(_command: string, args: string[]) {
-      if (args[0] === 'worktree' && args[1] === 'list') return { code: 0, stdout: 'worktree /repo/worktrees/safe\nbranch refs/heads/agent-containers/safe\n', stderr: '' };
+      if (args[0] === 'worktree' && args[1] === 'list') return { code: 0, stdout: worktreeListing, stderr: '' };
       if (args[0] === 'show-ref') return { code: 0, stdout: '', stderr: '' };
       if (args[0] === 'rev-parse') return { code: 0, stdout: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n', stderr: '' };
       if (args[0] === 'worktree' && args[1] === 'remove') return { code: 128, stdout: '', stderr: 'contains modified or untracked files, use --force to delete it' };
@@ -110,11 +113,11 @@ test('removeWorkspace names the opt-in remediation when Git refuses a dirty work
 
 test('removeWorkspace fails closed for mismatched Git or container metadata and retains state', async () => {
   for (const result of [
-    { code: 0, stdout: 'worktree /repo/other\nbranch refs/heads/agent-containers/safe\n', stderr: '' },
-    { code: 0, stdout: 'worktree /repo/worktrees/safe\nbranch refs/heads/agent-containers/safe\n', stderr: '' },
+    { code: 0, stdout: `worktree ${join(repoRoot, 'other')}\nbranch refs/heads/agent-containers/safe\n`, stderr: '' },
+    { code: 0, stdout: worktreeListing, stderr: '' },
   ]) {
     let deleted = false;
-    const runner = { async run(_command: string, args: string[]) { if (args[1] === 'list') return result; if (args[0] === 'show-ref') return { code: 0, stdout: '', stderr: '' }; if (args[0] === 'rev-parse') return { code: 0, stdout: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n', stderr: '' }; if (args[0] === 'inspect') return { code: 0, stdout: `${containerId}\n/repo/other\n`, stderr: '' }; return { code: 0, stdout: '', stderr: '' }; } };
+    const runner = { async run(_command: string, args: string[]) { if (args[1] === 'list') return result; if (args[0] === 'show-ref') return { code: 0, stdout: '', stderr: '' }; if (args[0] === 'rev-parse') return { code: 0, stdout: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n', stderr: '' }; if (args[0] === 'inspect') return { code: 0, stdout: `${containerId}\n${join(repoRoot, 'other')}\n`, stderr: '' }; return { code: 0, stdout: '', stderr: '' }; } };
     await assert.rejects(() => removeWorkspace(metadata, { confirmed: true }, runner, async () => undefined, async () => { deleted = true; }), /recorded (Git worktree|Dev Container)/);
     assert.equal(deleted, false);
   }
@@ -122,7 +125,7 @@ test('removeWorkspace fails closed for mismatched Git or container metadata and 
 
 test('removeWorkspace keeps metadata when Docker is unavailable unless container cleanup is explicitly skipped', async () => {
   let deleted = false;
-  const runner = { async run(_command: string, args: string[]) { if (args[1] === 'list') return { code: 0, stdout: 'worktree /repo/worktrees/safe\nbranch refs/heads/agent-containers/safe\n', stderr: '' }; if (args[0] === 'show-ref') return { code: 0, stdout: '', stderr: '' }; if (args[0] === 'rev-parse') return { code: 0, stdout: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n', stderr: '' }; if (args[0] === 'inspect') throw Object.assign(new Error('docker missing'), { code: 'ENOENT' }); return { code: 0, stdout: '', stderr: '' }; } };
+  const runner = { async run(_command: string, args: string[]) { if (args[1] === 'list') return { code: 0, stdout: worktreeListing, stderr: '' }; if (args[0] === 'show-ref') return { code: 0, stdout: '', stderr: '' }; if (args[0] === 'rev-parse') return { code: 0, stdout: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n', stderr: '' }; if (args[0] === 'inspect') throw Object.assign(new Error('docker missing'), { code: 'ENOENT' }); return { code: 0, stdout: '', stderr: '' }; } };
   await assert.rejects(() => removeWorkspace(metadata, { confirmed: true }, runner, async () => undefined, async () => { deleted = true; }), /docker missing/);
   assert.equal(deleted, false);
   await removeWorkspace(metadata, { confirmed: true, skipContainerCleanup: true }, runner, async () => undefined, async () => { deleted = true; });
@@ -139,7 +142,7 @@ test('removeWorkspace reconciles each recorded resource already absent after a f
     };
     const runner = {
       async run(_command: string, args: string[]) {
-        if (args[0] === 'worktree' && args[1] === 'list') return absent.has('worktree') ? { code: 0, stdout: '', stderr: '' } : { code: 0, stdout: 'worktree /repo/worktrees/safe\nbranch refs/heads/agent-containers/safe\n', stderr: '' };
+        if (args[0] === 'worktree' && args[1] === 'list') return absent.has('worktree') ? { code: 0, stdout: '', stderr: '' } : { code: 0, stdout: worktreeListing, stderr: '' };
         if (args[0] === 'show-ref') return absent.has('branch') ? { code: 1, stdout: '', stderr: '' } : { code: 0, stdout: '', stderr: '' };
         if (args[0] === 'rev-parse') return { code: 0, stdout: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n', stderr: '' };
         if (args[0] === 'inspect') return absent.has('container') ? { code: 1, stdout: '', stderr: `No such container: ${containerId}` } : { code: 0, stdout: inspection, stderr: '' };
@@ -194,7 +197,7 @@ test('removeWorkspace refuses to forget an unregistered dangling worktree symlin
 
 test('removeWorkspace deletes the exact verified merged branch without Git upstream semantics', async () => {
   const calls: Array<{ args: string[]; input?: string }> = [];
-  const runner = { async run(_command: string, args: string[], options?: { input?: string }) { calls.push({ args, input: options?.input }); if (args[1] === 'list') return { code: 0, stdout: 'worktree /repo/worktrees/safe\nbranch refs/heads/agent-containers/safe\n', stderr: '' }; if (args[0] === 'show-ref') return { code: 0, stdout: '', stderr: '' }; if (args[0] === 'rev-parse') return { code: 0, stdout: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n', stderr: '' }; if (args[0] === 'inspect') return { code: 0, stdout: inspection, stderr: '' }; return { code: 0, stdout: '', stderr: '' }; } };
+  const runner = { async run(_command: string, args: string[], options?: { input?: string }) { calls.push({ args, input: options?.input }); if (args[1] === 'list') return { code: 0, stdout: worktreeListing, stderr: '' }; if (args[0] === 'show-ref') return { code: 0, stdout: '', stderr: '' }; if (args[0] === 'rev-parse') return { code: 0, stdout: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n', stderr: '' }; if (args[0] === 'inspect') return { code: 0, stdout: inspection, stderr: '' }; return { code: 0, stdout: '', stderr: '' }; } };
   await removeWorkspace(metadata, { confirmed: true }, runner, async () => undefined, async () => undefined);
   assert.deepEqual(calls.at(-1), { args: ['update-ref', '--stdin'], input: 'start\nverify refs/heads/main aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\ndelete refs/heads/agent-containers/safe aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nprepare\ncommit\n' });
 });
@@ -205,7 +208,7 @@ test('removeWorkspace refuses to delete a branch that moved after its merged OID
   const runner = {
     async run(_command: string, args: string[]) {
       calls.push(args);
-      if (args[0] === 'worktree' && args[1] === 'list') return { code: 0, stdout: 'worktree /repo/worktrees/safe\nbranch refs/heads/agent-containers/safe\n', stderr: '' };
+      if (args[0] === 'worktree' && args[1] === 'list') return { code: 0, stdout: worktreeListing, stderr: '' };
       if (args[0] === 'show-ref') return { code: 0, stdout: '', stderr: '' };
       if (args[0] === 'rev-parse') return { code: 0, stdout: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n', stderr: '' };
       if (args[0] === 'update-ref') return { code: 1, stdout: '', stderr: 'cannot lock ref: is at bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb but expected aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' };

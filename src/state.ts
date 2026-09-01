@@ -103,6 +103,10 @@ function legacyManualRecoveryPath(stateDir: string, name: string): string {
   return join(stateDir, 'locks', `${validateWorkspaceName(name)}.manual-recovery.json`);
 }
 
+function manualRecoveryClearFailsafePath(stateDir: string, name: string): string {
+  return join(stateDir, 'locks', `${validateWorkspaceName(name)}.manual-recovery.clear-failsafe.json`);
+}
+
 function manualRecoveryJournalPath(stateDir: string, name: string): string {
   return join(stateDir, 'locks', `${validateWorkspaceName(name)}.manual-recovery.journal`);
 }
@@ -182,6 +186,9 @@ export async function recordManualRecovery(stateDir: string, name: string, input
     await durability.assertStateWriteSupport();
     await bootstrapManualRecoveryJournalUnsafe(stateDir, name);
     await appendManualRecoveryJournalEvent(manualRecoveryJournalPath(stateDir, name), { event: 'set', recovery }, durability);
+    // A prior failed clear may have retained its older failsafe. The new journal
+    // set is authoritative, so it is safe to retire that stale barrier now.
+    await durableRemove(manualRecoveryClearFailsafePath(stateDir, name), join(stateDir, 'locks'), true, durability);
   });
 }
 
@@ -217,19 +224,28 @@ export async function loadManualRecovery(stateDir: string, name: string): Promis
   try {
     const source = await readFile(journalPath, 'utf8');
     const recovery = parseManualRecoveryJournal(source, name);
+    if (recovery) return recovery;
+    const failsafe = await loadManualRecoveryFile(manualRecoveryClearFailsafePath(stateDir, name), name);
+    if (failsafe) return failsafe;
     // An empty authoritative journal from an interrupted older migration is
     // not evidence that its legacy barrier was cleared.
-    return recovery ?? (source.trim() === '' ? loadLegacyManualRecovery(stateDir, name) : undefined);
+    return source.trim() === '' ? loadLegacyManualRecovery(stateDir, name) : undefined;
   } catch (error: unknown) {
     if (!isNodeError(error, 'ENOENT')) throw error;
+    const failsafe = await loadManualRecoveryFile(manualRecoveryClearFailsafePath(stateDir, name), name);
+    if (failsafe) return failsafe;
     return loadLegacyManualRecovery(stateDir, name);
   }
 }
 
 async function loadLegacyManualRecovery(stateDir: string, name: string): Promise<ManualRecovery | undefined> {
+  return loadManualRecoveryFile(legacyManualRecoveryPath(stateDir, name), name);
+}
+
+async function loadManualRecoveryFile(path: string, name: string): Promise<ManualRecovery | undefined> {
   try {
-    const recovery: unknown = JSON.parse(await readFile(legacyManualRecoveryPath(stateDir, name), 'utf8'));
-    if (!isManualRecovery(recovery)) throw new Error(`Manual recovery state for ${name} is invalid; refusing to release lifecycle protection.`);
+    const recovery: unknown = JSON.parse(await readFile(path, 'utf8'));
+    if (!isStoredManualRecovery(recovery)) throw new Error(`Manual recovery state for ${name} is invalid; refusing to release lifecycle protection.`);
     return normalizeManualRecovery(recovery);
   } catch (error: unknown) {
     if (isNodeError(error, 'ENOENT')) return undefined;
@@ -256,7 +272,7 @@ function parseManualRecoveryJournal(source: string, name: string): ManualRecover
 function isCheckedManualRecoveryJournalEvent(value: unknown): value is CheckedManualRecoveryJournalEvent {
   if (typeof value !== 'object' || value === null || !('event' in value) || !('checksum' in value) || typeof value.checksum !== 'string') return false;
   if (value.event === 'clear') return value.checksum === journalChecksum({ event: 'clear' });
-  return value.event === 'set' && 'recovery' in value && isManualRecovery(value.recovery) && value.checksum === journalChecksum({ event: 'set', recovery: value.recovery });
+  return value.event === 'set' && 'recovery' in value && isStoredManualRecovery(value.recovery) && value.checksum === journalChecksum({ event: 'set', recovery: value.recovery });
 }
 
 function journalChecksum(event: ManualRecoveryJournalEvent): string {
@@ -279,7 +295,14 @@ export async function clearManualRecoveryIfCurrent(stateDir: string, name: strin
     const durability = stateDurability();
     await durability.assertStateWriteSupport();
     await bootstrapManualRecoveryJournalUnsafe(stateDir, name);
+    const directory = join(stateDir, 'locks');
+    // Keep a separately durable copy until the clear is fully published. If
+    // replacement or its directory sync fails after visibility, readers still
+    // observe this barrier instead of treating the acknowledgement as complete.
+    const failsafePath = manualRecoveryClearFailsafePath(stateDir, name);
+    await durableReplace(join(directory, `.${randomUUID()}.manual-recovery.clear-failsafe.tmp`), failsafePath, directory, `${JSON.stringify(current)}\n`, durability);
     await appendManualRecoveryJournalEvent(manualRecoveryJournalPath(stateDir, name), { event: 'clear' }, durability);
+    await durableRemove(failsafePath, directory, false, durability);
   });
 }
 
@@ -375,11 +398,21 @@ function isManualRecovery(value: unknown): value is ManualRecovery {
     isCanonicalPath(candidate.worktree) && typeof candidate.createdAt === 'string';
 }
 
+function isStoredManualRecovery(value: unknown): value is ManualRecovery {
+  const candidate = typeof value === 'object' && value !== null ? value as Partial<ManualRecovery> : undefined;
+  return candidate?.version === 1 &&
+    (!('generation' in candidate) || candidate.generation === undefined || (typeof candidate.generation === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(candidate.generation))) &&
+    (candidate.reason === 'operation-may-be-active' || candidate.reason === 'remote-exec-interrupted' || candidate.reason === 'devcontainer-up-ambiguous' || candidate.reason === 'local-process-reap-unconfirmed') &&
+    Array.isArray(candidate.containerIds) && candidate.containerIds.every((id) => isCanonicalContainerId(id) || /^[a-f0-9]{12}$/.test(id)) &&
+    isCanonicalPath(candidate.worktree) && typeof candidate.createdAt === 'string';
+}
+
 function normalizeManualRecovery(recovery: ManualRecovery): ManualRecovery {
-  if (typeof recovery.generation === 'string') return recovery;
+  const normalized = { ...recovery, containerIds: recovery.containerIds.filter(isCanonicalContainerId) };
+  if (typeof normalized.generation === 'string') return normalized;
   // Legacy durable records predate generations. Their content-derived identity
   // remains stable until a new set record replaces them.
-  return { ...recovery, generation: `00000000-0000-4000-8000-${createHash('sha256').update(JSON.stringify(recovery)).digest('hex').slice(0, 12)}` };
+  return { ...normalized, generation: `00000000-0000-4000-8000-${createHash('sha256').update(JSON.stringify(normalized)).digest('hex').slice(0, 12)}` };
 }
 
 function manualRecoveryError(name: string): Error {

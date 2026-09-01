@@ -1,12 +1,16 @@
 import assert from 'node:assert/strict';
 import { chmod, lstat, mkdtemp, mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import test from 'node:test';
 import { loadManualRecovery, loadMetadata, recordManualRecovery, saveMetadata, setStateDurableRenameForTesting, withWorkspaceLock } from '../src/state.js';
 import { exitCodeForError, runCli } from '../src/cli.js';
 import { nodeProcessRunner, UnconfirmedProcessReapError } from '../src/workspaces.js';
+
+const repoRoot = resolve(tmpdir(), 'agent-containers-cli-repo');
+const worktree = join(repoRoot, 'worktrees', 'safe');
 
 test('built public CLI entry point is executable', async () => {
   const mode = (await stat('dist/src/bin/agent-containers.js')).mode & 0o777;
@@ -70,6 +74,28 @@ test('recover retires a dead guarded lifecycle lock without a manual recovery re
   await assert.rejects(() => lstat(lockPath), { code: 'ENOENT' });
 });
 
+test('recover acknowledges a legacy journal with a short Docker ID hint without trusting it', async (t) => {
+  const stateHome = await mkdtemp(join(tmpdir(), 'agent-containers-cli-legacy-recover-'));
+  const stateDir = join(stateHome, 'agent-containers');
+  const previousStateHome = process.env.XDG_STATE_HOME;
+  t.after(async () => {
+    if (previousStateHome === undefined) delete process.env.XDG_STATE_HOME;
+    else process.env.XDG_STATE_HOME = previousStateHome;
+    await rm(stateHome, { recursive: true, force: true });
+  });
+  process.env.XDG_STATE_HOME = stateHome;
+  const recovery = { version: 1, reason: 'operation-may-be-active', containerIds: ['abcdef012345'], worktree, createdAt: '2026-01-01T00:00:00.000Z' };
+  const event = { event: 'set' as const, recovery };
+  const entry = { ...event, checksum: createHash('sha256').update(JSON.stringify(event)).digest('hex') };
+  await mkdir(join(stateDir, 'locks'), { recursive: true });
+  await writeFile(join(stateDir, 'locks', 'safe.manual-recovery.journal'), `${JSON.stringify(entry)}\n`);
+
+  assert.deepEqual((await loadManualRecovery(stateDir, 'safe'))?.containerIds, []);
+  const messages: string[] = [];
+  assert.equal(await runCli(['recover', 'safe', '--yes', '--remote-command-stopped'], process.cwd(), (message) => messages.push(message)), 0);
+  assert.match(messages.at(-1) ?? '', /Acknowledged recovery/);
+});
+
 test('recover never clears a newer manual recovery barrier published while it waited for a lifecycle lock', async () => {
   const stateHome = await mkdtemp(join(tmpdir(), 'agent-containers-cli-recover-'));
   const stateDir = join(stateHome, 'agent-containers');
@@ -80,7 +106,7 @@ test('recover never clears a newer manual recovery barrier published while it wa
   let lockHeld!: () => void;
   const lockIsHeld = new Promise<void>((resolve) => { lockHeld = resolve; });
   try {
-    await recordManualRecovery(stateDir, 'safe', { reason: 'operation-may-be-active', containerIds: [], worktree: '/repo/worktrees/safe' });
+    await recordManualRecovery(stateDir, 'safe', { reason: 'operation-may-be-active', containerIds: [], worktree });
     const acknowledged = await loadManualRecovery(stateDir, 'safe');
     assert.ok(acknowledged);
     const activeLifecycle = withWorkspaceLock(stateDir, 'safe', async () => {
@@ -92,7 +118,7 @@ test('recover never clears a newer manual recovery barrier published while it wa
     const recover = runCli(['recover', 'safe', '--yes', '--remote-command-stopped'], process.cwd(), () => undefined).finally(() => { recoverSettled = true; });
     await new Promise((resolve) => setTimeout(resolve, 35));
     assert.equal(recoverSettled, false, 'recover must not clear a guard while another lifecycle holds the workspace lock');
-    await recordManualRecovery(stateDir, 'safe', { reason: 'operation-may-be-active', containerIds: [], worktree: '/repo/worktrees/safe' });
+    await recordManualRecovery(stateDir, 'safe', { reason: 'operation-may-be-active', containerIds: [], worktree });
     releaseLock();
     await activeLifecycle;
     assert.equal(await recover, 1);
@@ -116,15 +142,15 @@ test('recover refuses an unconfirmed-reap quarantine whose recorded owner remain
   await saveMetadata(stateDir, {
     version: 1,
     name: 'safe',
-    repoRoot: '/repo',
-    worktree: '/repo/worktrees/safe',
+    repoRoot,
+    worktree,
     branch: 'agent-containers/safe',
     baseRef: 'refs/heads/main',
     devcontainerPath: '.devcontainer/devcontainer.json',
     createdAt: '2026-01-01T00:00:00.000Z',
     containerId: '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
   });
-  await recordManualRecovery(stateDir, 'safe', { reason: 'local-process-reap-unconfirmed', containerIds: [], worktree: '/repo/worktrees/safe' });
+  await recordManualRecovery(stateDir, 'safe', { reason: 'local-process-reap-unconfirmed', containerIds: [], worktree });
   await assert.rejects(
     () => withWorkspaceLock(stateDir, 'safe', async () => { throw new UnconfirmedProcessReapError(); }, {
       allowManualRecovery: true,

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { mkdir, mkdtemp, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import test from 'node:test';
 import { createDevcontainerProgressReporter, devcontainerUpFailureDetail, execNamedWorkspaceLifecycle, execWorkspace, execWorkspaceLifecycle, formatDevcontainerProgressLine, type ProcessRunner } from '../src/runtime.js';
 import type { ProcessRunOptions } from '../src/types.js';
@@ -12,12 +12,14 @@ const noOpRecovery = async (): Promise<void> => undefined;
 const containerId = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
 const untrackedContainerId = 'abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789';
 const knownContainerId = 'fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210';
+const repoRoot = resolve(tmpdir(), 'agent-containers-runtime-repo');
+const worktree = join(repoRoot, 'worktrees', 'safe-name');
 
 const metadata: WorkspaceMetadata = {
   version: 1,
   name: 'safe-name',
-  repoRoot: '/repo',
-  worktree: '/repo/worktrees/safe-name',
+  repoRoot,
+  worktree,
   branch: 'agent-containers/safe-name',
   baseRef: 'refs/heads/main',
   devcontainerPath: '.devcontainer/devcontainer.json',
@@ -40,9 +42,9 @@ test('execWorkspace uses the linked-worktree mount, requires a current container
 
   await execWorkspace(metadata, ['sh', '-lc', 'printf "$HOME;$(whoami)"'], runner, async (next) => { saved = next; }, async () => '{}', undefined, noOpRecovery, noOpRecovery);
   assert.deepEqual(calls.map(({ command, args }) => ({ command, args })), [
-    { command: 'devcontainer', args: ['up', '--workspace-folder', '/repo/worktrees/safe-name', '--config', '/repo/worktrees/safe-name/.devcontainer/devcontainer.json', '--log-format', 'json', '--mount-git-worktree-common-dir'] },
+    { command: 'devcontainer', args: ['up', '--workspace-folder', worktree, '--config', join(worktree, '.devcontainer/devcontainer.json'), '--log-format', 'json', '--mount-git-worktree-common-dir'] },
     { command: 'docker', args: ['inspect', '--format', '{{.Id}}\n{{ index .Config.Labels "devcontainer.local_folder" }}', containerId] },
-    { command: 'devcontainer', args: ['exec', '--workspace-folder', '/repo/worktrees/safe-name', '--config', '/repo/worktrees/safe-name/.devcontainer/devcontainer.json', '--container-id', containerId, '--mount-git-worktree-common-dir', 'sh', '-lc', 'printf "$HOME;$(whoami)"'] },
+    { command: 'devcontainer', args: ['exec', '--workspace-folder', worktree, '--config', join(worktree, '.devcontainer/devcontainer.json'), '--container-id', containerId, '--mount-git-worktree-common-dir', 'sh', '-lc', 'printf "$HOME;$(whoami)"'] },
   ]);
   assert.equal(calls[0].options?.stdio, 'pipe');
   assert.equal(typeof (calls[0].options as { onOutput?: unknown } | undefined)?.onOutput, 'function');
