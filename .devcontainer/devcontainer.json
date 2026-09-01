@@ -1,0 +1,6 @@
+{
+  "name": "Agent Containers Development",
+  "image": "mcr.microsoft.com/devcontainers/javascript-node:22-bookworm",
+  "remoteUser": "node",
+  "postCreateCommand": "npm ci"
+}

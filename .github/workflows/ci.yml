@@ -1,0 +1,176 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    name: Node ${{ matrix.node }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [20, 22, 24]
+    steps:
+      # actions/checkout v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      # actions/setup-node v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run test:native-packaging-contract
+      - run: npm run verify:native-packaging-contract
+
+  native-durability:
+    name: Native durability (${{ matrix.artifact }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            artifact: linux-x64
+            publication_mode: strict
+          - runner: ubuntu-24.04-arm
+            artifact: linux-arm64
+            publication_mode: strict
+          - runner: macos-15-intel
+            artifact: darwin-x64
+            publication_mode: strict
+          - runner: macos-14
+            artifact: darwin-arm64
+            publication_mode: strict
+          - runner: windows-latest
+            artifact: win32-x64
+            publication_mode: recoverable
+          - runner: windows-11-arm
+            artifact: win32-arm64
+            publication_mode: recoverable
+    steps:
+      # actions/checkout v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      # actions/setup-node v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 20.19.0
+          cache: npm
+      - run: npm ci
+      - run: npm run test:native
+        env:
+          EXPECTED_NATIVE_PUBLICATION_MODE: ${{ matrix.publication_mode }}
+      - run: npm run native:prebuild
+      # actions/upload-artifact v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: native-prebuild-${{ matrix.artifact }}
+          path: prebuilds
+          if-no-files-found: error
+
+  assemble-native-package:
+    name: Assemble cross-platform native package
+    needs: native-durability
+    runs-on: ubuntu-latest
+    steps:
+      # actions/checkout v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      # actions/setup-node v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 20.19.0
+          cache: npm
+      - run: npm ci
+      # actions/download-artifact v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          pattern: native-prebuild-*
+          path: .
+          merge-multiple: true
+      - run: npm run native:verify-prebuilds
+      - run: mkdir native-package && npm pack --pack-destination native-package
+      - run: node scripts/verify-native-package-tarball.mjs native-package/*.tgz
+      # actions/upload-artifact v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: native-package
+          path: native-package/*.tgz
+          if-no-files-found: error
+
+  native-package-smoke:
+    name: Native package smoke (${{ matrix.artifact }})
+    needs: assemble-native-package
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            artifact: linux-x64
+            publication_mode: strict
+          - runner: ubuntu-24.04-arm
+            artifact: linux-arm64
+            publication_mode: strict
+          - runner: macos-15-intel
+            artifact: darwin-x64
+            publication_mode: strict
+          - runner: macos-14
+            artifact: darwin-arm64
+            publication_mode: strict
+          - runner: windows-latest
+            artifact: win32-x64
+            publication_mode: recoverable
+          - runner: windows-11-arm
+            artifact: win32-arm64
+            publication_mode: recoverable
+    steps:
+      # actions/checkout v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      # actions/setup-node v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 20.19.0
+          cache: npm
+      # actions/download-artifact v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: native-package
+          path: native-package
+      - name: Install assembled package without lifecycle downloads
+        shell: bash
+        run: mkdir .packed-native && npm install --prefix .packed-native ./native-package/*.tgz
+      - name: Load and smoke-test installed production native adapter
+        run: node scripts/test-native.mjs
+        env:
+          PACKED_NATIVE_PACKAGE_DIR: ${{ github.workspace }}/.packed-native/node_modules/@dsarlo/agent-containers
+          EXPECTED_NATIVE_PUBLICATION_MODE: ${{ matrix.publication_mode }}
+
+  live-devcontainer:
+    name: Live Dev Containers lifecycle
+    runs-on: ubuntu-latest
+    steps:
+      # actions/checkout v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      # actions/setup-node v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 20.19.0
+          cache: npm
+      - run: npm ci
+      - run: npm run build:native
+      - run: npm install --global @devcontainers/cli@0.89.0
+      - name: Require Docker, Dev Containers, and relative linked-worktree support
+        run: |
+          docker version
+          devcontainer --version
+          worktree_help="$(git worktree add -h 2>&1 || true)"
+          grep -Eq -- '(^|[[:space:]])--(\[no-\])?relative-paths([[:space:]]|$)' <<<"${worktree_help}"
+      - run: AGENT_CONTAINERS_REQUIRE_LIVE_INTEGRATION=1 npm run test:integration
