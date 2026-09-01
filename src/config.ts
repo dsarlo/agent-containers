@@ -1,11 +1,12 @@
 import { lstat, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
-import { basename, dirname, join } from 'node:path';
+import { basename, dirname, isAbsolute, join, posix, win32 } from 'node:path';
 import { parse } from 'yaml';
-import type { AgentContainersConfig } from './types.js';
+import type { AgentContainersConfig, ProcessResult, ProcessRunner } from './types.js';
 
 export const CONFIG_OUTLINE = `# Agent Containers workspace configuration (schema version 1).
-# All paths are relative to the source repository unless absolute.
+# workspace.worktreeRoot is relative to the source repository unless absolute.
+# environment.devcontainerPath must be a safe repository-relative regular file.
 version: 1
 
 workspace:
@@ -92,7 +93,50 @@ export async function loadConfig(path: string): Promise<AgentContainersConfig> {
   };
   const errors = validateConfig(config);
   if (errors.length > 0) throw new Error(`Invalid configuration: ${errors.join('; ')}`);
-  return config;
+  const devcontainerPath = safeRepositoryPath(config.environment.devcontainerPath);
+  if (!devcontainerPath) throw new Error('Invalid configuration: environment.devcontainerPath must be a safe repository-relative path.');
+  return { ...config, environment: { ...config.environment, devcontainerPath } };
+}
+
+/** Verify that every newly-created linked worktree receives the configured file. */
+export async function assertDevcontainerPathCommittedOnBaseBranch(config: AgentContainersConfig, repoRoot: string, runner: ProcessRunner, baseBranch = config.workspace.baseBranch): Promise<void> {
+  const path = safeRepositoryPath(config.environment.devcontainerPath);
+  if (!path) throw new Error('environment.devcontainerPath must be a safe repository-relative path.');
+  const baseRef = `refs/heads/${baseBranch}`;
+  const branch = await runner.run('git', ['show-ref', '--verify', '--quiet', baseRef], { cwd: repoRoot });
+  if (branch.code === 1) throw new Error(`Configured local base branch "${baseBranch}" does not exist.`);
+  if (branch.code !== 0) throw gitCommandError('git show-ref', branch);
+  const committed = await runner.run('git', ['ls-tree', '-z', baseRef, '--', path], { cwd: repoRoot });
+  if (committed.code !== 0) throw gitCommandError('git ls-tree', committed);
+  const entry = gitTreeEntry(committed.stdout, path);
+  if (!entry) {
+    throw new Error(`environment.devcontainerPath "${config.environment.devcontainerPath}" must be committed to configured local base branch "${baseBranch}" or copied into the worktree.`);
+  }
+  if (!entry.isRegularFile) {
+    throw new Error(`environment.devcontainerPath "${config.environment.devcontainerPath}" must be committed as a regular non-symlink file to configured local base branch "${baseBranch}".`);
+  }
+}
+
+function gitTreeEntry(output: string, path: string): { isRegularFile: boolean } | undefined {
+  for (const record of output.split('\0')) {
+    const separator = record.indexOf('\t');
+    if (separator < 0 || record.slice(separator + 1) !== path) continue;
+    const [mode, type] = record.slice(0, separator).split(' ');
+    return { isRegularFile: (mode === '100644' || mode === '100755') && type === 'blob' };
+  }
+  return undefined;
+}
+
+function safeRepositoryPath(value: string): string | undefined {
+  if (/[^\x20-\x7e]/.test(value) || value.includes('*') || value.includes('?') || value.includes('[') || value.startsWith(':') || isAbsolute(value) || posix.isAbsolute(value) || win32.isAbsolute(value)) return undefined;
+  const components = value.split(/[\\/]/);
+  if (components.length === 0 || components.some((component) => !component || component === '.' || component === '..')) return undefined;
+  return components.join('/');
+}
+
+function gitCommandError(command: string, result: ProcessResult): Error {
+  const detail = result.stderr.trim() || result.stdout.trim() || `exit code ${result.code}`;
+  return new Error(`${command} failed: ${detail}`);
 }
 
 function validateConfig(config: AgentContainersConfig): string[] {

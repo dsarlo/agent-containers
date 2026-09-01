@@ -1,8 +1,8 @@
-import { readFile } from 'node:fs/promises';
+import { readFile, realpath } from 'node:fs/promises';
 import { parse, type ParseError } from 'jsonc-parser';
-import { resolve } from 'node:path';
-import type { ProcessResult, ProcessRunner, ProcessRunOptions } from './types.js';
-import { clearManualRecovery, loadMetadata, recordManualRecovery, saveMetadata, withWorkspaceLock, type WorkspaceMetadata } from './state.js';
+import { isAbsolute, relative, resolve } from 'node:path';
+import type { ProcessOutputEvent, ProcessResult, ProcessRunner, ProcessRunOptions } from './types.js';
+import { bootstrapManualRecoveryJournal, clearManualRecovery, loadMetadata, recordManualRecovery, saveMetadata, withWorkspaceLock, type WorkspaceMetadata } from './state.js';
 
 export type { ProcessRunner } from './types.js';
 
@@ -17,10 +17,18 @@ export interface ManualRecovery {
 
 type RecoveryRecorder = (recovery: ManualRecovery) => Promise<void>;
 type RecoveryClearer = () => Promise<void>;
+type ConfigReader = (path: string) => Promise<string>;
+type PathResolver = (path: string) => Promise<string>;
+const DEVCONTAINER_PROGRESS_LINE_LIMIT = 8 * 1024;
+const DEVCONTAINER_FAILURE_DETAIL_LIMIT = 2 * 1024;
+const readDevcontainerConfig: ConfigReader = (path) => readFile(path, 'utf8');
+const resolveSyntheticPath: PathResolver = async (path) => path;
 
 /** Run the remote lifecycle under its durable workspace lock and recovery guard. */
-export async function execWorkspaceLifecycle(metadata: WorkspaceMetadata, command: string[], runner: ProcessRunner, save: (metadata: WorkspaceMetadata) => Promise<void>, stateDir: string, readConfig: (path: string) => Promise<string> = (path) => readFile(path, 'utf8')): Promise<ProcessResult> {
-  return withWorkspaceLock(stateDir, metadata.name, (signal) => execWorkspace(
+export async function execWorkspaceLifecycle(metadata: WorkspaceMetadata, command: string[], runner: ProcessRunner, save: (metadata: WorkspaceMetadata) => Promise<void>, stateDir: string, readConfig: ConfigReader = readDevcontainerConfig): Promise<ProcessResult> {
+  return withWorkspaceLock(stateDir, metadata.name, async (signal) => {
+    await requireInitializedRecoveryJournal(stateDir, metadata.name);
+    return execWorkspace(
     metadata,
     command,
     runner,
@@ -29,14 +37,16 @@ export async function execWorkspaceLifecycle(metadata: WorkspaceMetadata, comman
     signal,
     (recovery) => recordManualRecovery(stateDir, metadata.name, recovery),
     () => clearManualRecovery(stateDir, metadata.name),
-  ));
+    );
+  });
 }
 
 /** Load the current workspace record only after acquiring its lifecycle lock. */
-export async function execNamedWorkspaceLifecycle(name: string, command: string[], runner: ProcessRunner, stateDir: string, readConfig: (path: string) => Promise<string> = (path) => readFile(path, 'utf8')): Promise<ProcessResult> {
+export async function execNamedWorkspaceLifecycle(name: string, command: string[], runner: ProcessRunner, stateDir: string, readConfig: ConfigReader = readDevcontainerConfig): Promise<ProcessResult> {
   return withWorkspaceLock(stateDir, name, async (signal) => {
     const metadata = await loadMetadata(stateDir, name);
     if (!metadata) throw new Error(`No Agent Containers workspace named "${name}".`);
+    await requireInitializedRecoveryJournal(stateDir, name);
     return execWorkspace(
       metadata,
       command,
@@ -50,18 +60,18 @@ export async function execNamedWorkspaceLifecycle(name: string, command: string[
   });
 }
 
-export async function execWorkspace(metadata: WorkspaceMetadata, command: string[], runner: ProcessRunner, save: (metadata: WorkspaceMetadata) => Promise<void>, readConfig: (path: string) => Promise<string> = (path) => readFile(path, 'utf8'), signal?: AbortSignal, recordRecovery: RecoveryRecorder = missingRecoveryRecorder, clearRecovery: RecoveryClearer = missingRecoveryClearer): Promise<ProcessResult> {
+export async function execWorkspace(metadata: WorkspaceMetadata, command: string[], runner: ProcessRunner, save: (metadata: WorkspaceMetadata) => Promise<void>, readConfig: ConfigReader = readDevcontainerConfig, signal?: AbortSignal, recordRecovery: RecoveryRecorder = missingRecoveryRecorder, clearRecovery: RecoveryClearer = missingRecoveryClearer, resolvePath: PathResolver = readConfig === readDevcontainerConfig ? realpath : resolveSyntheticPath): Promise<ProcessResult> {
   if (command.length === 0) throw new Error('A command is required after --.');
-  const configPath = resolve(metadata.worktree, metadata.devcontainerPath);
+  const configPath = await resolveDevcontainerConfigPath(metadata.worktree, metadata.devcontainerPath, resolvePath);
   await assertSupportedDevcontainerConfig(configPath, readConfig);
   await recordRecovery({ reason: 'operation-may-be-active', containerIds: [], worktree: metadata.worktree });
   let up: ProcessResult;
   try {
-    up = await runner.run('devcontainer', ['up', '--workspace-folder', metadata.worktree, '--config', configPath, '--log-format', 'json', '--mount-git-worktree-common-dir'], withSignal(undefined, signal));
+    up = await runner.run('devcontainer', ['up', '--workspace-folder', metadata.worktree, '--config', configPath, '--log-format', 'json', '--mount-git-worktree-common-dir'], withSignal({ stdio: 'pipe', onOutput: createDevcontainerProgressReporter((message) => process.stderr.write(`${message}\n`)) }, signal));
   } catch (error: unknown) {
     return ambiguousUpRecovery(metadata, runner, save, recordRecovery, `devcontainer up did not return a trustworthy terminal outcome: ${error instanceof Error ? error.message : String(error)}`);
   }
-  if (up.code !== 0) return ambiguousUpRecovery(metadata, runner, save, recordRecovery, `devcontainer up failed without a trustworthy terminal outcome: ${commandDetail(up)}`);
+  if (up.code !== 0) return ambiguousUpRecovery(metadata, runner, save, recordRecovery, devcontainerUpFailureDetail(up));
   const containerId = containerIdFromOutput(up.stdout);
   if (!containerId) return ambiguousUpRecovery(metadata, runner, save, recordRecovery, 'devcontainer up completed without a trustworthy terminal containerId');
   if (metadata.containerId !== containerId) try {
@@ -95,7 +105,7 @@ export async function execWorkspace(metadata: WorkspaceMetadata, command: string
   }
   // The CLI can only terminate its local transport. If it was interrupted, it
   // cannot truthfully assert that the command inside the container stopped.
-  const result = await runner.run('devcontainer', ['exec', '--workspace-folder', metadata.worktree, '--config', configPath, '--container-id', containerId, ...command], withSignal({ stdio: 'inherit' }, signal));
+  const result = await runner.run('devcontainer', ['exec', '--workspace-folder', metadata.worktree, '--config', configPath, '--container-id', containerId, '--mount-git-worktree-common-dir', ...command], withSignal({ stdio: 'inherit' }, signal));
   if (signal?.aborted) {
     await recordRecovery({ reason: 'remote-exec-interrupted', containerIds: [containerId], worktree: metadata.worktree });
     throw new Error(`The local Dev Containers CLI was interrupted; the remote command may still be active in container ${containerId}. Agent Containers recorded a manual-recovery block and will not run lifecycle commands for ${metadata.name} until an operator verifies the remote command is stopped and clears it.`);
@@ -111,24 +121,30 @@ export async function execWorkspace(metadata: WorkspaceMetadata, command: string
  */
 async function ambiguousUpRecovery(metadata: WorkspaceMetadata, runner: ProcessRunner, save: (metadata: WorkspaceMetadata) => Promise<void>, recordRecovery: RecoveryRecorder, outcome: string): Promise<never> {
   const inspectionSignal = AbortSignal.timeout(5_000);
-  let candidates: string[];
-  try {
-    const listed = await runner.run('docker', ['ps', '--all', '--quiet', '--filter', `label=devcontainer.local_folder=${metadata.worktree}`], withSignal(undefined, inspectionSignal));
-    if (listed.code !== 0) return recordAmbiguousUp(recordRecovery, metadata, [], `Docker could not list candidate containers: ${commandDetail(listed)}`);
-    candidates = listed.stdout.split(/\r?\n/).map((id) => id.trim()).filter(isDockerContainerId);
-  } catch (error: unknown) {
-    return recordAmbiguousUp(recordRecovery, metadata, [], `Docker could not list candidate containers: ${error instanceof Error ? error.message : String(error)}`);
-  }
-
-  const matching: string[] = [];
-  for (const candidate of candidates) {
+  const zeroCandidatePolls = 3;
+  let matching: string[] = [];
+  for (let attempt = 0; attempt < zeroCandidatePolls; attempt += 1) {
+    let candidates: string[];
     try {
-      const inspected = await runner.run('docker', ['inspect', '--format', '{{ index .Config.Labels "devcontainer.local_folder" }}', candidate], withSignal(undefined, inspectionSignal));
-      if (inspected.code !== 0) return recordAmbiguousUp(recordRecovery, metadata, candidates, `Docker could not verify candidate ${candidate}: ${commandDetail(inspected)}`);
-      if (inspected.stdout.trim() === metadata.worktree) matching.push(candidate);
+      const listed = await runner.run('docker', ['ps', '--all', '--quiet', '--filter', `label=devcontainer.local_folder=${metadata.worktree}`], withSignal(undefined, inspectionSignal));
+      if (listed.code !== 0) return recordAmbiguousUp(recordRecovery, metadata, [], `Docker could not list candidate containers: ${commandDetail(listed)}`);
+      candidates = listed.stdout.split(/\r?\n/).map((id) => id.trim()).filter(isDockerContainerId);
     } catch (error: unknown) {
-      return recordAmbiguousUp(recordRecovery, metadata, candidates, `Docker could not verify candidate ${candidate}: ${error instanceof Error ? error.message : String(error)}`);
+      return recordAmbiguousUp(recordRecovery, metadata, [], `Docker could not list candidate containers: ${error instanceof Error ? error.message : String(error)}`);
     }
+
+    matching = [];
+    for (const candidate of candidates) {
+      try {
+        const inspected = await runner.run('docker', ['inspect', '--format', '{{ index .Config.Labels "devcontainer.local_folder" }}', candidate], withSignal(undefined, inspectionSignal));
+        if (inspected.code !== 0) return recordAmbiguousUp(recordRecovery, metadata, candidates, `Docker could not verify candidate ${candidate}: ${commandDetail(inspected)}`);
+        if (inspected.stdout.trim() === metadata.worktree) matching.push(candidate);
+      } catch (error: unknown) {
+        return recordAmbiguousUp(recordRecovery, metadata, candidates, `Docker could not verify candidate ${candidate}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    if (matching.length > 0 || attempt === zeroCandidatePolls - 1) break;
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 1_000));
   }
 
   if (matching.length === 0) {
@@ -142,8 +158,8 @@ async function ambiguousUpRecovery(metadata: WorkspaceMetadata, runner: ProcessR
     }
   }
   return recordAmbiguousUp(recordRecovery, metadata, matching, matching.length === 1
-    ? `Found and recorded container ${matching[0]} with the exact worktree label, but ${outcome}`
-    : `Found ${matching.length} containers with the exact worktree label after ${outcome}; ownership is ambiguous`);
+    ? `${outcome}. Found and recorded container ${matching[0]} with the exact worktree label, but the terminal outcome is ambiguous`
+    : `${outcome}. Found ${matching.length} containers with the exact worktree label; ownership is ambiguous`);
 }
 
 async function recordAmbiguousUp(recordRecovery: RecoveryRecorder, metadata: WorkspaceMetadata, containerIds: string[], detail: string): Promise<never> {
@@ -157,6 +173,78 @@ function isDockerContainerId(value: string): boolean {
 
 function commandDetail(result: ProcessResult): string {
   return result.stderr.trim() || result.stdout.trim() || `exit code ${result.code}`;
+}
+
+async function resolveDevcontainerConfigPath(worktree: string, devcontainerPath: string, resolvePath: PathResolver): Promise<string> {
+  const requestedConfigPath = resolve(worktree, devcontainerPath);
+  const [canonicalWorktree, canonicalConfigPath] = await Promise.all([
+    resolvePath(worktree),
+    resolvePath(requestedConfigPath),
+  ]);
+  const configRelativePath = relative(canonicalWorktree, canonicalConfigPath);
+  if (configRelativePath === '..' || configRelativePath.startsWith('../') || configRelativePath.startsWith('..\\') || isAbsolute(configRelativePath)) {
+    throw new Error(`Dev Container configuration at ${canonicalConfigPath} resolves outside canonical worktree ${canonicalWorktree}.`);
+  }
+  return canonicalConfigPath;
+}
+
+/** Return a compact human-readable message from one structured Dev Containers log line. */
+export function formatDevcontainerProgressLine(line: string): string | undefined {
+  const parsed = parseDevcontainerLogLine(line);
+  if (!parsed || 'outcome' in parsed) return undefined;
+  const text = structuredLogText(parsed);
+  if (!text) return undefined;
+  return compactDevcontainerText(text, DEVCONTAINER_PROGRESS_LINE_LIMIT);
+}
+
+/** Frame streamed JSON log chunks so partial lines never reach the terminal. */
+export function createDevcontainerProgressReporter(report: (message: string) => void): (event: ProcessOutputEvent) => void {
+  let pending = '';
+  return (event) => {
+    pending += event.text;
+    for (;;) {
+      const newline = pending.indexOf('\n');
+      if (newline < 0) break;
+      const line = pending.slice(0, newline);
+      pending = pending.slice(newline + 1);
+      const message = formatDevcontainerProgressLine(line);
+      if (message) report(message);
+    }
+    // Do not retain an unterminated huge transcript or ever print it raw.
+    if (pending.length > DEVCONTAINER_PROGRESS_LINE_LIMIT) pending = '';
+  };
+}
+
+/** Extract a bounded root cause from Dev Containers JSON logs without replaying the transcript. */
+export function devcontainerUpFailureDetail(result: ProcessResult): string {
+  const lines = `${result.stderr}\n${result.stdout}`.split(/\r?\n/)
+    .map((line) => structuredLogText(parseDevcontainerLogLine(line)) ?? (line.trim().startsWith('{') ? undefined : line.trim()))
+    .filter((line): line is string => Boolean(line))
+    .map((line) => compactDevcontainerText(line, DEVCONTAINER_FAILURE_DETAIL_LIMIT));
+  const cause = [...lines].reverse().find((line) => /(?:ERROR:|failed to solve|\bfatal\b|\berror\b)/i.test(line));
+  return cause ?? lines.at(-1) ?? `exit code ${result.code}`;
+}
+
+function parseDevcontainerLogLine(line: string): Record<string, unknown> | undefined {
+  try {
+    const parsed: unknown = JSON.parse(line);
+    return typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed) ? parsed as Record<string, unknown> : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function structuredLogText(record: Record<string, unknown> | undefined): string | undefined {
+  if (!record) return undefined;
+  for (const key of ['text', 'message', 'msg', 'progress', 'data']) {
+    if (typeof record[key] === 'string') return record[key];
+  }
+  return undefined;
+}
+
+function compactDevcontainerText(text: string, limit: number): string {
+  const compact = text.replace(/^\[\d+(?:\.\d+)? ms\]\s*/, '').replace(/\s+/g, ' ').trim();
+  return compact.length > limit ? `${compact.slice(0, limit - 1)}…` : compact;
 }
 
 export async function assertSupportedDevcontainerConfig(path: string, readConfig: (path: string) => Promise<string> = (configPath) => readFile(configPath, 'utf8')): Promise<void> {
@@ -176,6 +264,12 @@ function parseJsoncObject(source: string): DevcontainerConfig {
   if (errors.length > 0) throw new Error(`invalid JSONC (${errors.map((error) => error.error).join(', ')})`);
   if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) throw new Error('Dev Container configuration must be a JSON object');
   return parsed as DevcontainerConfig;
+}
+
+function requireInitializedRecoveryJournal(stateDir: string, name: string): Promise<void> {
+  return bootstrapManualRecoveryJournal(stateDir, name).then((created) => {
+    if (created) throw new Error(`Initialized the durable manual-recovery journal for workspace "${name}". No Dev Containers command was dispatched; retry this invocation before remote work can begin.`);
+  });
 }
 
 function missingRecoveryRecorder(): Promise<void> {
@@ -205,7 +299,7 @@ function containerIdFromOutput(output: string): string | undefined {
 class CommandError extends Error {
   readonly exitCode: number | undefined;
   constructor(command: string, result: ProcessResult) {
-    const detail = result.stderr.trim() || result.stdout.trim() || `exit code ${result.code}`;
+    const detail = command === 'devcontainer up' ? devcontainerUpFailureDetail(result) : commandDetail(result);
     super(`${command} failed: ${detail}`);
     this.exitCode = result.code >= 1 && result.code <= 255 ? result.code : undefined;
   }

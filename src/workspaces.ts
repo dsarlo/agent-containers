@@ -3,62 +3,154 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import { resolve } from 'node:path';
 import type { AgentContainersConfig, ProcessResult, ProcessRunner, ProcessRunOptions } from './types.js';
 import { validateWorkspaceName } from './names.js';
-import { deleteMetadata, isAgentContainersWorkspace, loadMetadata, saveMetadata, type WorkspaceMetadata } from './state.js';
+import { bootstrapManualRecoveryJournal, deleteMetadata, isAgentContainersWorkspace, loadMetadata, saveMetadata, type WorkspaceMetadata } from './state.js';
 
 export type { ProcessRunner } from './types.js';
 
 /** Keep enough terminal output for Dev Containers' final JSON record without unbounded memory use. */
 export const PROCESS_OUTPUT_LIMIT = 1024 * 1024;
+const PROCESS_OUTPUT_EVENT_LIMIT = 64 * 1024;
+const WINDOWS_REAP_TIMEOUT_MS = 5_000;
 
-export const nodeProcessRunner: ProcessRunner = {
-  run(command, args, options = {}) {
-    return new Promise((resolveResult, reject) => {
-      if (options.signal?.aborted) {
-        reject(abortError());
-        return;
-      }
-      const stdio = options.stdio ?? 'pipe';
-      const child = spawn(command, args, { cwd: options.cwd, shell: false, stdio, detached: process.platform !== 'win32' });
-      if (options.input !== undefined) child.stdin?.end(options.input);
-      let stdout = '';
-      let stderr = '';
-      let settled = false;
-      let forceKill: NodeJS.Timeout | undefined;
-      const cleanup = () => {
-        options.signal?.removeEventListener('abort', abortChild);
-        if (forceKill) clearTimeout(forceKill);
-      };
-      const settle = (result: ProcessResult) => {
-        if (settled) return;
-        settled = true;
-        cleanup();
-        resolveResult(result);
-      };
-      const fail = (error: Error) => {
-        if (settled) return;
-        settled = true;
-        cleanup();
-        reject(error);
-      };
-      const abortChild = () => {
-        if (settled) return;
-        signalProcessTree(child, 'SIGTERM');
-        forceKill = setTimeout(() => signalProcessTree(child, 'SIGKILL'), 5_000);
-      };
-      child.stdout?.on('data', (chunk: Buffer) => { stdout = appendBounded(stdout, chunk); });
-      child.stderr?.on('data', (chunk: Buffer) => { stderr = appendBounded(stderr, chunk); });
-      child.on('error', fail);
-      child.on('close', (code) => settle({ code: code ?? 1, stdout, stderr }));
-      options.signal?.addEventListener('abort', abortChild, { once: true });
-    });
-  },
-};
+export interface NodeProcessRunnerDependencies {
+  /** Override only for focused cross-platform process-runner tests. */
+  platform?: NodeJS.Platform;
+  /** Override only for focused cross-platform process-runner tests. */
+  spawn?: typeof spawn;
+  /** Bound Windows cancellation reaping without making focused tests wait seconds. */
+  windowsReapTimeoutMs?: number;
+}
 
-function signalProcessTree(child: ChildProcess, signal: NodeJS.Signals): void {
+export function createNodeProcessRunner({
+  platform = process.platform,
+  spawn: spawnProcess = spawn,
+  windowsReapTimeoutMs = WINDOWS_REAP_TIMEOUT_MS,
+}: NodeProcessRunnerDependencies = {}): ProcessRunner {
+  return {
+    run(command, args, options = {}) {
+      return new Promise((resolveResult, reject) => {
+        if (options.signal?.aborted) {
+          reject(abortError());
+          return;
+        }
+        const stdio = options.stdio ?? 'pipe';
+        const child = spawnProcess(command, args, { cwd: options.cwd, shell: false, stdio, detached: platform !== 'win32' });
+        if (options.input !== undefined) child.stdin?.end(options.input);
+        let stdout = '';
+        let stderr = '';
+        const stdoutDecoder = new TextDecoder();
+        const stderrDecoder = new TextDecoder();
+        let settled = false;
+        let forceKill: NodeJS.Timeout | undefined;
+        let rootTerminationAttempted = false;
+        const terminateRootOnce = () => {
+          if (rootTerminationAttempted) return;
+          rootTerminationAttempted = true;
+          terminateManagedRoot(child);
+        };
+        const cleanup = () => {
+          options.signal?.removeEventListener('abort', abortChild);
+          if (forceKill) clearTimeout(forceKill);
+        };
+        const settle = (result: ProcessResult) => {
+          if (settled) return;
+          settled = true;
+          cleanup();
+          resolveResult(result);
+        };
+        const fail = (error: Error) => {
+          if (settled) return;
+          settled = true;
+          cleanup();
+          reject(error);
+        };
+        const abortChild = () => {
+          if (settled) return;
+          if (platform === 'win32') {
+            signalProcessTree(child, 'SIGTERM', platform, spawnProcess, terminateRootOnce);
+            forceKill = setTimeout(() => {
+              try {
+                // This is a failed recovery, not proof that taskkill stopped descendants.
+                terminateRootOnce();
+                fail(windowsReapTimeoutError());
+              } catch (error: unknown) {
+                fail(error instanceof Error ? error : new Error(String(error)));
+              }
+            }, windowsReapTimeoutMs);
+            return;
+          }
+          signalProcessTree(child, 'SIGTERM', platform, spawnProcess);
+          forceKill = setTimeout(() => signalProcessTree(child, 'SIGKILL', platform, spawnProcess), 5_000);
+        };
+        const receive = (stream: 'stdout' | 'stderr', chunk: Buffer, flush = false) => {
+          const text = (stream === 'stdout' ? stdoutDecoder : stderrDecoder).decode(chunk, { stream: !flush });
+          if (!text) return;
+          if (stream === 'stdout') stdout = appendBounded(stdout, text);
+          else stderr = appendBounded(stderr, text);
+          for (let start = 0; start < text.length; start += PROCESS_OUTPUT_EVENT_LIMIT) {
+            options.onOutput?.({ stream, text: text.slice(start, start + PROCESS_OUTPUT_EVENT_LIMIT) });
+          }
+        };
+        child.stdout?.on('data', (chunk: Buffer) => { receive('stdout', chunk); });
+        child.stderr?.on('data', (chunk: Buffer) => { receive('stderr', chunk); });
+        child.on('error', fail);
+        child.on('close', (code) => {
+          receive('stdout', Buffer.alloc(0), true);
+          receive('stderr', Buffer.alloc(0), true);
+          settle({ code: code ?? 1, stdout, stderr });
+        });
+        options.signal?.addEventListener('abort', abortChild, { once: true });
+      });
+    },
+  };
+}
+
+export const nodeProcessRunner: ProcessRunner = createNodeProcessRunner();
+
+function signalProcessTree(
+  child: ChildProcess,
+  signal: NodeJS.Signals,
+  platform: NodeJS.Platform,
+  spawnProcess: typeof spawn,
+  terminateWindowsRoot?: () => void,
+): void {
   try {
-    if (process.platform === 'win32' || child.pid === undefined) child.kill(signal);
+    if (platform === 'win32') {
+      if (child.pid === undefined) return;
+      // taskkill follows the Windows process tree without invoking a command shell.
+      const killer = spawnProcess('taskkill', ['/PID', String(child.pid), '/T', '/F'], { shell: false, stdio: 'ignore', windowsHide: true });
+      // A child may exit after cancellation is requested; taskkill then reports it
+      // asynchronously. That is not a runner failure and must not escape the event loop.
+      let rootTerminationAttempted = false;
+      const terminateRootOnce = () => {
+        if (rootTerminationAttempted) return;
+        rootTerminationAttempted = true;
+        (terminateWindowsRoot ?? (() => terminateManagedRoot(child)))();
+      };
+      killer.once('error', terminateRootOnce);
+      // Do not retry tree termination: on failure, make one best-effort direct attempt
+      // on the managed root only. This does not imply its descendants are stopped.
+      killer.once('close', (code) => {
+        if (code !== 0) terminateRootOnce();
+      });
+      return;
+    }
+    if (child.pid === undefined) child.kill(signal);
     else process.kill(-child.pid, signal);
   } catch (error: unknown) {
+    if (!isNodeError(error, 'ESRCH')) throw error;
+  }
+}
+
+function windowsReapTimeoutError(): Error {
+  return new Error('Windows process reaping timed out before the managed child closed; cancellation recovery requires manual verification.');
+}
+
+function terminateManagedRoot(child: ChildProcess): void {
+  try {
+    child.kill('SIGKILL');
+  } catch (error: unknown) {
+    // An exited root is a normal cancellation race. The runner still waits for close.
     if (!isNodeError(error, 'ESRCH')) throw error;
   }
 }
@@ -73,11 +165,8 @@ function withSignal(options: Omit<ProcessRunOptions, 'signal'>, signal?: AbortSi
   return signal ? { ...options, signal } : options;
 }
 
-function appendBounded(current: string, chunk: Buffer): string {
-  const boundedChunk = chunk.length > PROCESS_OUTPUT_LIMIT
-    ? chunk.subarray(chunk.length - PROCESS_OUTPUT_LIMIT).toString()
-    : chunk.toString();
-  const combined = current + boundedChunk;
+function appendBounded(current: string, text: string): string {
+  const combined = current + text;
   return combined.length > PROCESS_OUTPUT_LIMIT ? combined.slice(combined.length - PROCESS_OUTPUT_LIMIT) : combined;
 }
 
@@ -93,6 +182,8 @@ export async function createWorkspace(options: {
 }): Promise<WorkspaceMetadata> {
   const name = validateWorkspaceName(options.name);
   if (await loadMetadata(options.stateDir, name)) throw new Error(`Agent Containers workspace "${name}" already exists.`);
+  // A new workspace may establish its recovery journal before any Git side effect.
+  await bootstrapManualRecoveryJournal(options.stateDir, name);
   const root = await findGitRoot(options.cwd, options.runner, options.signal);
   const worktree = resolve(root, options.config.workspace.worktreeRoot, name);
   try {
@@ -137,7 +228,15 @@ export async function createWorkspace(options: {
   return metadata;
 }
 
-export async function removeWorkspace(metadata: WorkspaceMetadata, options: { confirmed: boolean; skipContainerCleanup?: boolean; signal?: AbortSignal }, runner: ProcessRunner, save: (metadata: WorkspaceMetadata) => Promise<void>, removeMetadata: () => Promise<void>): Promise<void> {
+export interface RemoveWorkspaceOptions {
+  confirmed: boolean;
+  /** Explicitly allow Git to remove a dirty or untracked owned worktree. */
+  forceWorktree?: boolean;
+  skipContainerCleanup?: boolean;
+  signal?: AbortSignal;
+}
+
+export async function removeWorkspace(metadata: WorkspaceMetadata, options: RemoveWorkspaceOptions, runner: ProcessRunner, save: (metadata: WorkspaceMetadata) => Promise<void>, removeMetadata: () => Promise<void>): Promise<void> {
   if (!options.confirmed) throw new Error('Refusing to remove a workspace without --yes.');
   if (!isAgentContainersWorkspace(metadata)) throw new Error('Refusing to remove metadata that is not an Agent Containers workspace.');
   let current = metadata;
@@ -182,6 +281,14 @@ export async function removeWorkspace(metadata: WorkspaceMetadata, options: { co
     }
   }
 
+  if (worktreePresent && !current.cleanup?.worktree && !options.forceWorktree) {
+    const status = await runner.run('git', ['status', '--porcelain=v1', '--untracked-files=all'], withSignal({ cwd: current.worktree }, options.signal));
+    if (status.code !== 0) throw commandError('git status', status);
+    if (status.stdout.trim()) {
+      throw new Error(`Refusing to remove dirty or untracked worktree ${current.worktree}. After reviewing its files, retry with ac remove ${current.name} --yes --force-worktree.`);
+    }
+  }
+
   if (current.containerId && !current.cleanup?.container && !options.skipContainerCleanup) {
     const inspect = await runner.run('docker', ['inspect', '--format', '{{ index .Config.Labels "devcontainer.local_folder" }}', current.containerId], withSignal({}, options.signal));
     if (inspect.code !== 0) {
@@ -199,8 +306,11 @@ export async function removeWorkspace(metadata: WorkspaceMetadata, options: { co
 
   if (!current.cleanup?.worktree) {
     if (worktreePresent) {
-      const result = await runner.run('git', ['worktree', 'remove', current.worktree], withSignal({ cwd: current.repoRoot }, options.signal));
-      if (result.code !== 0) throw commandError('git worktree remove', result);
+      const result = await runner.run('git', ['worktree', 'remove', ...(options.forceWorktree ? ['--force'] : []), current.worktree], withSignal({ cwd: current.repoRoot }, options.signal));
+      if (result.code !== 0) {
+        const remediation = `ac remove ${current.name} --yes --force-worktree`;
+        throw new Error(`git worktree remove did not remove the recorded worktree: ${commandError('git worktree remove', result).message}. After reviewing its dirty or untracked files, retry with ${remediation}.`);
+      }
     }
     current = withCleanup(current, 'worktree');
     await save(current);

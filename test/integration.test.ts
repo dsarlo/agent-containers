@@ -2,9 +2,10 @@ import assert from 'node:assert/strict';
 import { access, lstat, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { spawn, spawnSync } from 'node:child_process';
+import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
+import { EventEmitter } from 'node:events';
 import test from 'node:test';
-import { createWorkspace, nodeProcessRunner, PROCESS_OUTPUT_LIMIT } from '../src/workspaces.js';
+import { createNodeProcessRunner, createWorkspace, nodeProcessRunner, PROCESS_OUTPUT_LIMIT } from '../src/workspaces.js';
 import { execWorkspaceLifecycle } from '../src/runtime.js';
 import { isLiveIntegrationEnabled, probeLiveIntegrationPrerequisites } from '../src/live-integration.js';
 
@@ -45,6 +46,97 @@ test('nodeProcessRunner bounds burst capture while retaining terminal Dev Contai
   assert.match(result.stdout, /\{"containerId":"terminal"\}\n$/);
 });
 
+test('nodeProcessRunner emits incrementally decoded UTF-8 pipe output while capture remains bounded', async () => {
+  const events: string[] = [];
+  const result = await nodeProcessRunner.run(process.execPath, ['-e', 'process.stdout.write(Buffer.from([0xf0, 0x9f])); setTimeout(() => process.stdout.write(Buffer.from([0x98, 0x80])), 20)'], {
+    onOutput: (event) => events.push(event.text),
+  });
+  assert.equal(result.code, 0);
+  assert.equal(events.join(''), '😀');
+  assert.equal(result.stdout, '😀');
+});
+
+test('nodeProcessRunner does not invoke an output callback for inherited stdio', async () => {
+  let observed = false;
+  const result = await nodeProcessRunner.run(process.execPath, ['-e', 'process.stdout.write("inherited-output\\n")'], {
+    stdio: 'inherit',
+    onOutput: () => { observed = true; },
+  });
+  assert.equal(result.code, 0);
+  assert.equal(observed, false);
+});
+
+test('nodeProcessRunner directly reaps the Windows root when taskkill errors without closing, while awaiting the managed child', async () => {
+  const calls: Array<{ command: string; args: string[]; options: Record<string, unknown> }> = [];
+  const killers: EventEmitter[] = [];
+  const rootKillSignals: NodeJS.Signals[] = [];
+  const managedChild = Object.assign(new EventEmitter(), {
+    pid: 4321,
+    kill: (signal: NodeJS.Signals) => {
+      rootKillSignals.push(signal);
+      throw Object.assign(new Error('already gone'), { code: 'ESRCH' });
+    },
+  }) as unknown as ChildProcess;
+  const spawnForTest = ((command: string, args: readonly string[], options: Record<string, unknown>) => {
+    calls.push({ command, args: [...args], options });
+    if (command !== 'taskkill') return managedChild;
+    const killer = new EventEmitter();
+    killers.push(killer);
+    return killer as ChildProcess;
+  }) as typeof spawn;
+  const controller = new AbortController();
+  const runner = createNodeProcessRunner({ platform: 'win32', spawn: spawnForTest });
+  let settled = false;
+  const running = runner.run('managed-command', [], { signal: controller.signal }).then((result) => { settled = true; return result; });
+
+  controller.abort();
+  await new Promise((resolveTick) => setImmediate(resolveTick));
+  assert.deepEqual(calls, [
+    { command: 'managed-command', args: [], options: { cwd: undefined, shell: false, stdio: 'pipe', detached: false } },
+    { command: 'taskkill', args: ['/PID', '4321', '/T', '/F'], options: { shell: false, stdio: 'ignore', windowsHide: true } },
+  ]);
+  killers[0]?.emit('error', new Error('taskkill could not start'));
+  await new Promise((resolveTick) => setImmediate(resolveTick));
+  try {
+    assert.deepEqual(rootKillSignals, ['SIGKILL'], 'a taskkill error gets one direct root fallback without a shell');
+    assert.equal(settled, false, 'the managed child is still awaited after cancellation');
+  } finally {
+    managedChild.emit('close', 1);
+  }
+
+  assert.equal((await running).code, 1);
+  assert.equal(settled, true);
+});
+
+test('nodeProcessRunner rejects through Windows reaping recovery when taskkill and the managed child never close', async () => {
+  const rootKillSignals: NodeJS.Signals[] = [];
+  const managedChild = Object.assign(new EventEmitter(), {
+    pid: 8765,
+    kill: (signal: NodeJS.Signals) => { rootKillSignals.push(signal); return true; },
+  }) as unknown as ChildProcess;
+  const spawnForTest = ((command: string) => command === 'taskkill'
+    ? new EventEmitter() as ChildProcess
+    : managedChild) as typeof spawn;
+  const controller = new AbortController();
+  const runner = createNodeProcessRunner({
+    platform: 'win32',
+    spawn: spawnForTest,
+    windowsReapTimeoutMs: 0,
+  });
+  let failure: Error | undefined;
+  let settled = false;
+  void runner.run('managed-command', [], { signal: controller.signal }).then(
+    () => { settled = true; },
+    (error: unknown) => { failure = error as Error; settled = true; },
+  );
+
+  controller.abort();
+  await new Promise((resolveDelay) => setTimeout(resolveDelay, 0));
+  assert.equal(settled, true, 'a Windows child that never closes must enter recovery instead of retaining the lifecycle lock');
+  assert.match(failure?.message ?? '', /Windows process reaping timed out/);
+  assert.deepEqual(rootKillSignals, ['SIGKILL'], 'the timed-out recovery makes one shell-free root termination attempt');
+});
+
 test('nodeProcessRunner abort terminates spawned process-group descendants before settling', { skip: process.platform === 'win32' }, async () => {
   const directory = await mkdtemp(join(tmpdir(), 'agent-containers-process-group-'));
   const marker = join(directory, 'grandchild-survived');
@@ -66,8 +158,15 @@ test('SIGTERM keeps the lifecycle lock until a cancelled child process has exite
   const reapedMarker = join(stateDir, 'child-reaped');
   const childCommand = `const fs = require('node:fs'); process.on('SIGTERM', () => setTimeout(() => { fs.writeFileSync(${JSON.stringify(reapedMarker)}, 'reaped'); process.exit(0); }, 200)); setTimeout(() => process.exit(0), 900); setInterval(() => {}, 1000);`;
   const childProgram = `
-    import { withWorkspaceLock } from ${JSON.stringify(stateUrl)};
+    import { withWorkspaceLock, setStateDurabilityAdapterForTesting } from ${JSON.stringify(stateUrl)};
     import { nodeProcessRunner } from ${JSON.stringify(workspacesUrl)};
+    setStateDurabilityAdapterForTesting({
+      publicationMode: async () => 'strict',
+      assertStateWriteSupport: async () => undefined,
+      syncFile: async () => undefined,
+      syncDirectory: async () => undefined,
+      moveFileWriteThrough: async () => undefined,
+    });
     const stateDir = process.argv[1];
     await withWorkspaceLock(stateDir, 'safe', async (signal) => {
       process.stdout.write('LOCKED\\n');

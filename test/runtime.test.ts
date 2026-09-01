@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict';
-import { mkdtemp } from 'node:fs/promises';
+import { mkdir, mkdtemp, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
-import { execNamedWorkspaceLifecycle, execWorkspace, execWorkspaceLifecycle, type ProcessRunner } from '../src/runtime.js';
-import { clearManualRecovery, deleteMetadata, loadManualRecovery, recordManualRecovery, saveMetadata, withWorkspaceLock, type WorkspaceMetadata } from '../src/state.js';
+import { createDevcontainerProgressReporter, devcontainerUpFailureDetail, execNamedWorkspaceLifecycle, execWorkspace, execWorkspaceLifecycle, formatDevcontainerProgressLine, type ProcessRunner } from '../src/runtime.js';
+import type { ProcessRunOptions } from '../src/types.js';
+import { bootstrapManualRecoveryJournal, clearManualRecovery, deleteMetadata, loadManualRecovery, recordManualRecovery, saveMetadata, withWorkspaceLock, type WorkspaceMetadata } from '../src/state.js';
 
 const noOpRecovery = async (): Promise<void> => undefined;
 
@@ -20,7 +21,7 @@ const metadata: WorkspaceMetadata = {
 };
 
 test('execWorkspace uses the linked-worktree mount, requires a current container ID, and inherits the terminal for agents', async () => {
-  const calls: Array<{ command: string; args: string[]; options: unknown }> = [];
+  const calls: Array<{ command: string; args: string[]; options?: ProcessRunOptions }> = [];
   let saved: WorkspaceMetadata | undefined;
   const runner: ProcessRunner = {
     async run(command, args, options) {
@@ -31,11 +32,40 @@ test('execWorkspace uses the linked-worktree mount, requires a current container
   };
 
   await execWorkspace(metadata, ['sh', '-lc', 'printf "$HOME;$(whoami)"'], runner, async (next) => { saved = next; }, async () => '{}', undefined, noOpRecovery, noOpRecovery);
-  assert.deepEqual(calls, [
-    { command: 'devcontainer', args: ['up', '--workspace-folder', '/repo/worktrees/safe-name', '--config', '/repo/worktrees/safe-name/.devcontainer/devcontainer.json', '--log-format', 'json', '--mount-git-worktree-common-dir'], options: undefined },
-    { command: 'devcontainer', args: ['exec', '--workspace-folder', '/repo/worktrees/safe-name', '--config', '/repo/worktrees/safe-name/.devcontainer/devcontainer.json', '--container-id', '0123456789abcdef0123456789abcdef', 'sh', '-lc', 'printf "$HOME;$(whoami)"'], options: { stdio: 'inherit' } },
+  assert.deepEqual(calls.map(({ command, args }) => ({ command, args })), [
+    { command: 'devcontainer', args: ['up', '--workspace-folder', '/repo/worktrees/safe-name', '--config', '/repo/worktrees/safe-name/.devcontainer/devcontainer.json', '--log-format', 'json', '--mount-git-worktree-common-dir'] },
+    { command: 'devcontainer', args: ['exec', '--workspace-folder', '/repo/worktrees/safe-name', '--config', '/repo/worktrees/safe-name/.devcontainer/devcontainer.json', '--container-id', '0123456789abcdef0123456789abcdef', '--mount-git-worktree-common-dir', 'sh', '-lc', 'printf "$HOME;$(whoami)"'] },
   ]);
+  assert.equal(calls[0].options?.stdio, 'pipe');
+  assert.equal(typeof (calls[0].options as { onOutput?: unknown } | undefined)?.onOutput, 'function');
+  assert.deepEqual(calls[1].options, { stdio: 'inherit' });
   assert.equal(saved?.containerId, '0123456789abcdef0123456789abcdef');
+});
+
+test('Dev Containers JSON progress formatting emits only compact structured messages', () => {
+  assert.equal(formatDevcontainerProgressLine('{"type":"text","level":2,"text":"[231 ms] Start: Run: docker build"}'), 'Start: Run: docker build');
+  assert.equal(formatDevcontainerProgressLine('{"type":"progress","message":"Building development container"}'), 'Building development container');
+  assert.equal(formatDevcontainerProgressLine('{"outcome":"success","containerId":"0123456789abcdef0123456789abcdef"}'), undefined);
+  assert.equal(formatDevcontainerProgressLine('ordinary non-JSON output'), undefined);
+});
+
+test('Dev Containers progress reporter frames JSON lines split across output chunks', () => {
+  const reported: string[] = [];
+  const report = createDevcontainerProgressReporter((message) => reported.push(message));
+  report({ stream: 'stdout', text: '{"type":"progress","message":"Building' });
+  report({ stream: 'stdout', text: ' development container"}\n{"outcome":"success"}\n' });
+  assert.deepEqual(reported, ['Building development container']);
+});
+
+test('Dev Containers up failure detail leads with the last meaningful structured cause and stays bounded', () => {
+  const detail = devcontainerUpFailureDetail({
+    code: 17,
+    stdout: `${JSON.stringify({ type: 'text', text: 'fetching base image' })}\n${JSON.stringify({ type: 'text', text: '#9 ERROR: failed to solve: process "/bin/sh -c npm ci" did not complete successfully' })}\n${JSON.stringify({ type: 'text', text: 'irrelevant'.repeat(100_000) })}\n`,
+    stderr: '',
+  });
+  assert.match(detail, /^#9 ERROR: failed to solve:/);
+  assert.ok(detail.length < 2_500, 'failure detail remains bounded instead of replaying the JSON transcript');
+  assert.equal(detail.includes('{"type"'), false, 'raw JSON transcript is never included');
 });
 
 test('execWorkspace refuses successful up output without a terminal container ID', async () => {
@@ -95,9 +125,29 @@ test('execWorkspaceLifecycle supplies durable recovery callbacks under the works
     },
   };
 
+  await bootstrapManualRecoveryJournal(stateDir, metadata.name);
   await execWorkspaceLifecycle(metadata, ['true'], runner, async () => undefined, stateDir, async () => '{}');
   assert.equal(await loadManualRecovery(stateDir, metadata.name), undefined);
   await withWorkspaceLock(stateDir, metadata.name, async () => undefined);
+});
+
+test('an existing workspace initializes its recovery journal before dispatch and requires a retry', async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), 'agent-containers-journal-bootstrap-'));
+  await saveMetadata(stateDir, metadata);
+  const calls: string[] = [];
+  const runner: ProcessRunner = {
+    async run(command, args) {
+      calls.push(`${command} ${args[0]}`);
+      return args[0] === 'up'
+        ? { code: 0, stdout: '{"outcome":"success","containerId":"0123456789abcdef0123456789abcdef"}\n', stderr: '' }
+        : { code: 0, stdout: '', stderr: '' };
+    },
+  };
+
+  await assert.rejects(() => execNamedWorkspaceLifecycle(metadata.name, ['true'], runner, stateDir, async () => '{}'), /recovery journal.*retry/i);
+  assert.deepEqual(calls, [], 'journal bootstrap never dispatches Dev Containers');
+  await execNamedWorkspaceLifecycle(metadata.name, ['true'], runner, stateDir, async () => '{}');
+  assert.deepEqual(calls, ['devcontainer up', 'devcontainer exec']);
 });
 
 test('named lifecycle execution loads metadata only after a concurrent remove releases the workspace lock', async () => {
@@ -150,27 +200,51 @@ test('a recovery writer failure during interruption leaves the durable pre-dispa
   await assert.rejects(() => withWorkspaceLock(stateDir, metadata.name, async () => undefined), /manual recovery/);
 });
 
-test('a nonzero devcontainer up reconciles exact-label candidates and records recovery without deleting a container', async () => {
-  const candidate = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
+test('a nonzero devcontainer up with zero candidates retains the manual recovery block without clearing it', async () => {
   const calls: Array<{ command: string; args: string[] }> = [];
   const records: Array<{ reason: string; containerIds: string[]; worktree: string }> = [];
+  let cleared = false;
   const runner: ProcessRunner = {
     async run(command, args) {
       calls.push({ command, args });
       if (command === 'devcontainer') return { code: 17, stdout: '', stderr: 'post-create provisioning failed' };
-      if (args[0] === 'ps') return { code: 0, stdout: `${candidate}\n`, stderr: '' };
-      if (args[0] === 'inspect') return { code: 0, stdout: metadata.worktree, stderr: '' };
+      if (args[0] === 'ps') return { code: 0, stdout: '', stderr: '' };
       throw new Error(`unexpected command: ${command} ${args.join(' ')}`);
     },
   };
 
   await assert.rejects(
-    () => (execWorkspace as (...args: unknown[]) => Promise<unknown>)(metadata, ['true'], runner, async () => undefined, async () => '{}', undefined, async (recovery: { reason: string; containerIds: string[]; worktree: string }) => { records.push(recovery); }, async () => undefined),
+    () => (execWorkspace as (...args: unknown[]) => Promise<unknown>)(metadata, ['true'], runner, async () => undefined, async () => '{}', undefined, async (recovery: { reason: string; containerIds: string[]; worktree: string }) => { records.push(recovery); }, async () => { cleared = true; }),
+    /post-create provisioning failed.*manual recovery/s,
+  );
+  assert.deepEqual(calls.filter((call) => call.command === 'docker').map((call) => call.args[0]), ['ps', 'ps', 'ps']);
+  assert.deepEqual(records.at(-1), { reason: 'devcontainer-up-ambiguous', containerIds: [], worktree: metadata.worktree });
+  assert.equal(cleared, false);
+});
+
+test('an interruption during zero-candidate verification retains manual recovery instead of clearing the guard', async () => {
+  const lifecycle = new AbortController();
+  const records: Array<{ reason: string; containerIds: string[]; worktree: string }> = [];
+  let cleared = false;
+  let psCalls = 0;
+  const runner: ProcessRunner = {
+    async run(command, args) {
+      if (command === 'devcontainer') return { code: 17, stdout: '', stderr: 'provisioning failed' };
+      if (args[0] === 'ps') {
+        psCalls += 1;
+        if (psCalls === 1) queueMicrotask(() => lifecycle.abort());
+        return { code: 0, stdout: '', stderr: '' };
+      }
+      throw new Error(`unexpected command: ${command} ${args.join(' ')}`);
+    },
+  };
+
+  await assert.rejects(
+    () => (execWorkspace as (...args: unknown[]) => Promise<unknown>)(metadata, ['true'], runner, async () => undefined, async () => '{}', lifecycle.signal, async (recovery: { reason: string; containerIds: string[]; worktree: string }) => { records.push(recovery); }, async () => { cleared = true; }),
     /manual recovery/,
   );
-  assert.deepEqual(calls.filter((call) => call.command === 'docker').map((call) => call.args[0]), ['ps', 'inspect']);
-  assert.deepEqual(records.at(-1), { reason: 'devcontainer-up-ambiguous', containerIds: [candidate], worktree: metadata.worktree });
-  assert.equal(calls.some((call) => call.command === 'docker' && call.args[0] === 'rm'), false, 'reconciliation must never delete a candidate');
+  assert.equal(cleared, false);
+  assert.deepEqual(records.at(-1), { reason: 'devcontainer-up-ambiguous', containerIds: [], worktree: metadata.worktree });
 });
 
 test('execWorkspace reconciles an interrupted up through an exact worktree label and then blocks for manual recovery', async () => {
@@ -298,6 +372,31 @@ test('execWorkspace accepts standards-compatible JSONC comments, strings, and tr
   }`;
   await execWorkspace(metadata, ['true'], runner, async () => undefined, async () => config, undefined, noOpRecovery, noOpRecovery);
   assert.equal(calls.length, 2);
+});
+
+test('execWorkspace rejects a Dev Container config symlink that escapes its worktree before dispatch', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agent-containers-config-escape-'));
+  const worktree = join(root, 'worktree');
+  const outside = join(root, 'outside');
+  const configPath = join(worktree, '.devcontainer', 'devcontainer.json');
+  await mkdir(join(worktree, '.devcontainer'), { recursive: true });
+  await mkdir(outside);
+  await writeFile(join(outside, 'devcontainer.json'), '{}');
+  await symlink(join(outside, 'devcontainer.json'), configPath);
+
+  let dispatches = 0;
+  const runner: ProcessRunner = {
+    async run() {
+      dispatches += 1;
+      throw new Error('Dev Containers must not run for an escaping config');
+    },
+  };
+
+  await assert.rejects(
+    () => execWorkspace({ ...metadata, worktree }, ['true'], runner, async () => undefined, undefined, undefined, noOpRecovery, noOpRecovery),
+    /Dev Container configuration.*outside.*worktree/i,
+  );
+  assert.equal(dispatches, 0, 'the escaping config is rejected before Dev Containers dispatch');
 });
 
 test('execWorkspace retains a new container when its Docker ownership inspection cannot verify the worktree', async () => {

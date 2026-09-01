@@ -4,8 +4,19 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import * as state from '../src/state.js';
-import { loadMetadata, releaseStaleWorkspaceLock, saveMetadata, withWorkspaceLock, type WorkspaceLockOptions, type WorkspaceMetadata } from '../src/state.js';
+import { bootstrapManualRecoveryJournal, loadManualRecovery, loadMetadata, recordManualRecovery, releaseStaleWorkspaceLock, saveMetadata, setStateDurabilityAdapterForTesting, withWorkspaceLock, type WorkspaceLockOptions, type WorkspaceMetadata } from '../src/state.js';
 import type { ProcessRunner } from '../src/types.js';
+import type { StateDurabilityAdapter } from '../src/durability.js';
+
+const testDurabilityAdapter: StateDurabilityAdapter = {
+  publicationMode: async () => 'strict',
+  assertStateWriteSupport: async () => undefined,
+  syncFile: async () => undefined,
+  syncDirectory: async () => undefined,
+  moveFileWriteThrough: async () => undefined,
+};
+setStateDurabilityAdapterForTesting(testDurabilityAdapter);
+test.after(() => setStateDurabilityAdapterForTesting(undefined));
 
 const metadata: WorkspaceMetadata = { version: 1, name: 'safe', repoRoot: '/repo', worktree: '/repo/worktrees/safe', branch: 'agent-containers/safe', baseRef: 'refs/heads/main', devcontainerPath: '.devcontainer/devcontainer.json', createdAt: '2026-01-01T00:00:00.000Z' };
 
@@ -25,6 +36,115 @@ test('metadata writes are atomic and never expose a predictable temporary file',
   assert.deepEqual(JSON.parse(content), metadata);
   await writeFile(join(stateDir, 'workspaces', '.safe.json.tmp'), 'partial');
   assert.deepEqual(JSON.parse(await readFile(join(stateDir, 'workspaces', 'safe.json'), 'utf8')), metadata);
+});
+
+test('recoverable Windows publication uses its write-through move without pretending to sync directories', async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), 'agent-containers-windows-publication-'));
+  const calls: string[] = [];
+  const recoverable = {
+    publicationMode: async () => 'recoverable' as const,
+    assertStateWriteSupport: async () => undefined,
+    syncFile: async (path: string) => { calls.push(`file:${path}`); },
+    syncDirectory: async (path: string) => { calls.push(`directory:${path}`); },
+    moveFileWriteThrough: async (source: string, destination: string) => {
+      calls.push(`move:${source}->${destination}`);
+      await rename(source, destination);
+    },
+  } as unknown as StateDurabilityAdapter;
+  setStateDurabilityAdapterForTesting(recoverable);
+  try {
+    await saveMetadata(stateDir, metadata);
+  } finally {
+    setStateDurabilityAdapterForTesting(testDurabilityAdapter);
+  }
+  assert.equal(calls.some((call) => call.startsWith('move:')), true);
+  assert.equal(calls.some((call) => call.startsWith('directory:')), false);
+});
+
+test('a recoverable Windows lock publication uses write-through move and never claims directory sync', async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), 'agent-containers-windows-lock-'));
+  const calls: string[] = [];
+  const recoverable = {
+    publicationMode: async () => 'recoverable' as const,
+    assertStateWriteSupport: async () => undefined,
+    syncFile: async () => undefined,
+    syncDirectory: async () => { calls.push('directory'); },
+    moveFileWriteThrough: async (source: string, destination: string) => {
+      calls.push(`move:${source}->${destination}`);
+      await rename(source, destination);
+    },
+  } as unknown as StateDurabilityAdapter;
+
+  await withWorkspaceLock(stateDir, 'safe', async () => undefined, { durabilityAdapter: recoverable });
+  assert.equal(calls.some((call) => call.startsWith('move:')), true);
+  assert.equal(calls.includes('directory'), false);
+});
+
+test('recoverable Windows bootstraps the first manual recovery journal through a write-through staged-file publication without directory sync', async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), 'agent-containers-windows-journal-bootstrap-'));
+  const calls: string[] = [];
+  const recoverable: StateDurabilityAdapter = {
+    publicationMode: async () => 'recoverable',
+    assertStateWriteSupport: async () => undefined,
+    syncFile: async (path) => { calls.push(`file:${path}`); },
+    syncDirectory: async (path) => { calls.push(`directory:${path}`); },
+    moveFileWriteThrough: async (source, destination) => {
+      calls.push(`move:${source}->${destination}`);
+      await rename(source, destination);
+    },
+  };
+  setStateDurabilityAdapterForTesting(recoverable);
+  try {
+    assert.equal(await bootstrapManualRecoveryJournal(stateDir, 'safe'), true);
+  } finally {
+    setStateDurabilityAdapterForTesting(testDurabilityAdapter);
+  }
+
+  const journalPath = join(stateDir, 'locks', 'safe.manual-recovery.journal');
+  const move = calls.find((call) => call.startsWith('move:'));
+  assert.ok(move, 'first journal bootstrap must publish through MoveFileExW write-through');
+  assert.match(move, /\.safe\..+\.manual-recovery\.journal\.tmp->.*safe\.manual-recovery\.journal$/);
+  assert.equal(calls.includes(`file:${journalPath}`), false, 'the final journal path is never directly initialized');
+  assert.equal(calls.some((call) => call.startsWith('directory:')), false, 'recoverable Windows never claims a directory sync');
+  assert.equal((await readFile(journalPath, 'utf8')), '');
+});
+
+test('failed recoverable Windows journal bootstrap blocks the lifecycle action before remote dispatch', async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), 'agent-containers-windows-journal-bootstrap-failure-'));
+  let remoteLifecycleDispatched = false;
+  const recoverable: StateDurabilityAdapter = {
+    publicationMode: async () => 'recoverable',
+    assertStateWriteSupport: async () => undefined,
+    syncFile: async () => undefined,
+    syncDirectory: async () => undefined,
+    moveFileWriteThrough: async (source, destination) => {
+      if (destination.endsWith('.manual-recovery.journal')) throw new Error('write-through publication failed');
+      await rename(source, destination);
+    },
+  };
+  setStateDurabilityAdapterForTesting(recoverable);
+  try {
+    await assert.rejects(
+      () => withWorkspaceLock(stateDir, 'safe', async () => {
+        await bootstrapManualRecoveryJournal(stateDir, 'safe');
+        remoteLifecycleDispatched = true;
+      }),
+      /write-through publication failed/,
+    );
+  } finally {
+    setStateDurabilityAdapterForTesting(testDurabilityAdapter);
+  }
+  assert.equal(remoteLifecycleDispatched, false);
+});
+
+test('manual recovery journal retains an earlier recovery record when its final record is truncated', async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), 'agent-containers-recovery-journal-'));
+  await recordManualRecovery(stateDir, 'safe', { reason: 'operation-may-be-active', containerIds: [], worktree: metadata.worktree });
+  const journalPath = join(stateDir, 'locks', 'safe.manual-recovery.journal');
+  const journal = await readFile(journalPath, 'utf8');
+  assert.match(journal, /"checksum"/);
+  await writeFile(journalPath, `${journal}{"event":"clear"`);
+  assert.equal((await loadManualRecovery(stateDir, 'safe'))?.reason, 'operation-may-be-active');
 });
 
 test('a durable manual recovery blocks lifecycle and stale-PID unlock until an explicit operator acknowledgement', async () => {
@@ -47,12 +167,15 @@ test('withWorkspaceLock serializes same-name lifecycle operations across contend
   const events: string[] = [];
   let releaseFirst!: () => void;
   const firstCanFinish = new Promise<void>((resolveFirst) => { releaseFirst = resolveFirst; });
+  let firstStarted!: () => void;
+  const firstHasStarted = new Promise<void>((resolveFirstStarted) => { firstStarted = resolveFirstStarted; });
   const first = withWorkspaceLock(stateDir, 'safe', async () => {
     events.push('first-start');
+    firstStarted();
     await firstCanFinish;
     events.push('first-end');
   });
-  await new Promise((resolve) => setImmediate(resolve));
+  await firstHasStarted;
   const second = withWorkspaceLock(stateDir, 'safe', async () => { events.push('second'); });
   await new Promise((resolve) => setTimeout(resolve, 35));
   assert.deepEqual(events, ['first-start']);

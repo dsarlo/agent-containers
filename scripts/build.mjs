@@ -1,5 +1,5 @@
 /* global process */
-import { rm } from 'node:fs/promises';
+import { chmod, rm } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import { resolve } from 'node:path';
 
@@ -16,3 +16,4 @@ const code = await new Promise((resolveCode, reject) => {
 });
 
 if (code !== 0) process.exitCode = code ?? 1;
+else await chmod('dist/src/bin/agent-containers.js', 0o755);

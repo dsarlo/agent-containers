@@ -1,5 +1,5 @@
 import { join, resolve } from 'node:path';
-import { initConfig, loadConfig } from './config.js';
+import { assertDevcontainerPathCommittedOnBaseBranch, initConfig, loadConfig } from './config.js';
 import { clearManualRecovery, defaultStateDir, deleteMetadata, listMetadata, loadMetadata, releaseStaleWorkspaceLock, saveMetadata, withWorkspaceLock } from './state.js';
 import { execNamedWorkspaceLifecycle } from './runtime.js';
 import { createWorkspace, findGitRoot, nodeProcessRunner, removeWorkspace } from './workspaces.js';
@@ -23,9 +23,10 @@ export async function runCli(args: string[], cwd = process.cwd(), write: (messag
       case 'validate': {
         ensureOptions(rest, ['--config']);
         const explicitConfig = optionValue(rest, '--config');
-        const root = explicitConfig ? cwd : await findGitRoot(cwd, nodeProcessRunner);
+        const root = await findGitRoot(cwd, nodeProcessRunner);
         const configPath = explicitConfig ?? join(root, '.agent-containers.yml');
-        await loadConfig(resolve(cwd, configPath));
+        const config = await loadConfig(resolve(cwd, configPath));
+        await assertDevcontainerPathCommittedOnBaseBranch(config, root, nodeProcessRunner);
         write(`Configuration is valid: ${resolve(cwd, configPath)}`);
         return 0;
       }
@@ -35,7 +36,12 @@ export async function runCli(args: string[], cwd = process.cwd(), write: (messag
         return withWorkspaceLock(stateDir, name, async (signal) => {
           const root = await findGitRoot(cwd, nodeProcessRunner, signal);
           const config = await loadConfig(join(root, '.agent-containers.yml'));
-          const workspace = await createWorkspace({ cwd, name, config, stateDir, runner: nodeProcessRunner, baseBranch: optionValue(rest.slice(1), '--base'), signal });
+          const baseBranch = optionValue(rest.slice(1), '--base');
+          await assertDevcontainerPathCommittedOnBaseBranch(config, root, nodeProcessRunner);
+          if (baseBranch && baseBranch !== config.workspace.baseBranch) {
+            await assertDevcontainerPathCommittedOnBaseBranch(config, root, nodeProcessRunner, baseBranch);
+          }
+          const workspace = await createWorkspace({ cwd, name, config, stateDir, runner: nodeProcessRunner, baseBranch, signal });
           write(`Created ${workspace.name} at ${workspace.worktree}`);
           return 0;
         });
@@ -75,12 +81,12 @@ export async function runCli(args: string[], cwd = process.cwd(), write: (messag
       }
       case 'remove': {
         const name = requiredPositional(rest, 'workspace name');
-        ensureOnly(rest.slice(1), ['--yes', '--skip-container-cleanup']);
-        if (!rest.includes('--yes')) throw new UsageError('Usage: agent-containers remove <name> --yes [--skip-container-cleanup]');
+        ensureOnly(rest.slice(1), ['--yes', '--skip-container-cleanup', '--force-worktree']);
+        if (!rest.includes('--yes')) throw new UsageError('Usage: agent-containers remove <name> --yes [--skip-container-cleanup] [--force-worktree]');
         await withWorkspaceLock(stateDir, name, async (signal) => {
           const metadata = await loadMetadata(stateDir, name);
           if (!metadata) throw new Error(`No Agent Containers workspace named "${name}".`);
-          await removeWorkspace(metadata, { confirmed: true, skipContainerCleanup: rest.includes('--skip-container-cleanup'), signal }, nodeProcessRunner, (next) => saveMetadata(stateDir, next), () => deleteMetadata(stateDir, name));
+          await removeWorkspace(metadata, { confirmed: true, forceWorktree: rest.includes('--force-worktree'), skipContainerCleanup: rest.includes('--skip-container-cleanup'), signal }, nodeProcessRunner, (next) => saveMetadata(stateDir, next), () => deleteMetadata(stateDir, name));
         });
         write(`Removed ${name}`);
         return 0;

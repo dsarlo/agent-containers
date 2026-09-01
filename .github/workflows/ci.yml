@@ -26,10 +26,120 @@ jobs:
       - run: npm run lint
       - run: npm run typecheck
       - run: npm test
-      - run: npm run build
+      - run: npm run test:native-packaging-contract
+      - run: npm run verify:native-packaging-contract
+
+  native-durability:
+    name: Native durability (${{ matrix.artifact }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            artifact: linux-x64
+            publication_mode: strict
+          - runner: ubuntu-24.04-arm
+            artifact: linux-arm64
+            publication_mode: strict
+          - runner: macos-15-intel
+            artifact: darwin-x64
+            publication_mode: strict
+          - runner: macos-14
+            artifact: darwin-arm64
+            publication_mode: strict
+          - runner: windows-latest
+            artifact: win32-x64
+            publication_mode: recoverable
+          - runner: windows-11-arm
+            artifact: win32-arm64
+            publication_mode: recoverable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20.19.0
+          cache: npm
+      - run: npm ci
+      - run: npm run test:native
+        env:
+          EXPECTED_NATIVE_PUBLICATION_MODE: ${{ matrix.publication_mode }}
+      - run: npm run native:prebuild
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-prebuild-${{ matrix.artifact }}
+          path: prebuilds
+          if-no-files-found: error
+
+  assemble-native-package:
+    name: Assemble cross-platform native package
+    needs: native-durability
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20.19.0
+          cache: npm
+      - run: npm ci
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: native-prebuild-*
+          path: prebuilds
+          merge-multiple: true
+      - run: npm run native:verify-prebuilds
       - run: mkdir .pack && npm pack --pack-destination .pack
-      - run: npm install --prefix .packed-install .pack/*.tgz
-      - run: mkdir .packed-invoke && (cd .packed-invoke && git init -b main && ../.packed-install/node_modules/.bin/ac init && ../.packed-install/node_modules/.bin/agent-containers validate)
+      - run: node scripts/verify-native-package-tarball.mjs .pack/*.tgz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-package
+          path: .pack/*.tgz
+          if-no-files-found: error
+
+  native-package-smoke:
+    name: Native package smoke (${{ matrix.artifact }})
+    needs: assemble-native-package
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            artifact: linux-x64
+            publication_mode: strict
+          - runner: ubuntu-24.04-arm
+            artifact: linux-arm64
+            publication_mode: strict
+          - runner: macos-15-intel
+            artifact: darwin-x64
+            publication_mode: strict
+          - runner: macos-14
+            artifact: darwin-arm64
+            publication_mode: strict
+          - runner: windows-latest
+            artifact: win32-x64
+            publication_mode: recoverable
+          - runner: windows-11-arm
+            artifact: win32-arm64
+            publication_mode: recoverable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20.19.0
+          cache: npm
+      - uses: actions/download-artifact@v4
+        with:
+          name: native-package
+          path: .pack
+      - name: Install assembled package without lifecycle downloads
+        shell: bash
+        run: mkdir .packed-native && npm install --prefix .packed-native .pack/*.tgz
+      - name: Load and smoke-test installed production native adapter
+        run: node scripts/test-native.mjs
+        env:
+          PACKED_NATIVE_PACKAGE_DIR: ${{ github.workspace }}/.packed-native/node_modules/@dsarlo/agent-containers
+          EXPECTED_NATIVE_PUBLICATION_MODE: ${{ matrix.publication_mode }}
 
   live-devcontainer:
     name: Live Dev Containers lifecycle

@@ -12,9 +12,10 @@ Agent Containers gives every coding task an isolated Git worktree and Dev Contai
 ## Prerequisites
 
 - Node.js 20.19 or newer
+- A Node-API build toolchain for source installation: Python 3 and a C++ compiler/toolchain supported by `node-gyp` (for example, Xcode Command Line Tools on macOS or Visual Studio C++ Build Tools on Windows)
 - Git whose `git worktree add -h` lists `--relative-paths` or `--[no-]relative-paths`
 - Docker and the Dev Containers CLI (`npm install -g @devcontainers/cli`) for `exec` and `run`
-- A repository with a simple image-based Dev Container configuration
+- A repository with a simple image-based Dev Container configuration committed on the configured base branch
 
 ## Install from source
 
@@ -22,11 +23,12 @@ Agent Containers gives every coding task an isolated Git worktree and Dev Contai
 git clone https://github.com/dsarlo/agent-containers.git
 cd agent-containers
 npm ci
+npm run build:native
 npm run build
 npm link
 ```
 
-The provided executable names are `agent-containers` and the short alias `ac`.
+The provided executable names are `agent-containers` and the short alias `ac`. `npm link` registers those bins with the Node installation active at link time. In repositories using asdf, Volta, or another version manager, use a Node version satisfying Agent Containers' `>=20.19.0` engine and make it available to the target project's shell before invoking `ac`; otherwise that manager may reject the linked bin before Agent Containers runs.
 
 ## Agent skill
 
@@ -38,7 +40,7 @@ Run these from a Git repository:
 
 ```sh
 ac init
-# Edit .agent-containers.yml if your default branch or Dev Container path differs.
+# Commit the Dev Container configuration on the configured base branch, then edit .agent-containers.yml if needed.
 ac validate
 ac create search-page
 ac run search-page -- npm test
@@ -50,7 +52,7 @@ ac remove search-page --yes
 
 ## Configuration
 
-`ac init` writes a commented `.agent-containers.yml`. All path values are relative to the source repository unless absolute.
+`ac init` writes a commented `.agent-containers.yml`. `workspace.worktreeRoot` resolves from the source Git root. `environment.devcontainerPath` must be a safe repository-relative path because it is verified against, and resolved inside, each worktree.
 
 ```yaml
 # Agent Containers workspace configuration, schema version 1
@@ -65,7 +67,7 @@ commands:
   lint: npm run lint
 ```
 
-The defaults are `version: 1`, `workspace.worktreeRoot: ../.agent-containers-worktrees`, `workspace.baseBranch: main`, and `environment.devcontainerPath: .devcontainer/devcontainer.json`. `commands` is descriptive only; Agent Containers never evaluates these command strings. See the [configuration reference](docs/configuration.md).
+The defaults are `version: 1`, `workspace.worktreeRoot: ../.agent-containers-worktrees`, `workspace.baseBranch: main`, and `environment.devcontainerPath: .devcontainer/devcontainer.json`. `commands` is descriptive only; Agent Containers never evaluates these command strings. `devcontainerPath` is a safe repository-relative **regular file** (symlinks are rejected): it resolves within each worktree, and both `validate` and `create` require it to be tracked on `baseBranch`. When `create --base <branch>` is used, the same file must also be tracked on that effective local base before any worktree side effect. An untracked configuration in the source checkout does not appear in a new worktree. `.agent-containers.yml` itself is read from the primary Git root and may remain untracked. If you place a copied `devcontainer.json` in a deeper directory, remember that `build.context` and `build.dockerfile` resolve independently relative to that config; for example use `"build": { "context": "..", "dockerfile": "../Dockerfile" }` when appropriate. See the [configuration reference](docs/configuration.md).
 
 ## Lifecycle commands
 
@@ -78,17 +80,17 @@ agent-containers run <name> -- <agent command...>
 agent-containers recover <name> --yes --remote-command-stopped
 agent-containers unlock <name> --yes
 agent-containers status [name]
-agent-containers remove <name> --yes [--skip-container-cleanup]
+agent-containers remove <name> --yes [--force-worktree] [--skip-container-cleanup]
 ```
 
 - `init --force` atomically replaces only the configuration path; it refuses symlinks and cannot overwrite a hard-link peer.
-- `exec` and `run` persist and fsync an operation-may-be-active guard **before** dispatching Dev Containers. They pass each argument directly to Dev Containers without host-shell interpolation and inherit the invoking terminal for interactive tools. The guard is cleared only after a confirmed successful remote command; a state-write failure refuses dispatch or retains the guard. Ctrl-C/SIGTERM is forwarded to the **local** Dev Containers CLI, but that cannot prove an in-container command stopped. After the local CLI is reaped, Agent Containers promotes/retains the durable manual-recovery block and refuses `create`, `exec`, `run`, and `remove` for that workspace.
+- `exec` and `run` are explicit aliases: each starts or reuses the workspace's Dev Container and executes the provided argument vector. They persist a native-durability-synced operation-may-be-active guard **before** dispatching Dev Containers, pass each argument directly without host-shell interpolation, and retain the worktree-common-dir mount protocol for Git worktrees. They inherit the invoking terminal for interactive tools. During a cold `up`, compact structured Dev Containers stage/progress messages stream to stderr while the terminal JSON record remains captured for validation; failed builds lead with the final meaningful BuildKit/Dev Container error instead of replaying an entire JSON transcript. The guard is cleared only after a confirmed successful remote command; a state-write failure refuses dispatch or retains the guard. Ctrl-C/SIGTERM is forwarded to the **local** Dev Containers CLI, but that cannot prove an in-container command stopped. On POSIX hosts Agent Containers terminates the local child process group; on Windows it invokes shell-free `taskkill /T /F` for the local CLI process tree, falls back once to the managed root if that utility errors or fails, and normally waits for the managed child to close. If Windows reaping still cannot finish within its bounded deadline, it reports an error while retaining the manual-recovery block; it never claims descendants stopped. After the local CLI is reaped—or a bounded recovery error is reported—Agent Containers promotes/retains the durable manual-recovery block and refuses `create`, `exec`, `run`, and `remove` for that workspace.
 - `recover <name> --yes --remote-command-stopped` is an explicit operator acknowledgement, not remote cleanup: first inspect the container (and its logs/processes) yourself and stop or wait for the in-container command as appropriate; then use this command to clear the block. It neither stops nor removes a container. `unlock` never clears manual recovery, even after the original PID has died.
-- If `devcontainer up` is interrupted, exits nonzero, throws, or lacks a trustworthy terminal container ID, Agent Containers runs `docker ps --all --quiet --filter label=devcontainer.local_folder=<recorded-worktree>` and independently verifies each candidate's exact label. It records one exact match as the workspace container, but **every** untrustworthy-start result—including zero matches, multiple candidates, or Docker inspection failure—blocks for manual recovery because provisioning may still continue. It never deletes a discovered resource.
+- If `devcontainer up` is interrupted, exits nonzero, throws, or lacks a trustworthy terminal container ID, Agent Containers performs three short bounded `docker ps --all --quiet --filter label=devcontainer.local_folder=<recorded-worktree>` probes and independently verifies each candidate's exact label. It records one exact match as the workspace container, but **every** untrustworthy-start result—including zero matches, multiple candidates, or Docker inspection failure—blocks for manual recovery because provisioning may still continue. It never deletes a discovered resource.
 - `status` reads local metadata and works without Docker or Dev Containers.
-- Lifecycle-lock publication fsyncs the owner record and staging directory before its atomic rename, then fsyncs the lock directory. When a state root, `locks`, or `workspaces` directory is first created, Agent Containers creates each missing component progressively and fsyncs both the new directory and its parent before any Git, Docker, or Dev Containers side effect. Lock, recovery-marker, and metadata removals are followed by a parent-directory fsync so a completed lifecycle does not rely on an unpersisted directory entry. This crash-durability contract requires POSIX directory fsync; Agent Containers refuses state-creating lifecycle operations on Windows rather than claiming equivalent durability.
+- Lifecycle-lock publication synchronizes the owner record and staging directory before its atomic rename, then synchronizes the lock directory where the platform supports it. The packaged N-API adapter ships prebuilds for Linux, macOS, and Windows on both x64 and ARM64; it fails closed before lifecycle side effects if its exact OS/architecture binary is absent or malformed. Linux uses `fsync`; macOS uses `F_FULLFSYNC` for regular recovery-journal records and reports directory synchronization independently, without claiming identical full-media directory semantics. Windows uses `FlushFileBuffers` for regular files and `MoveFileExW(MOVEFILE_WRITE_THROUGH)` for recoverable metadata publication; Windows does **not** claim a per-directory fsync. Instead, it uses a checksummed append-only per-workspace manual-recovery journal: after a crash it selects an old valid or new valid recovery state, never treats a truncated final entry as a cleared guard, and fails closed on middle corruption. Existing workspaces bootstrap that journal durably and require one retry before their first remote lifecycle dispatch. When a state root, `locks`, or `workspaces` directory is first created, Agent Containers creates each missing component progressively and synchronizes new/parent directory boundaries on strict platforms before Git, Docker, or Dev Containers side effects.
 - `unlock <name> --yes` releases only a normal lock whose complete, valid owner record names a local PID that has exited. It refuses active locks. It also deliberately preserves a malformed published lock: its owner identity cannot be reconstructed safely, so `unlock` cannot prove it abandoned. After independently verifying no Agent Containers process can still own the workspace, repair it manually by removing `<state-dir>/locks/<name>.lock` (where `<state-dir>` is `$XDG_STATE_HOME/agent-containers` or `~/.local/state/agent-containers`), then retry the original lifecycle operation. Never delete a malformed lock merely because it is old.
-- `remove` requires `--yes`, verifies recorded resource identity and ownership, and checkpoints completed cleanup stages for safe retries.
+- `remove` requires `--yes`, verifies recorded resource identity and ownership, and checkpoints completed cleanup stages for safe retries. It refuses to discard a dirty worktree by default. After preserving desired changes, add the separate `--force-worktree` acknowledgement when you intentionally want Git to delete modified or untracked workspace files; it does not bypass container ownership checks or the unmerged-branch protection.
 
 ## v0.1 limitations and recovery
 

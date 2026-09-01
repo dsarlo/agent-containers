@@ -19,11 +19,68 @@ test('removeWorkspace requires confirmation and records every safe destructive c
     { command: 'git', args: ['rev-parse', '--verify', 'refs/heads/agent-containers/safe'], cwd: '/repo' },
     { command: 'git', args: ['rev-parse', '--verify', 'refs/heads/main'], cwd: '/repo' },
     { command: 'git', args: ['merge-base', '--is-ancestor', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'], cwd: '/repo' },
+    { command: 'git', args: ['status', '--porcelain=v1', '--untracked-files=all'], cwd: '/repo/worktrees/safe' },
     { command: 'docker', args: ['inspect', '--format', '{{ index .Config.Labels "devcontainer.local_folder" }}', 'abc'] },
     { command: 'docker', args: ['rm', '-f', 'abc'] },
     { command: 'git', args: ['worktree', 'remove', '/repo/worktrees/safe'], cwd: '/repo' },
     { command: 'git', args: ['update-ref', '--stdin'], cwd: '/repo', input: 'start\nverify refs/heads/main aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\ndelete refs/heads/agent-containers/safe aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nprepare\ncommit\n' },
   ]);
+});
+
+test('removeWorkspace passes --force only for the verified recorded worktree after confirmation', async () => {
+  const calls: string[][] = [];
+  const runner = {
+    async run(_command: string, args: string[]) {
+      calls.push(args);
+      if (args[0] === 'worktree' && args[1] === 'list') return { code: 0, stdout: 'worktree /repo/worktrees/safe\nbranch refs/heads/agent-containers/safe\n', stderr: '' };
+      if (args[0] === 'show-ref') return { code: 0, stdout: '', stderr: '' };
+      if (args[0] === 'rev-parse') return { code: 0, stdout: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n', stderr: '' };
+      return { code: 0, stdout: '', stderr: '' };
+    },
+  };
+
+  await removeWorkspace({ ...metadata, cleanup: { container: true } }, { confirmed: true, forceWorktree: true }, runner, async () => undefined, async () => undefined);
+
+  assert.deepEqual(calls.find((args) => args[0] === 'worktree' && args[1] === 'remove'), ['worktree', 'remove', '--force', '/repo/worktrees/safe']);
+});
+
+test('removeWorkspace refuses a dirty worktree before deleting its owned container', async () => {
+  const calls: string[][] = [];
+  const runner = {
+    async run(_command: string, args: string[]) {
+      calls.push(args);
+      if (args[0] === 'worktree' && args[1] === 'list') return { code: 0, stdout: 'worktree /repo/worktrees/safe\nbranch refs/heads/agent-containers/safe\n', stderr: '' };
+      if (args[0] === 'show-ref') return { code: 0, stdout: '', stderr: '' };
+      if (args[0] === 'rev-parse') return { code: 0, stdout: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n', stderr: '' };
+      if (args[0] === 'status') return { code: 0, stdout: '?? important-output.txt\n', stderr: '' };
+      if (args[0] === 'inspect') return { code: 0, stdout: '/repo/worktrees/safe\n', stderr: '' };
+      return { code: 0, stdout: '', stderr: '' };
+    },
+  };
+
+  await assert.rejects(
+    () => removeWorkspace(metadata, { confirmed: true }, runner, async () => undefined, async () => undefined),
+    /ac remove safe --yes --force-worktree/,
+  );
+  assert.equal(calls.some((args) => args[0] === 'rm'), false, 'dirty-worktree refusal must not destroy its owned container first');
+  assert.equal(calls.some((args) => args[0] === 'worktree' && args[1] === 'remove'), false);
+});
+
+test('removeWorkspace names the opt-in remediation when Git refuses a dirty worktree', async () => {
+  const runner = {
+    async run(_command: string, args: string[]) {
+      if (args[0] === 'worktree' && args[1] === 'list') return { code: 0, stdout: 'worktree /repo/worktrees/safe\nbranch refs/heads/agent-containers/safe\n', stderr: '' };
+      if (args[0] === 'show-ref') return { code: 0, stdout: '', stderr: '' };
+      if (args[0] === 'rev-parse') return { code: 0, stdout: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n', stderr: '' };
+      if (args[0] === 'worktree' && args[1] === 'remove') return { code: 128, stdout: '', stderr: 'contains modified or untracked files, use --force to delete it' };
+      return { code: 0, stdout: '', stderr: '' };
+    },
+  };
+
+  await assert.rejects(
+    () => removeWorkspace({ ...metadata, cleanup: { container: true } }, { confirmed: true }, runner, async () => undefined, async () => undefined),
+    /ac remove safe --yes --force-worktree/,
+  );
 });
 
 test('removeWorkspace fails closed for mismatched Git or container metadata and retains state', async () => {

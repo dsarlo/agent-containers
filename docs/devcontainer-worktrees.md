@@ -1,6 +1,6 @@
 # Dev Container worktrees
 
-Agent Containers uses `git worktree add --relative-paths` and passes `--mount-git-worktree-common-dir` to `devcontainer up` so Git inside a linked worktree can reach the shared Git directory.
+Agent Containers uses `git worktree add --relative-paths` and passes `--mount-git-worktree-common-dir` to both `devcontainer up` **and** `devcontainer exec`, so Git inside a linked worktree reaches the same shared Git directory and the container's configured working directory stays consistent across cold and warm execution.
 
 ## Prerequisites
 

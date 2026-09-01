@@ -1,8 +1,9 @@
 import { lstat, mkdir, open, readdir, readFile, rename, rm, type FileHandle } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, createHash } from 'node:crypto';
 import { isValidWorkspaceName, validateWorkspaceName } from './names.js';
+import { getProductionStateDurabilityAdapter, type StateDurabilityAdapter } from './durability.js';
 
 export interface WorkspaceMetadata {
   version: 1;
@@ -47,6 +48,17 @@ export interface ManualRecoveryInput {
   worktree: string;
 }
 
+let testDurabilityAdapter: StateDurabilityAdapter | undefined;
+
+/** Test-only injection point so state behavior can be exercised without a compiled host addon. */
+export function setStateDurabilityAdapterForTesting(adapter: StateDurabilityAdapter | undefined): void {
+  testDurabilityAdapter = adapter;
+}
+
+function stateDurability(adapter?: StateDurabilityAdapter): StateDurabilityAdapter {
+  return adapter ?? testDurabilityAdapter ?? getProductionStateDurabilityAdapter();
+}
+
 export function defaultStateDir(environment: NodeJS.ProcessEnv = process.env): string {
   return join(environment.XDG_STATE_HOME || join(homedir(), '.local', 'state'), 'agent-containers');
 }
@@ -55,32 +67,111 @@ export function metadataPath(stateDir: string, name: string): string {
   return join(stateDir, 'workspaces', `${validateWorkspaceName(name)}.json`);
 }
 
-function manualRecoveryPath(stateDir: string, name: string): string {
+function legacyManualRecoveryPath(stateDir: string, name: string): string {
   return join(stateDir, 'locks', `${validateWorkspaceName(name)}.manual-recovery.json`);
 }
 
-/** Persist a recovery barrier before a lifecycle can release after remote completion is unknown. */
+function manualRecoveryJournalPath(stateDir: string, name: string): string {
+  return join(stateDir, 'locks', `${validateWorkspaceName(name)}.manual-recovery.journal`);
+}
+
+type ManualRecoveryJournalEvent = { event: 'set'; recovery: ManualRecovery } | { event: 'clear' };
+type CheckedManualRecoveryJournalEvent = ManualRecoveryJournalEvent & { checksum: string };
+
+/**
+ * Safely establish the append-only recovery journal. Existing workspaces must
+ * retry after this one-time durable initialization, so remote work never starts
+ * immediately after the journal itself was first published.
+ */
+export async function bootstrapManualRecoveryJournal(stateDir: string, name: string): Promise<boolean> {
+  const lockName = validateWorkspaceName(name);
+  const directory = join(stateDir, 'locks');
+  const path = manualRecoveryJournalPath(stateDir, lockName);
+  const durability = stateDurability();
+  await durability.assertStateWriteSupport();
+  await ensureDurableDirectory(directory, durability);
+  try {
+    await lstat(path);
+    return false;
+  } catch (error: unknown) {
+    if (!isNodeError(error, 'ENOENT')) throw error;
+  }
+  const legacy = await loadLegacyManualRecovery(stateDir, lockName);
+  if (await durability.publicationMode() === 'recoverable') {
+    const stagingPath = join(directory, `.${lockName}.${randomUUID()}.manual-recovery.journal.tmp`);
+    let stagingFile: FileHandle | undefined;
+    try {
+      stagingFile = await open(stagingPath, 'wx', 0o600);
+      await stagingFile.close();
+      stagingFile = undefined;
+      await durability.syncFile(stagingPath);
+      // Windows cannot flush directories. MoveFileExW with REPLACE_EXISTING and
+      // WRITE_THROUGH is its atomic, durable old-valid-or-new-valid boundary.
+      await durability.moveFileWriteThrough(stagingPath, path);
+    } catch (error: unknown) {
+      await stagingFile?.close();
+      await rm(stagingPath, { force: true });
+      throw error;
+    }
+  } else {
+    let file: FileHandle | undefined;
+    try {
+      file = await open(path, 'wx', 0o600);
+      await file.close();
+      file = undefined;
+      await durability.syncFile(path);
+      await syncDirectory(directory, durability);
+    } catch (error: unknown) {
+      await file?.close();
+      if (isNodeError(error, 'EEXIST')) return false;
+      throw error;
+    }
+  }
+  // Previous releases had a replacement marker. Preserve it as a durable set
+  // event so upgrade can never silently release an old manual-recovery block.
+  if (legacy) await appendManualRecoveryJournalEvent(path, { event: 'set', recovery: legacy }, durability);
+  return true;
+}
+
+/** Persist an append-only, checksummed recovery barrier before remote lifecycle work. */
 export async function recordManualRecovery(stateDir: string, name: string, input: ManualRecoveryInput): Promise<void> {
   const recovery: ManualRecovery = { version: 1, ...input, createdAt: new Date().toISOString() };
   if (!isManualRecovery(recovery)) throw new Error('Refusing to save invalid manual recovery state.');
-  const path = manualRecoveryPath(stateDir, name);
-  const directory = join(stateDir, 'locks');
-  await ensureDurableDirectory(directory);
-  const temporaryPath = join(directory, `.${validateWorkspaceName(name)}.${randomUUID()}.manual-recovery.tmp`);
-  await durableReplace(temporaryPath, path, directory, `${JSON.stringify(recovery, null, 2)}\n`);
+  const durability = stateDurability();
+  await durability.assertStateWriteSupport();
+  await bootstrapManualRecoveryJournal(stateDir, name);
+  await appendManualRecoveryJournalEvent(manualRecoveryJournalPath(stateDir, name), { event: 'set', recovery }, durability);
 }
 
-async function durableReplace(temporaryPath: string, path: string, directory: string, content: string): Promise<void> {
+async function appendManualRecoveryJournalEvent(path: string, event: ManualRecoveryJournalEvent, durability: StateDurabilityAdapter): Promise<void> {
+  const entry: CheckedManualRecoveryJournalEvent = { ...event, checksum: journalChecksum(event) };
+  let file: FileHandle | undefined;
+  try {
+    file = await open(path, 'a', 0o600);
+    await file.writeFile(`${JSON.stringify(entry)}\n`, 'utf8');
+    await file.close();
+    file = undefined;
+    // The regular-file flush is the durable recovery guard on macOS and the
+    // Windows old-valid-or-new-valid publication protocol.
+    await durability.syncFile(path);
+  } catch (error: unknown) {
+    await file?.close();
+    throw error;
+  }
+}
+
+async function durableReplace(temporaryPath: string, path: string, directory: string, content: string, durability: StateDurabilityAdapter): Promise<void> {
   let file: FileHandle | undefined;
   try {
     file = await open(temporaryPath, 'wx', 0o600);
     await file.writeFile(content, 'utf8');
-    await file.sync();
     await file.close();
     file = undefined;
-    await rename(temporaryPath, path);
-    await syncDirectory(directory);
-  } catch (error) {
+    await durability.syncFile(temporaryPath);
+    if (await durability.publicationMode() === 'recoverable') await durability.moveFileWriteThrough(temporaryPath, path);
+    else await rename(temporaryPath, path);
+    await syncDirectory(directory, durability);
+  } catch (error: unknown) {
     await file?.close();
     await rm(temporaryPath, { force: true });
     throw error;
@@ -88,8 +179,18 @@ async function durableReplace(temporaryPath: string, path: string, directory: st
 }
 
 export async function loadManualRecovery(stateDir: string, name: string): Promise<ManualRecovery | undefined> {
+  const journalPath = manualRecoveryJournalPath(stateDir, name);
   try {
-    const recovery: unknown = JSON.parse(await readFile(manualRecoveryPath(stateDir, name), 'utf8'));
+    return parseManualRecoveryJournal(await readFile(journalPath, 'utf8'), name);
+  } catch (error: unknown) {
+    if (!isNodeError(error, 'ENOENT')) throw error;
+    return loadLegacyManualRecovery(stateDir, name);
+  }
+}
+
+async function loadLegacyManualRecovery(stateDir: string, name: string): Promise<ManualRecovery | undefined> {
+  try {
+    const recovery: unknown = JSON.parse(await readFile(legacyManualRecoveryPath(stateDir, name), 'utf8'));
     if (!isManualRecovery(recovery)) throw new Error(`Manual recovery state for ${name} is invalid; refusing to release lifecycle protection.`);
     return recovery;
   } catch (error: unknown) {
@@ -98,11 +199,39 @@ export async function loadManualRecovery(stateDir: string, name: string): Promis
   }
 }
 
+function parseManualRecoveryJournal(source: string, name: string): ManualRecovery | undefined {
+  const lines = source.split('\n');
+  const hasPartialTail = source.length > 0 && !source.endsWith('\n');
+  if (hasPartialTail) lines.pop();
+  let recovery: ManualRecovery | undefined;
+  for (const line of lines) {
+    if (!line) continue;
+    let entry: unknown;
+    try { entry = JSON.parse(line); } catch { throw new Error(`Manual recovery journal for ${name} is corrupt before its final record; refusing to release lifecycle protection.`); }
+    if (!isCheckedManualRecoveryJournalEvent(entry)) throw new Error(`Manual recovery journal for ${name} is corrupt before its final record; refusing to release lifecycle protection.`);
+    if (entry.event === 'set') recovery = entry.recovery;
+    else recovery = undefined;
+  }
+  return recovery;
+}
+
+function isCheckedManualRecoveryJournalEvent(value: unknown): value is CheckedManualRecoveryJournalEvent {
+  if (typeof value !== 'object' || value === null || !('event' in value) || !('checksum' in value) || typeof value.checksum !== 'string') return false;
+  if (value.event === 'clear') return value.checksum === journalChecksum({ event: 'clear' });
+  return value.event === 'set' && 'recovery' in value && isManualRecovery(value.recovery) && value.checksum === journalChecksum({ event: 'set', recovery: value.recovery });
+}
+
+function journalChecksum(event: ManualRecoveryJournalEvent): string {
+  return createHash('sha256').update(JSON.stringify(event)).digest('hex');
+}
+
 /** This is deliberately separate from `unlock`: it records an operator's explicit remote-state acknowledgement. */
 export async function clearManualRecovery(stateDir: string, name: string): Promise<void> {
-  const recovery = await loadManualRecovery(stateDir, name);
-  if (!recovery) throw new Error(`No manual recovery block exists for workspace "${name}".`);
-  await durableRemove(manualRecoveryPath(stateDir, name), join(stateDir, 'locks'), false);
+  if (!await loadManualRecovery(stateDir, name)) throw new Error(`No manual recovery block exists for workspace "${name}".`);
+  const durability = stateDurability();
+  await durability.assertStateWriteSupport();
+  await bootstrapManualRecoveryJournal(stateDir, name);
+  await appendManualRecoveryJournalEvent(manualRecoveryJournalPath(stateDir, name), { event: 'clear' }, durability);
 }
 
 export async function loadMetadata(stateDir: string, name: string): Promise<WorkspaceMetadata | undefined> {
@@ -123,13 +252,17 @@ export async function saveMetadata(stateDir: string, metadata: WorkspaceMetadata
   if (!isAgentContainersWorkspace(metadata)) throw new Error('Refusing to save invalid Agent Containers workspace metadata.');
   const path = metadataPath(stateDir, metadata.name);
   const directory = join(stateDir, 'workspaces');
-  await ensureDurableDirectory(directory);
+  const durability = stateDurability();
+  await durability.assertStateWriteSupport();
+  await ensureDurableDirectory(directory, durability);
   const temporaryPath = join(directory, `.${metadata.name}.${randomUUID()}.tmp`);
-  await durableReplace(temporaryPath, path, directory, `${JSON.stringify(metadata, null, 2)}\n`);
+  await durableReplace(temporaryPath, path, directory, `${JSON.stringify(metadata, null, 2)}\n`, durability);
 }
 
 export async function deleteMetadata(stateDir: string, name: string): Promise<void> {
-  await durableRemove(metadataPath(stateDir, name), join(stateDir, 'workspaces'), true);
+  const durability = stateDurability();
+  await durability.assertStateWriteSupport();
+  await durableRemove(metadataPath(stateDir, name), join(stateDir, 'workspaces'), true, durability);
 }
 
 export async function listMetadata(stateDir: string): Promise<WorkspaceMetadata[]> {
@@ -194,6 +327,8 @@ export interface WorkspaceLockOptions {
   onLockPublication?: (step: LockPublicationStep) => void | Promise<void>;
   /** Test seam for progressively durable state-directory creation. */
   onStateDirectoryDurability?: (step: StateDirectoryDurabilityStep) => void | Promise<void>;
+  /** Explicit adapter injection for tests and embedders that provide equivalent native durability. */
+  durabilityAdapter?: StateDurabilityAdapter;
 }
 
 export type LockPublicationStep = 'owner-file-synced' | 'staging-directory-synced' | 'published' | 'locks-directory-synced';
@@ -203,23 +338,25 @@ export interface StateDirectoryDurabilityStep {
 }
 
 export async function withWorkspaceLock<T>(stateDir: string, name: string, action: (signal: AbortSignal) => Promise<T>, options: number | WorkspaceLockOptions = 30_000): Promise<T> {
-  const { timeoutMs, abortSignal, allowManualRecovery, onLockPublication, onStateDirectoryDurability } = typeof options === 'number'
-    ? { timeoutMs: options, abortSignal: undefined, allowManualRecovery: false, onLockPublication: undefined, onStateDirectoryDurability: undefined }
-    : { timeoutMs: options.timeoutMs ?? 30_000, abortSignal: options.abortSignal, allowManualRecovery: options.allowManualRecovery ?? false, onLockPublication: options.onLockPublication, onStateDirectoryDurability: options.onStateDirectoryDurability };
+  const { timeoutMs, abortSignal, allowManualRecovery, onLockPublication, onStateDirectoryDurability, durabilityAdapter } = typeof options === 'number'
+    ? { timeoutMs: options, abortSignal: undefined, allowManualRecovery: false, onLockPublication: undefined, onStateDirectoryDurability: undefined, durabilityAdapter: undefined }
+    : { timeoutMs: options.timeoutMs ?? 30_000, abortSignal: options.abortSignal, allowManualRecovery: options.allowManualRecovery ?? false, onLockPublication: options.onLockPublication, onStateDirectoryDurability: options.onStateDirectoryDurability, durabilityAdapter: options.durabilityAdapter };
+  const durability = stateDurability(durabilityAdapter);
+  await durability.assertStateWriteSupport();
   const lockName = validateWorkspaceName(name);
   const locksDir = join(stateDir, 'locks');
   const lockPath = join(locksDir, `${lockName}.lock`);
   const recoveryPath = join(locksDir, `${lockName}.recovery`);
-  await ensureDurableDirectory(locksDir, onStateDirectoryDurability);
+  await ensureDurableDirectory(locksDir, durability, onStateDirectoryDurability);
   const deadline = Date.now() + timeoutMs;
   while (true) {
-    await waitForRecoveryToFinish(recoveryPath, deadline, name);
-    if (await acquireOwnedDirectory(lockPath, locksDir, lockName, deadline, name, onLockPublication)) break;
+    await waitForRecoveryToFinish(recoveryPath, deadline, name, durability);
+    if (await acquireOwnedDirectory(lockPath, locksDir, lockName, deadline, name, durability, onLockPublication)) break;
   }
   try {
     if (!allowManualRecovery && await loadManualRecovery(stateDir, lockName)) throw manualRecoveryError(name);
   } catch (error) {
-    await durableRemove(lockPath, locksDir, true);
+    await durableRemove(lockPath, locksDir, true, durability);
     throw error;
   }
   const cancellation = new AbortController();
@@ -243,20 +380,22 @@ export async function withWorkspaceLock<T>(stateDir: string, name: string, actio
     process.off('SIGINT', onInterrupt);
     process.off('SIGTERM', onTerminate);
     abortSignal?.removeEventListener('abort', cancel);
-    await durableRemove(lockPath, locksDir, true);
+    await durableRemove(lockPath, locksDir, true, durability);
     if (receivedSignal) process.kill(process.pid, receivedSignal);
   }
 }
 
 /** Release only a lock whose recorded local owner PID is proven no longer alive. */
 export async function releaseStaleWorkspaceLock(stateDir: string, name: string, isPidAlive: (pid: number) => boolean = localPidIsAlive, hooks: StaleLockRecoveryHooks = {}, timeoutMs = 30_000): Promise<void> {
+  const durability = stateDurability();
+  await durability.assertStateWriteSupport();
   const lockName = validateWorkspaceName(name);
   const locksDir = join(stateDir, 'locks');
   const lockPath = join(locksDir, `${lockName}.lock`);
   const recoveryPath = join(locksDir, `${lockName}.recovery`);
-  await ensureDurableDirectory(locksDir);
+  await ensureDurableDirectory(locksDir, durability);
   if (await loadManualRecovery(stateDir, lockName)) throw manualRecoveryError(name);
-  await acquireRecoveryLock(recoveryPath, locksDir, lockName, Date.now() + timeoutMs, name, isPidAlive);
+  await acquireRecoveryLock(recoveryPath, locksDir, lockName, Date.now() + timeoutMs, name, isPidAlive, durability);
   try {
     let owner: unknown;
     try {
@@ -271,14 +410,14 @@ export async function releaseStaleWorkspaceLock(stateDir: string, name: string, 
     if (isPidAlive(owner.pid)) throw new Error(`Lifecycle lock for workspace "${name}" is owned by active PID ${owner.pid}; refusing to interrupt it.`);
     await hooks.beforeRemoval?.();
     const reclaimedPath = join(locksDir, `.${lockName}.${owner.token}.reclaimed`);
-    await durableRename(lockPath, reclaimedPath, locksDir);
-    await durableRemove(reclaimedPath, locksDir, false);
+    await durableRename(lockPath, reclaimedPath, locksDir, durability);
+    await durableRemove(reclaimedPath, locksDir, false, durability);
   } finally {
-    await durableRemove(recoveryPath, locksDir, true);
+    await durableRemove(recoveryPath, locksDir, true, durability);
   }
 }
 
-async function waitForRecoveryToFinish(recoveryPath: string, deadline: number, name: string): Promise<void> {
+async function waitForRecoveryToFinish(recoveryPath: string, deadline: number, name: string, durability: StateDurabilityAdapter): Promise<void> {
   while (true) {
     try {
       await lstat(recoveryPath);
@@ -290,8 +429,8 @@ async function waitForRecoveryToFinish(recoveryPath: string, deadline: number, n
     if (owner && !localPidIsAlive(owner.pid)) {
       const abandonedPath = `${recoveryPath}.${owner.token}.abandoned`;
       try {
-        await durableRename(recoveryPath, abandonedPath, dirname(recoveryPath));
-        await durableRemove(abandonedPath, dirname(recoveryPath), false);
+        await durableRename(recoveryPath, abandonedPath, dirname(recoveryPath), durability);
+        await durableRemove(abandonedPath, dirname(recoveryPath), false, durability);
         return;
       } catch (error: unknown) {
         if (!isNodeError(error, 'ENOENT')) throw error;
@@ -303,43 +442,45 @@ async function waitForRecoveryToFinish(recoveryPath: string, deadline: number, n
   }
 }
 
-async function acquireRecoveryLock(recoveryPath: string, locksDir: string, lockName: string, deadline: number, name: string, isPidAlive: (pid: number) => boolean): Promise<void> {
+async function acquireRecoveryLock(recoveryPath: string, locksDir: string, lockName: string, deadline: number, name: string, isPidAlive: (pid: number) => boolean, durability: StateDurabilityAdapter): Promise<void> {
   while (true) {
-    await reclaimDeadPublishedLock(recoveryPath, isPidAlive);
-    if (await acquireOwnedDirectory(recoveryPath, locksDir, `${lockName}.recovery`, deadline, name)) return;
+    await reclaimDeadPublishedLock(recoveryPath, isPidAlive, durability);
+    if (await acquireOwnedDirectory(recoveryPath, locksDir, `${lockName}.recovery`, deadline, name, durability)) return;
   }
 }
 
-async function reclaimDeadPublishedLock(path: string, isPidAlive: (pid: number) => boolean): Promise<void> {
+async function reclaimDeadPublishedLock(path: string, isPidAlive: (pid: number) => boolean, durability: StateDurabilityAdapter): Promise<void> {
   const owner = await readLockOwner(path);
   if (!owner || isPidAlive(owner.pid)) return;
   const abandonedPath = `${path}.${owner.token}.abandoned`;
   try {
-    await durableRename(path, abandonedPath, dirname(path));
-    await durableRemove(abandonedPath, dirname(path), false);
+    await durableRename(path, abandonedPath, dirname(path), durability);
+    await durableRemove(abandonedPath, dirname(path), false, durability);
   } catch (error: unknown) {
     if (!isNodeError(error, 'ENOENT')) throw error;
   }
 }
 
 /** Build owner metadata off-path, then atomically publish the directory. */
-async function acquireOwnedDirectory(path: string, locksDir: string, temporaryStem: string, deadline: number, name: string, onLockPublication?: (step: LockPublicationStep) => void | Promise<void>): Promise<boolean> {
+async function acquireOwnedDirectory(path: string, locksDir: string, temporaryStem: string, deadline: number, name: string, durability: StateDurabilityAdapter, onLockPublication?: (step: LockPublicationStep) => void | Promise<void>): Promise<boolean> {
   const temporaryPath = join(locksDir, `.${temporaryStem}.${randomUUID()}.pending`);
   let ownerFile: FileHandle | undefined;
   try {
     await mkdir(temporaryPath, { recursive: false, mode: 0o700 });
     const owner: LockOwner = { pid: process.pid, token: randomUUID(), createdAt: new Date().toISOString() };
-    ownerFile = await open(join(temporaryPath, 'owner.json'), 'wx', 0o600);
+    const ownerPath = join(temporaryPath, 'owner.json');
+    ownerFile = await open(ownerPath, 'wx', 0o600);
     await ownerFile.writeFile(`${JSON.stringify(owner)}\n`, 'utf8');
-    await ownerFile.sync();
     await ownerFile.close();
     ownerFile = undefined;
+    await durability.syncFile(ownerPath);
     await onLockPublication?.('owner-file-synced');
-    await syncDirectory(temporaryPath);
+    await syncDirectory(temporaryPath, durability);
     await onLockPublication?.('staging-directory-synced');
-    await rename(temporaryPath, path);
+    if (await durability.publicationMode() === 'recoverable') await durability.moveFileWriteThrough(temporaryPath, path);
+    else await rename(temporaryPath, path);
     await onLockPublication?.('published');
-    await syncDirectory(locksDir);
+    await syncDirectory(locksDir, durability);
     await onLockPublication?.('locks-directory-synced');
     return true;
   } catch (error: unknown) {
@@ -352,8 +493,7 @@ async function acquireOwnedDirectory(path: string, locksDir: string, temporarySt
   }
 }
 
-async function ensureDurableDirectory(directory: string, onDurabilityStep?: (step: StateDirectoryDurabilityStep) => void | Promise<void>): Promise<void> {
-  assertDirectoryFsyncSupported();
+async function ensureDurableDirectory(directory: string, durability: StateDurabilityAdapter, onDurabilityStep?: (step: StateDirectoryDurabilityStep) => void | Promise<void>): Promise<void> {
   const missing: string[] = [];
   let current = resolve(directory);
   while (true) {
@@ -383,36 +523,29 @@ async function ensureDurableDirectory(directory: string, onDurabilityStep?: (ste
       if (!entry.isDirectory()) throw new Error(`State directory path is not a directory: ${createdDirectory}`, { cause: error });
     }
     if (created) await onDurabilityStep?.({ kind: 'created', path: createdDirectory });
-    await syncDirectory(createdDirectory);
+    await syncDirectory(createdDirectory, durability);
     await onDurabilityStep?.({ kind: 'directory-synced', path: createdDirectory });
-    await syncDirectory(parent);
+    await syncDirectory(parent, durability);
     await onDurabilityStep?.({ kind: 'parent-directory-synced', path: parent });
   }
 }
 
-function assertDirectoryFsyncSupported(): void {
-  if (process.platform === 'win32') {
-    throw new Error('Agent Containers cannot safely create durable state directories on Windows because directory fsync is unavailable.');
-  }
+async function syncDirectory(directory: string, durability: StateDurabilityAdapter): Promise<void> {
+  // The native adapter makes this a no-op only for recoverable Windows mode;
+  // avoid calling it at all so callers cannot mistake it for a directory flush.
+  if (await durability.publicationMode() === 'recoverable') return;
+  await durability.syncDirectory(directory);
 }
 
-async function syncDirectory(directory: string): Promise<void> {
-  const handle = await open(directory, 'r');
-  try {
-    await handle.sync();
-  } finally {
-    await handle.close();
-  }
+async function durableRename(source: string, destination: string, directory: string, durability: StateDurabilityAdapter): Promise<void> {
+  if (await durability.publicationMode() === 'recoverable') await durability.moveFileWriteThrough(source, destination);
+  else await rename(source, destination);
+  await syncDirectory(directory, durability);
 }
 
-async function durableRename(source: string, destination: string, directory: string): Promise<void> {
-  await rename(source, destination);
-  await syncDirectory(directory);
-}
-
-async function durableRemove(path: string, directory: string, force: boolean): Promise<void> {
+async function durableRemove(path: string, directory: string, force: boolean, durability: StateDurabilityAdapter): Promise<void> {
   await rm(path, { recursive: true, force });
-  await syncDirectory(directory);
+  await syncDirectory(directory, durability);
 }
 
 async function readLockOwner(path: string): Promise<LockOwner | undefined> {
