@@ -163,23 +163,32 @@ export function createNodeProcessRunner({
           } catch { unconfirmed(); }
         };
         const reapWindowsProcessTree = () => {
+          // Start the bounded recovery clock before any direct fallback can fail.
+          cancellationDeadline = schedule(() => {
+            try {
+              if (windowsReaper && typeof windowsReaper.kill === 'function') terminateManagedRoot(windowsReaper);
+              terminateRootOnce();
+            } catch {
+              // The deadline is recovery, not a second opportunity to surface a generic error.
+            }
+            unconfirmed();
+          }, windowsReapTimeoutMs);
           if (child.pid === undefined) {
-            terminateRootOnce();
+            try { terminateRootOnce(); } catch { unconfirmed(); }
           } else {
             let killer: ChildProcess;
             try {
               killer = spawnProcess('taskkill', ['/PID', String(child.pid), '/T', '/F'], { shell: false, stdio: 'ignore', windowsHide: true });
               windowsReaper = killer;
             } catch {
-              terminateRootOnce();
-              cancellationDeadline = schedule(unconfirmed, windowsReapTimeoutMs);
+              try { terminateRootOnce(); } catch { unconfirmed(); }
               return;
             }
             let killerSettled = false;
             const fallback = () => {
               if (killerSettled) return;
               killerSettled = true;
-              try { terminateRootOnce(); } catch (error: unknown) { fail(error instanceof Error ? error : new Error(String(error))); }
+              try { terminateRootOnce(); } catch { unconfirmed(); }
             };
             killer.once('error', fallback);
             killer.once('close', (code) => {
@@ -190,17 +199,10 @@ export function createNodeProcessRunner({
                 terminationOperationCompleted = true;
                 finishCancellation();
               } else {
-                try { terminateRootOnce(); } catch (error: unknown) { fail(error instanceof Error ? error : new Error(String(error))); }
+                try { terminateRootOnce(); } catch { unconfirmed(); }
               }
             });
           }
-          cancellationDeadline = schedule(() => {
-            try {
-              if (windowsReaper && typeof windowsReaper.kill === 'function') terminateManagedRoot(windowsReaper);
-              terminateRootOnce();
-              unconfirmed();
-            } catch (error: unknown) { fail(error instanceof Error ? error : new Error(String(error))); }
-          }, windowsReapTimeoutMs);
         };
         const receive = (stream: 'stdout' | 'stderr', chunk: Buffer, flush = false) => {
           const text = (stream === 'stdout' ? stdoutDecoder : stderrDecoder).decode(chunk, { stream: !flush });
@@ -213,7 +215,10 @@ export function createNodeProcessRunner({
         };
         child.stdout?.on('data', (chunk: Buffer) => { receive('stdout', chunk); });
         child.stderr?.on('data', (chunk: Buffer) => { receive('stderr', chunk); });
-        child.on('error', fail);
+        child.on('error', (error) => {
+          if (cancellationStarted) unconfirmed();
+          else fail(error);
+        });
         child.on('close', (code) => {
           receive('stdout', Buffer.alloc(0), true);
           receive('stderr', Buffer.alloc(0), true);
@@ -299,6 +304,7 @@ export async function createWorkspace(options: {
   try {
     result = await options.runner.run('git', ['worktree', 'add', '--relative-paths', '-b', branch, worktree, baseRef], withSignal({ cwd: root, kind: 'lifecycle' }, options.signal));
   } catch (error: unknown) {
+    if (error instanceof UnconfirmedProcessReapError) throw error;
     throw await worktreeAddRecoveryError(error, root, worktree, branch, options.runner);
   }
   if (result.code !== 0) throw await worktreeAddRecoveryError(commandError('git worktree add', result), root, worktree, branch, options.runner);

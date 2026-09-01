@@ -4,7 +4,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { validateWorkspaceName } from '../src/names.js';
-import { createWorkspace, type ProcessRunner } from '../src/workspaces.js';
+import { createWorkspace, type ProcessRunner, UnconfirmedProcessReapError } from '../src/workspaces.js';
+import { loadManualRecovery, recordManualRecovery, withWorkspaceLock } from '../src/state.js';
 import type { AgentContainersConfig } from '../src/types.js';
 
 test('CI captures git worktree help even though Git exits 129', async () => {
@@ -114,6 +115,37 @@ test('createWorkspace reports exact branch and worktree recovery details after a
   );
   assert.equal(calls.some((args) => args[0] === 'worktree' && args[1] === 'remove'), false);
   assert.equal(calls.some((args) => args[0] === 'branch' && args[1] === '-D'), false);
+});
+
+test('create lifecycle preserves unconfirmed worktree-add reaping without probes and records durable recovery', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'agent-containers-add-unconfirmed-'));
+  const stateDir = join(directory, 'state');
+  const calls: string[][] = [];
+  const controller = new AbortController();
+  const runner: ProcessRunner = {
+    async run(_command, args, options) {
+      calls.push(args);
+      assert.equal(options?.kind, 'lifecycle');
+      assert.ok(options?.signal, 'the create lifecycle passes its lock signal to every Git command');
+      if (args[0] === 'rev-parse') return { code: 0, stdout: `${directory}\n`, stderr: '' };
+      if (args[0] === 'show-ref') return { code: args.at(-1) === 'refs/heads/main' ? 0 : 1, stdout: '', stderr: '' };
+      if (args.at(-1) === '-h') return { code: 129, stdout: '', stderr: '--[no-]relative-paths\n' };
+      if (args[0] === 'worktree' && args[1] === 'add') throw new UnconfirmedProcessReapError();
+      throw new Error(`unexpected probe after uncertain reaping: ${args.join(' ')}`);
+    },
+  };
+
+  await assert.rejects(
+    () => withWorkspaceLock(
+      stateDir,
+      'partial',
+      (signal) => createWorkspace({ cwd: directory, name: 'partial', config: { version: 1, workspace: { worktreeRoot: 'worktrees', baseBranch: 'main' }, environment: { devcontainerPath: '.devcontainer/devcontainer.json' }, commands: {} }, stateDir, runner, signal }),
+      { abortSignal: controller.signal, onUnconfirmedProcessReap: () => recordManualRecovery(stateDir, 'partial', { reason: 'local-process-reap-unconfirmed', containerIds: [], worktree: directory }) },
+    ),
+    UnconfirmedProcessReapError,
+  );
+  assert.deepEqual(calls.at(-1), ['worktree', 'add', '--relative-paths', '-b', 'agent-containers/partial', join(directory, 'worktrees', 'partial'), 'refs/heads/main']);
+  assert.equal((await loadManualRecovery(stateDir, 'partial'))?.reason, 'local-process-reap-unconfirmed');
 });
 
 

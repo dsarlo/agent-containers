@@ -37,9 +37,9 @@ export async function runCli(args: string[], cwd = process.cwd(), write: (messag
           const root = await findGitRoot(cwd, nodeProcessRunner, signal, 'lifecycle');
           const config = await loadConfig(join(root, '.agent-containers.yml'));
           const baseBranch = optionValue(rest.slice(1), '--base');
-          await assertDevcontainerPathCommittedOnBaseBranch(config, root, nodeProcessRunner, undefined, 'lifecycle');
+          await assertDevcontainerPathCommittedOnBaseBranch(config, root, nodeProcessRunner, undefined, 'lifecycle', signal);
           if (baseBranch && baseBranch !== config.workspace.baseBranch) {
-            await assertDevcontainerPathCommittedOnBaseBranch(config, root, nodeProcessRunner, baseBranch, 'lifecycle');
+            await assertDevcontainerPathCommittedOnBaseBranch(config, root, nodeProcessRunner, baseBranch, 'lifecycle', signal);
           }
           const workspace = await createWorkspace({ cwd, name, config, stateDir, runner: nodeProcessRunner, baseBranch, signal });
           write(`Created ${workspace.name} at ${workspace.worktree}`);

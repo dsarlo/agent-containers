@@ -29,6 +29,28 @@ test('base-branch Dev Container validation uses a safe Git path through the inje
   ]);
 });
 
+test('lifecycle base-branch validation passes its abort signal to both Git commands', async () => {
+  const config: AgentContainersConfig = {
+    version: 1,
+    workspace: { worktreeRoot: 'worktrees', baseBranch: 'main' },
+    environment: { devcontainerPath: '.devcontainer/devcontainer.json' },
+    commands: {},
+  };
+  const controller = new AbortController();
+  const signals: AbortSignal[] = [];
+  const runner: ProcessRunner = {
+    async run(_command, args, options) {
+      assert.equal(options?.kind, 'lifecycle');
+      assert.equal(options?.signal, controller.signal);
+      signals.push(options?.signal as AbortSignal);
+      return { code: 0, stdout: args[0] === 'ls-tree' ? '100644 blob 0123456789012345678901234567890123456789\t.devcontainer/devcontainer.json\0' : '', stderr: '' };
+    },
+  };
+
+  await assertDevcontainerPathCommittedOnBaseBranch(config, '/repo', runner, undefined, 'lifecycle', controller.signal);
+  assert.deepEqual(signals, [controller.signal, controller.signal]);
+});
+
 test('base-branch Dev Container validation rejects a committed symlink from Git tree metadata', async () => {
   const config: AgentContainersConfig = {
     version: 1,

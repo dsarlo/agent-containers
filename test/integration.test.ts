@@ -153,6 +153,34 @@ test('nodeProcessRunner drives the bounded Windows failure path through its inje
   await assert.rejects(running, UnconfirmedProcessReapError);
 });
 
+test('nodeProcessRunner turns Windows post-cancellation fallback failures into lifecycle recovery errors', async () => {
+  for (const scenario of ['taskkill-nonzero', 'taskkill-sync-throw', 'child-error', 'no-pid', 'deadline-fallback-throw'] as const) {
+    const root = Object.assign(new EventEmitter(), {
+      pid: scenario === 'no-pid' ? undefined : 1357,
+      kill: () => { throw new Error('root termination failed'); },
+    }) as unknown as ChildProcess;
+    const taskkill = new EventEmitter() as ChildProcess;
+    const timers: Array<() => void> = [];
+    const runner = createNodeProcessRunner({
+      platform: 'win32',
+      spawn: ((command: string) => {
+        if (command !== 'taskkill') return root;
+        if (scenario === 'taskkill-sync-throw') throw new Error('taskkill spawn failed');
+        return taskkill;
+      }) as typeof spawn,
+      setTimeout: ((callback: () => void) => { timers.push(callback); return {} as NodeJS.Timeout; }) as typeof setTimeout,
+      clearTimeout: (() => undefined) as typeof clearTimeout,
+    });
+    const controller = new AbortController();
+    const running = runner.run('managed-command', [], { kind: 'lifecycle', signal: controller.signal });
+    controller.abort();
+    if (scenario === 'taskkill-nonzero') taskkill.emit('close', 1);
+    if (scenario === 'child-error') root.emit('error', new Error('managed child failed'));
+    if (scenario === 'deadline-fallback-throw') timers[0]?.();
+    await assert.rejects(running, UnconfirmedProcessReapError, scenario);
+  }
+});
+
 test('nodeProcessRunner does not treat a cancelled POSIX root close as process-group reaping proof', async () => {
   const managedChild = Object.assign(new EventEmitter(), {
     pid: 2468,

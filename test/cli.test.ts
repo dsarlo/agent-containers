@@ -6,6 +6,7 @@ import { spawnSync } from 'node:child_process';
 import test from 'node:test';
 import { loadManualRecovery, recordManualRecovery, withWorkspaceLock } from '../src/state.js';
 import { exitCodeForError, runCli } from '../src/cli.js';
+import { nodeProcessRunner, UnconfirmedProcessReapError } from '../src/workspaces.js';
 
 test('built public CLI entry point is executable', async () => {
   const mode = (await stat('dist/src/bin/agent-containers.js')).mode & 0o777;
@@ -168,6 +169,42 @@ test('create with --base refuses a base missing its Dev Container config before 
   const gitCalls = await readFile(gitLog, 'utf8');
   assert.equal(gitCalls.split('\n').some((args) => args.startsWith('worktree add ')), false, 'create must reject before invoking git worktree add');
   assert.equal(spawnSync('git', ['show-ref', '--verify', '--quiet', 'refs/heads/agent-containers/blocked'], { cwd: root }).status, 1, 'create must not create a workspace branch');
+});
+
+test('public create passes its lock signal to validation and durably records uncertain worktree reaping without probes', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'agent-containers-cli-unconfirmed-create-'));
+  const stateHome = await mkdtemp(join(tmpdir(), 'agent-containers-cli-unconfirmed-state-'));
+  const stateDir = join(stateHome, 'agent-containers');
+  const previousStateHome = process.env.XDG_STATE_HOME;
+  const originalRun = nodeProcessRunner.run;
+  const calls: Array<{ args: string[]; signal?: AbortSignal; kind?: string }> = [];
+  t.after(async () => {
+    nodeProcessRunner.run = originalRun;
+    if (previousStateHome === undefined) delete process.env.XDG_STATE_HOME;
+    else process.env.XDG_STATE_HOME = previousStateHome;
+    await Promise.all([rm(root, { recursive: true, force: true }), rm(stateHome, { recursive: true, force: true })]);
+  });
+  await writeFile(join(root, '.agent-containers.yml'), 'version: 1\nworkspace:\n  worktreeRoot: worktrees\n  baseBranch: main\nenvironment:\n  devcontainerPath: .devcontainer/devcontainer.json\n');
+  process.env.XDG_STATE_HOME = stateHome;
+  nodeProcessRunner.run = async (_command, args, options) => {
+    calls.push({ args, signal: options?.signal, kind: options?.kind });
+    if (args[0] === 'rev-parse') return { code: 0, stdout: `${root}\n`, stderr: '' };
+    if (args[0] === 'show-ref') return { code: args.at(-1) === 'refs/heads/agent-containers/partial' ? 1 : 0, stdout: '', stderr: '' };
+    if (args[0] === 'ls-tree') return { code: 0, stdout: '100644 blob 0123456789012345678901234567890123456789\t.devcontainer/devcontainer.json\0', stderr: '' };
+    if (args.at(-1) === '-h') return { code: 129, stdout: '', stderr: '--[no-]relative-paths\n' };
+    if (args[0] === 'worktree' && args[1] === 'add') throw new UnconfirmedProcessReapError();
+    throw new Error(`unexpected follow-on probe: ${args.join(' ')}`);
+  };
+
+  await assert.rejects(() => runCli(['create', 'partial'], root, () => undefined), UnconfirmedProcessReapError);
+  const showRefIndex = calls.findIndex(({ args }) => args[0] === 'show-ref' && args.at(-1) === 'refs/heads/main');
+  const lsTreeIndex = calls.findIndex(({ args }) => args[0] === 'ls-tree');
+  assert.equal(lsTreeIndex, showRefIndex + 1, 'the config validation Git calls remain adjacent');
+  const validation = [calls[showRefIndex], calls[lsTreeIndex]];
+  assert.ok(validation.every(({ kind, signal }) => kind === 'lifecycle' && signal), 'both validation Git commands use the create lock signal');
+  assert.equal(validation[0]?.signal, validation[1]?.signal);
+  assert.deepEqual(calls.at(-1)?.args, ['worktree', 'add', '--relative-paths', '-b', 'agent-containers/partial', join(root, 'worktrees', 'partial'), 'refs/heads/main']);
+  assert.equal((await loadManualRecovery(stateDir, 'partial'))?.reason, 'local-process-reap-unconfirmed');
 });
 
 test('init and implicit validation resolve the repository root from a subdirectory', async () => {
