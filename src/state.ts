@@ -349,6 +349,10 @@ function manualRecoveryError(name: string): Error {
   return new Error(`Workspace "${name}" is blocked by durable manual recovery because a remote Dev Container operation may still be active. Verify the remote command/container state, then run agent-containers recover ${name} --yes --remote-command-stopped. The ordinary unlock command never clears this block.`);
 }
 
+function guardedLockRecoveryError(name: string): Error {
+  return new Error(`Lifecycle lock for workspace "${name}" is a current guarded crash-recovery lock. Ordinary unlock never clears it; verify remote state, then run agent-containers recover ${name} --yes --remote-command-stopped.`);
+}
+
 export interface WorkspaceLockOptions {
   timeoutMs?: number;
   /** Optional test or embedding cancellation source; process signals are wired internally. */
@@ -490,6 +494,9 @@ export async function releaseStaleWorkspaceLock(stateDir: string, name: string, 
     if (!isLockOwner(owner)) {
       throw malformedLockError(name, lockPath);
     }
+    if (await pathExists(reapGuardPath(lockPath))) {
+      throw guardedLockRecoveryError(name);
+    }
     if (isPidAlive(owner.pid)) throw new Error(`Lifecycle lock for workspace "${name}" is owned by active PID ${owner.pid}; refusing to interrupt it.`);
     await hooks.beforeRemoval?.();
     const reclaimedPath = join(locksDir, `.${lockName}.${owner.token}.reclaimed`);
@@ -500,7 +507,7 @@ export async function releaseStaleWorkspaceLock(stateDir: string, name: string, 
   }
 }
 
-/** Explicit operator acknowledgement is the only automated path that clears a failed reap-recovery quarantine. */
+/** Explicit recovery may retire a crashed current lock only after validating its guarded owner. */
 export async function acknowledgeUnconfirmedProcessReap(stateDir: string, name: string, timeoutMs = 30_000): Promise<void> {
   const durability = stateDurability();
   await durability.assertStateWriteSupport();
@@ -519,14 +526,22 @@ export async function acknowledgeUnconfirmedProcessReap(stateDir: string, name: 
       await retireOwnedLock(quarantinePath, locksDir, owner, durability);
       return;
     }
-    if (!await pathExists(retainedMarker)) return;
     const owner = await readLockOwner(lockPath);
-    if (!owner) throw malformedLockError(name, lockPath);
-    // The marker is inside a retained ordinary lock after a pre-move failure.
-    // Explicit acknowledgement, not unlock, deliberately retires both.
-    const retiredPath = join(locksDir, `.${lockName}.${owner.token}.recovery-acknowledged`);
-    await moveOwnedLock(lockPath, retiredPath, owner, locksDir, durability);
-    await durableRemove(retiredPath, locksDir, false, durability);
+    if (!owner) {
+      if (await pathExists(retainedMarker)) throw malformedLockError(name, lockPath);
+      return;
+    }
+    if (await pathExists(retainedMarker)) {
+      // The marker is inside a retained ordinary lock after a pre-move failure.
+      // Explicit acknowledgement, not unlock, deliberately retires both.
+      await moveOwnedLock(lockPath, quarantinePath, owner, locksDir, durability);
+      await durableRemove(quarantinePath, locksDir, false, durability);
+      return;
+    }
+    if (!await pathExists(reapGuardPath(lockPath))) return;
+    if (localPidIsAlive(owner.pid)) throw new Error(`Lifecycle lock for workspace "${name}" is owned by active PID ${owner.pid}; refusing to interrupt it.`);
+    await moveOwnedLock(lockPath, quarantinePath, owner, locksDir, durability);
+    await durableRemove(quarantinePath, locksDir, false, durability);
   } finally {
     await retireOwnedLock(recoveryPath, locksDir, recoveryOwner, durability);
   }

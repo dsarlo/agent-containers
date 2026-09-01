@@ -329,6 +329,50 @@ test('stale lock recovery refuses an active owner and releases a proven-dead leg
   assert.equal(acquired, true);
 });
 
+test('ordinary stale unlock retains a dead current guarded lock until explicit recovery acknowledgement', async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), 'agent-containers-guarded-stale-lock-'));
+  const lockPath = join(stateDir, 'locks', 'safe.lock');
+  await mkdir(lockPath, { recursive: true });
+  await writeFile(join(lockPath, 'owner.json'), JSON.stringify({ pid: 424242, token: '13131313-1313-4131-8131-131313131313' }));
+  await writeFile(join(lockPath, 'reap-guard'), '');
+
+  await assert.rejects(() => releaseStaleWorkspaceLock(stateDir, 'safe', () => false), /current guarded.*recover safe --yes --remote-command-stopped/i);
+  assert.equal((await lstat(lockPath)).isDirectory(), true, 'ordinary unlock must preserve a crash-surviving guarded lock');
+
+  await acknowledgeUnconfirmedProcessReap(stateDir, 'safe');
+  await assert.rejects(() => lstat(lockPath), { code: 'ENOENT' });
+});
+
+test('explicit reap acknowledgement refuses an active current guarded owner', async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), 'agent-containers-active-guarded-lock-'));
+  const lockPath = join(stateDir, 'locks', 'safe.lock');
+  await mkdir(lockPath, { recursive: true });
+  await writeFile(join(lockPath, 'owner.json'), JSON.stringify({ pid: process.pid, token: '14141414-1414-4141-8141-141414141414' }));
+  await writeFile(join(lockPath, 'reap-guard'), '');
+
+  await assert.rejects(() => acknowledgeUnconfirmedProcessReap(stateDir, 'safe'), /active PID/);
+  assert.equal((await lstat(lockPath)).isDirectory(), true);
+});
+
+test('failed guarded-lock acknowledgement deletion leaves the recognized recovery barrier', async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), 'agent-containers-guarded-ack-failure-'));
+  const lockPath = join(stateDir, 'locks', 'safe.lock');
+  await mkdir(lockPath, { recursive: true });
+  await writeFile(join(lockPath, 'owner.json'), JSON.stringify({ pid: 424242, token: '15151515-1515-4151-8151-151515151515' }));
+  await writeFile(join(lockPath, 'reap-guard'), '');
+  let syncs = 0;
+  setStateDurabilityAdapterForTesting({
+    ...testDurabilityAdapter,
+    syncDirectory: async () => { syncs += 1; if (syncs === 4) throw new Error('quarantine removal sync failed'); },
+  });
+  try {
+    await assert.rejects(() => acknowledgeUnconfirmedProcessReap(stateDir, 'safe'), /quarantine removal sync failed/);
+  } finally {
+    setStateDurabilityAdapterForTesting(testDurabilityAdapter);
+  }
+  await assert.rejects(() => releaseStaleWorkspaceLock(stateDir, 'safe', () => false), /quarantined.*Ordinary unlock never clears/i);
+});
+
 test('failed uncertain-reap recovery publication quarantines the lock from stale unlock until explicit acknowledgement', async () => {
   const stateDir = await mkdtemp(join(tmpdir(), 'agent-containers-quarantined-lock-'));
   const { UnconfirmedProcessReapError } = await import('../src/workspaces.js');
@@ -345,13 +389,13 @@ test('failed uncertain-reap recovery publication quarantines the lock from stale
   assert.equal(acquired, true);
 });
 
-test('explicit reap acknowledgement does not retire an active lifecycle normal guard', async () => {
+test('explicit reap acknowledgement rejects an active lifecycle normal guard', async () => {
   const stateDir = await mkdtemp(join(tmpdir(), 'agent-containers-normal-reap-guard-'));
   const lockPath = join(stateDir, 'locks', 'safe.lock');
   await mkdir(lockPath, { recursive: true });
   await writeFile(join(lockPath, 'owner.json'), JSON.stringify({ pid: process.pid, token: '12121212-1212-4121-8121-121212121212' }));
   await writeFile(join(lockPath, 'reap-guard'), '');
-  await acknowledgeUnconfirmedProcessReap(stateDir, 'safe');
+  await assert.rejects(() => acknowledgeUnconfirmedProcessReap(stateDir, 'safe'), /active PID/);
   assert.equal((await lstat(lockPath)).isDirectory(), true, 'the normal lifecycle guard is not a retained uncertain-reap marker');
 });
 

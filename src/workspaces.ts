@@ -74,6 +74,7 @@ export function createNodeProcessRunner({
         let cancellationStarted = false;
         let windowsReaper: ChildProcess | undefined;
         let windowsReaperLive = false;
+        let windowsTaskkillSucceeded = false;
         let rootClosed = false;
         let rootTerminationAttempted = false;
         const terminateRootOnce = () => {
@@ -110,7 +111,7 @@ export function createNodeProcessRunner({
         // Root exit cannot prove descendants remained in the local boundary.
         const finishCancellation = () => unconfirmed();
         const unconfirmed = () => fail(options.kind === 'lifecycle' ? new UnconfirmedProcessReapError() : processReapTimeoutError(platform));
-        const signalGroup = (signal: NodeJS.Signals): void => {
+        const signalGroup = (signal: NodeJS.Signals | 0): void => {
           if (child.pid === undefined) return;
           try {
             processKill(-child.pid, signal);
@@ -128,9 +129,10 @@ export function createNodeProcessRunner({
             cancellationTimer = schedule(() => {
               try {
                 signalGroup('SIGKILL');
-                // A process-group boundary cannot contain a setsid escapee.
-                unconfirmed();
-              } catch { unconfirmed(); }
+                // Root close cannot prove the group died, and a group cannot
+                // prove a setsid escapee died. Keep the bounded deadline.
+                try { signalGroup(0); } catch { /* deadline reports uncertainty */ }
+              } catch { /* deadline reports uncertainty */ }
             }, posixGraceMs);
           } catch { unconfirmed(); }
         };
@@ -173,9 +175,10 @@ export function createNodeProcessRunner({
               killerSettled = true;
               windowsReaperLive = false;
               if (code === 0) {
-                // taskkill and root close do not prove an adversarial descendant
-                // remained in the Windows tree boundary.
-                unconfirmed();
+                windowsTaskkillSucceeded = true;
+                // taskkill cannot prove tree completeness, but its managed root
+                // must still close before the lifecycle can release its lock.
+                if (rootClosed) finishCancellation();
               } else {
                 try { terminateRootOnce(); } catch { unconfirmed(); }
                 if (rootClosed) finishCancellation();
@@ -204,7 +207,7 @@ export function createNodeProcessRunner({
           receive('stderr', Buffer.alloc(0), true);
           const rootResult = { code: code ?? 1, stdout, stderr };
           if (!cancellationStarted) settle(rootResult);
-          else if (platform !== 'win32' || !windowsReaperLive) {
+          else if (platform === 'win32' && (windowsTaskkillSucceeded || !windowsReaperLive)) {
             finishCancellation();
           }
         });

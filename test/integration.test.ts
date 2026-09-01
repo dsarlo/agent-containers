@@ -274,8 +274,37 @@ test('nodeProcessRunner records an unconfirmed reap when a cancelled POSIX group
   controller.abort();
   managedChild.emit('close', 1);
   await new Promise((resolveDelay) => setTimeout(resolveDelay, 5));
-  assert.deepEqual(signals, ['SIGTERM']);
+  assert.deepEqual(signals, ['SIGTERM', 'SIGKILL'], 'root close must not cancel scheduled group escalation');
   await rejected;
+});
+
+test('nodeProcessRunner retains POSIX escalation after root close when a descendant may remain', async () => {
+  const root = Object.assign(new EventEmitter(), { pid: 2469, kill: () => true }) as unknown as ChildProcess;
+  const signals: NodeJS.Signals[] = [];
+  const timers: Array<() => void> = [];
+  const runner = createNodeProcessRunner({
+    platform: 'linux',
+    spawn: (() => root) as typeof spawn,
+    processKill: ((pid: number, signal?: NodeJS.Signals | 0) => {
+      assert.equal(pid, -2469);
+      if (signal !== 0) signals.push(signal as NodeJS.Signals);
+      return true;
+    }) as typeof process.kill,
+    posixGraceMs: 10,
+    posixVerificationTimeoutMs: 10,
+    setTimeout: ((callback: () => void) => { timers.push(callback); return {} as NodeJS.Timeout; }) as typeof setTimeout,
+    clearTimeout: (() => undefined) as typeof clearTimeout,
+  });
+  const controller = new AbortController();
+  const running = runner.run('managed-command', [], { kind: 'lifecycle', signal: controller.signal });
+
+  controller.abort();
+  root.emit('close', 1);
+  assert.deepEqual(signals, ['SIGTERM']);
+  timers[1]?.();
+  assert.deepEqual(signals, ['SIGTERM', 'SIGKILL']);
+  timers[0]?.();
+  await assert.rejects(running, UnconfirmedProcessReapError);
 });
 
 test('nodeProcessRunner never treats Windows taskkill success and root close as escaped-descendant proof', async () => {
@@ -297,6 +326,47 @@ test('nodeProcessRunner never treats Windows taskkill success and root close as 
   root.emit('close', 1);
   await assert.rejects(running, UnconfirmedProcessReapError);
   assert.deepEqual(calls, ['managed-command', 'C:\\Windows\\System32\\taskkill.exe']);
+});
+
+test('nodeProcessRunner waits for Windows root close after successful taskkill and bounds a missing close', async () => {
+  const root = Object.assign(new EventEmitter(), { pid: 2470, kill: () => true }) as unknown as ChildProcess;
+  const taskkill = new EventEmitter() as ChildProcess;
+  const timers: Array<() => void> = [];
+  const runner = createNodeProcessRunner({
+    platform: 'win32',
+    windowsDirectory: () => 'C:\\Windows',
+    spawn: ((command: string) => command.endsWith('taskkill.exe') ? taskkill : root) as typeof spawn,
+    setTimeout: ((callback: () => void) => { timers.push(callback); return {} as NodeJS.Timeout; }) as typeof setTimeout,
+    clearTimeout: (() => undefined) as typeof clearTimeout,
+  });
+  const controller = new AbortController();
+  const running = runner.run('managed-command', [], { kind: 'lifecycle', signal: controller.signal });
+
+  controller.abort();
+  taskkill.emit('close', 0);
+  let settled = false;
+  void running.catch(() => { settled = true; });
+  await new Promise((resolveTick) => setImmediate(resolveTick));
+  assert.equal(settled, false, 'taskkill success alone cannot release the lifecycle lock');
+  root.emit('close', 1);
+  await assert.rejects(running, UnconfirmedProcessReapError);
+
+  const noCloseRoot = Object.assign(new EventEmitter(), { pid: 2471, kill: () => true }) as unknown as ChildProcess;
+  const noCloseTaskkill = new EventEmitter() as ChildProcess;
+  const noCloseTimers: Array<() => void> = [];
+  const noClose = createNodeProcessRunner({
+    platform: 'win32',
+    windowsDirectory: () => 'C:\\Windows',
+    spawn: ((command: string) => command.endsWith('taskkill.exe') ? noCloseTaskkill : noCloseRoot) as typeof spawn,
+    setTimeout: ((callback: () => void) => { noCloseTimers.push(callback); return {} as NodeJS.Timeout; }) as typeof setTimeout,
+    clearTimeout: (() => undefined) as typeof clearTimeout,
+  });
+  const noCloseController = new AbortController();
+  const noCloseRunning = noClose.run('managed-command', [], { kind: 'lifecycle', signal: noCloseController.signal });
+  noCloseController.abort();
+  noCloseTaskkill.emit('close', 0);
+  noCloseTimers[0]?.();
+  await assert.rejects(noCloseRunning, UnconfirmedProcessReapError);
 });
 
 test('nodeProcessRunner returns an unconfirmed lifecycle failure when POSIX process-group death cannot be proven', async () => {
