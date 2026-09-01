@@ -80,7 +80,10 @@ export async function execWorkspace(metadata: WorkspaceMetadata, command: string
   if (!containerId) return ambiguousUpRecovery(metadata, runner, save, recordRecovery, 'devcontainer up completed without a trustworthy terminal containerId');
   const ownership = await inspectOwnedContainer(metadata, containerId, runner, signal);
   if (!ownership) return recordAmbiguousUp(recordRecovery, metadata, [], `Docker could not prove that Dev Containers returned container ${containerId} with the exact recorded worktree label`);
-  if (metadata.containerId !== containerId) try {
+  if (metadata.containerId !== undefined && metadata.containerId !== containerId) {
+    return recordAmbiguousUp(recordRecovery, metadata, [metadata.containerId, containerId], `Recorded container ${metadata.containerId} does not match Dev Containers returned container ${containerId}; an exact worktree label does not authorize replacing a recorded workspace resource`);
+  }
+  if (metadata.containerId === undefined) try {
     await save({ ...metadata, containerId });
   } catch (error: unknown) {
     const detail = error instanceof Error ? error.message : String(error);

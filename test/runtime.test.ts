@@ -474,6 +474,88 @@ test('execWorkspace preserves a returned reused ID when metadata persistence fai
   assert.equal((await loadManualRecovery(stateDir, metadata.name))?.containerIds[0], untrackedContainerId);
 });
 
+test('execWorkspace never replaces a recorded canonical container ID with a distinct exact-label terminal ID', async () => {
+  const calls: Array<{ command: string; args: string[] }> = [];
+  const recoveries: unknown[] = [];
+  let saves = 0;
+  const runner: ProcessRunner = {
+    async run(command, args) {
+      calls.push({ command, args });
+      if (args[0] === 'up') return { code: 0, stdout: `{"outcome":"success","containerId":"${untrackedContainerId}"}\n`, stderr: '' };
+      if (args[0] === 'inspect') return { code: 0, stdout: ownedInspection(untrackedContainerId), stderr: '' };
+      throw new Error(`unexpected command: ${command} ${args.join(' ')}`);
+    },
+  };
+
+  await assert.rejects(
+    () => execWorkspace({ ...metadata, containerId: knownContainerId }, ['true'], runner, async () => { saves += 1; }, async () => '{}', undefined, async (recovery) => { recoveries.push(recovery); }, noOpRecovery),
+    new RegExp(`recorded container.*${knownContainerId}.*returned.*${untrackedContainerId}.*manual recovery`, 'i'),
+  );
+  assert.equal(saves, 0, 'a label match never authorizes replacing a recorded canonical ID');
+  assert.deepEqual(recoveries.at(-1), { reason: 'devcontainer-up-ambiguous', containerIds: [knownContainerId, untrackedContainerId], worktree: metadata.worktree });
+  assert.equal(calls.some((call) => call.command === 'docker' && call.args[0] === 'rm'), false, 'neither resource is deleted');
+});
+
+test('execWorkspace adopts an exact inspected terminal ID only when no ID was previously recorded', async () => {
+  let saved: WorkspaceMetadata | undefined;
+  const runner: ProcessRunner = {
+    async run(_command, args) {
+      return args[0] === 'up'
+        ? { code: 0, stdout: `{"outcome":"success","containerId":"${untrackedContainerId}"}\n`, stderr: '' }
+        : args[0] === 'inspect' ? { code: 0, stdout: ownedInspection(untrackedContainerId), stderr: '' }
+        : { code: 0, stdout: '', stderr: '' };
+    },
+  };
+
+  await execWorkspace(metadata, ['true'], runner, async (next) => { saved = next; }, async () => '{}', undefined, noOpRecovery, noOpRecovery);
+  assert.equal(saved?.containerId, untrackedContainerId);
+});
+
+test('execWorkspace records recovery instead of adopting a terminal ID whose Docker ID or worktree label differs', async () => {
+  for (const inspection of [
+    `${containerId}\n${metadata.worktree}\n`,
+    `${untrackedContainerId}\n/different/worktree\n`,
+  ]) {
+    let saves = 0;
+    let recovery: unknown;
+    const runner: ProcessRunner = {
+      async run(_command, args) {
+        return args[0] === 'up'
+          ? { code: 0, stdout: `{"outcome":"success","containerId":"${untrackedContainerId}"}\n`, stderr: '' }
+          : args[0] === 'inspect' ? { code: 0, stdout: inspection, stderr: '' }
+          : { code: 0, stdout: '', stderr: '' };
+      },
+    };
+
+    await assert.rejects(
+      () => execWorkspace(metadata, ['true'], runner, async () => { saves += 1; }, async () => '{}', undefined, async (next) => { recovery = next; }, noOpRecovery),
+      /manual recovery/,
+    );
+    assert.equal(saves, 0);
+    assert.deepEqual(recovery, { reason: 'devcontainer-up-ambiguous', containerIds: [], worktree: metadata.worktree });
+  }
+});
+
+test('execWorkspace preserves the original metadata record when an initial terminal-ID save fails', async () => {
+  const persisted: WorkspaceMetadata = { ...metadata };
+  let recovery: unknown;
+  const runner: ProcessRunner = {
+    async run(_command, args) {
+      return args[0] === 'up'
+        ? { code: 0, stdout: `{"outcome":"success","containerId":"${untrackedContainerId}"}\n`, stderr: '' }
+        : args[0] === 'inspect' ? { code: 0, stdout: ownedInspection(untrackedContainerId), stderr: '' }
+        : { code: 0, stdout: '', stderr: '' };
+    },
+  };
+
+  await assert.rejects(
+    () => execWorkspace(persisted, ['true'], runner, async () => { throw new Error('concurrent metadata replacement'); }, async () => '{}', undefined, async (next) => { recovery = next; }, noOpRecovery),
+    /concurrent metadata replacement.*manual recovery/i,
+  );
+  assert.equal(persisted.containerId, undefined, 'a failed atomic replacement leaves the original metadata record intact');
+  assert.deepEqual(recovery, { reason: 'devcontainer-up-ambiguous', containerIds: [untrackedContainerId], worktree: metadata.worktree });
+});
+
 test('execWorkspace never removes a reused recorded container when persisting it would fail', async () => {
   const calls: Array<{ command: string; args: string[] }> = [];
   const runner: ProcessRunner = {
