@@ -274,7 +274,7 @@ test('nodeProcessRunner records an unconfirmed reap when a cancelled POSIX group
   controller.abort();
   managedChild.emit('close', 1);
   await new Promise((resolveDelay) => setTimeout(resolveDelay, 5));
-  assert.deepEqual(signals, ['SIGTERM', 'SIGKILL'], 'root close must not cancel scheduled group escalation');
+  assert.deepEqual(signals, ['SIGTERM'], 'a closed root prevents a delayed SIGKILL against a potentially recycled PGID');
   await rejected;
 });
 
@@ -302,7 +302,7 @@ test('nodeProcessRunner retains POSIX escalation after root close when a descend
   root.emit('close', 1);
   assert.deepEqual(signals, ['SIGTERM']);
   timers[1]?.();
-  assert.deepEqual(signals, ['SIGTERM', 'SIGKILL']);
+  assert.deepEqual(signals, ['SIGTERM']);
   timers[0]?.();
   await assert.rejects(running, UnconfirmedProcessReapError);
 });

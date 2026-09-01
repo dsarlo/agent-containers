@@ -1,6 +1,6 @@
 import { join, resolve } from 'node:path';
 import { assertDevcontainerPathCommittedOnBaseBranch, initConfig, loadConfig } from './config.js';
-import { acknowledgeUnconfirmedProcessReap, clearManualRecovery, defaultStateDir, deleteMetadata, listMetadata, loadManualRecovery, loadMetadata, recordManualRecovery, releaseStaleWorkspaceLock, saveMetadata, withWorkspaceLock } from './state.js';
+import { acknowledgeUnconfirmedProcessReap, clearManualRecoveryIfCurrent, defaultStateDir, deleteMetadata, listMetadata, loadManualRecovery, loadMetadata, recordManualRecovery, releaseStaleWorkspaceLock, saveMetadata, withWorkspaceLock } from './state.js';
 import { execNamedWorkspaceLifecycle } from './runtime.js';
 import { createWorkspace, findGitRoot, nodeProcessRunner, removeWorkspace } from './workspaces.js';
 
@@ -63,7 +63,10 @@ export async function runCli(args: string[], cwd = process.cwd(), write: (messag
           throw new UsageError('Usage: agent-containers recover <name> --yes --remote-command-stopped');
         }
         await acknowledgeUnconfirmedProcessReap(stateDir, name);
-        if (await loadManualRecovery(stateDir, name)) await withWorkspaceLock(stateDir, name, async () => clearManualRecovery(stateDir, name), { allowManualRecovery: true });
+        await withWorkspaceLock(stateDir, name, async () => {
+          const recovery = await loadManualRecovery(stateDir, name);
+          if (recovery) await clearManualRecoveryIfCurrent(stateDir, name, recovery.generation);
+        }, { allowManualRecovery: true });
         write(`Cleared manual recovery block for ${name}; this acknowledgement did not stop or remove any remote container.`);
         return 0;
       }
@@ -87,12 +90,14 @@ export async function runCli(args: string[], cwd = process.cwd(), write: (messag
         ensureOnly(rest.slice(1), ['--yes', '--skip-container-cleanup', '--force-worktree']);
         if (!rest.includes('--yes')) throw new UsageError('Usage: agent-containers remove <name> --yes [--skip-container-cleanup] [--force-worktree]');
         let recoveryWorktree = cwd;
+        let recoveryContainerIds: string[] = [];
         await withWorkspaceLock(stateDir, name, async (signal) => {
           const metadata = await loadMetadata(stateDir, name);
           if (!metadata) throw new Error(`No Agent Containers workspace named "${name}".`);
           recoveryWorktree = metadata.worktree;
+          recoveryContainerIds = metadata.containerId ? [metadata.containerId] : [];
           await removeWorkspace(metadata, { confirmed: true, forceWorktree: rest.includes('--force-worktree'), skipContainerCleanup: rest.includes('--skip-container-cleanup'), signal }, nodeProcessRunner, (next) => saveMetadata(stateDir, next), () => deleteMetadata(stateDir, name));
-        }, { onUnconfirmedProcessReap: () => recordManualRecovery(stateDir, name, { reason: 'local-process-reap-unconfirmed', containerIds: [], worktree: recoveryWorktree }) });
+        }, { onUnconfirmedProcessReap: () => recordManualRecovery(stateDir, name, { reason: 'local-process-reap-unconfirmed', containerIds: recoveryContainerIds, worktree: recoveryWorktree }) });
         write(`Removed ${name}`);
         return 0;
       }

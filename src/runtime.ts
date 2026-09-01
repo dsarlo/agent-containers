@@ -87,7 +87,7 @@ export async function execWorkspace(metadata: WorkspaceMetadata, command: string
     const detail = error instanceof Error ? error.message : String(error);
     return recordAmbiguousUp(recordRecovery, metadata, metadata.containerId === undefined ? [containerId] : [metadata.containerId, containerId], `Docker could not verify Dev Containers returned container ${containerId}: ${detail}`);
   }
-  if (!ownership) return recordAmbiguousUp(recordRecovery, metadata, [], `Docker could not prove that Dev Containers returned container ${containerId} with the exact recorded worktree label`);
+  if (!ownership) return recordAmbiguousUp(recordRecovery, metadata, [containerId], `Docker could not prove that Dev Containers returned container ${containerId} with the exact recorded worktree label`);
   if (metadata.containerId !== undefined && metadata.containerId !== containerId) {
     return recordAmbiguousUp(recordRecovery, metadata, [metadata.containerId, containerId], `Recorded container ${metadata.containerId} does not match Dev Containers returned container ${containerId}; an exact worktree label does not authorize replacing a recorded workspace resource`);
   }
@@ -112,8 +112,8 @@ export async function execWorkspace(metadata: WorkspaceMetadata, command: string
     await recordRecovery({ reason: 'remote-exec-interrupted', containerIds: [containerId], worktree: metadata.worktree });
     throw new Error(`The local Dev Containers CLI was interrupted; the remote command may still be active in container ${containerId}. Agent Containers recorded a manual-recovery block and will not run lifecycle commands for ${metadata.name} until an operator verifies the remote command is stopped and clears it.`);
   }
-  if (result.code !== 0) throw commandError('devcontainer exec', result);
   await clearRecovery();
+  if (result.code !== 0) throw commandError('devcontainer exec', result);
   return result;
 }
 
@@ -158,7 +158,7 @@ async function ambiguousUpRecovery(metadata: WorkspaceMetadata, runner: ProcessR
 }
 
 async function recordAmbiguousUp(recordRecovery: RecoveryRecorder, metadata: WorkspaceMetadata, containerIds: string[], detail: string): Promise<never> {
-  await recordRecovery({ reason: 'devcontainer-up-ambiguous', containerIds, worktree: metadata.worktree });
+  await recordRecovery({ reason: 'devcontainer-up-ambiguous', containerIds: recoveryHints(metadata, containerIds), worktree: metadata.worktree });
   throw new Error(`${detail}. Agent Containers did not remove any container and recorded a manual recovery block; verify Docker state before clearing it.`);
 }
 
@@ -175,8 +175,12 @@ function isOwnedContainerInspection(output: string, containerId: string, worktre
 }
 
 async function unconfirmedReapRecovery(metadata: WorkspaceMetadata, recordRecovery: RecoveryRecorder, detail: string, containerIds: string[] = []): Promise<never> {
-  await recordRecovery({ reason: 'local-process-reap-unconfirmed', containerIds, worktree: metadata.worktree });
+  await recordRecovery({ reason: 'local-process-reap-unconfirmed', containerIds: recoveryHints(metadata, containerIds), worktree: metadata.worktree });
   throw new Error(`Local Dev Containers process reaping could not be confirmed: ${detail} Agent Containers recorded a manual-recovery block; verify the local process tree and remote container state, then explicitly acknowledge recovery before running another lifecycle operation.`);
+}
+
+function recoveryHints(metadata: WorkspaceMetadata, observed: string[]): string[] {
+  return [...new Set([metadata.containerId, ...observed].filter(isCanonicalContainerId))];
 }
 
 function commandDetail(result: ProcessResult): string {

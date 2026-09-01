@@ -78,7 +78,7 @@ test('recover waits for an active workspace lifecycle lock before clearing manua
   }
 });
 
-test('recover explicitly clears an unconfirmed-reap quarantine without removing remote workspace state', async (t) => {
+test('recover refuses an unconfirmed-reap quarantine whose recorded owner remains alive', async (t) => {
   const stateHome = await mkdtemp(join(tmpdir(), 'agent-containers-cli-quarantine-recover-'));
   const stateDir = join(stateHome, 'agent-containers');
   const previousStateHome = process.env.XDG_STATE_HOME;
@@ -113,15 +113,13 @@ test('recover explicitly clears an unconfirmed-reap quarantine without removing 
   assert.equal(await runCli(['unlock', 'safe', '--yes'], process.cwd(), (message) => unlockMessages.push(message)), 1);
   assert.match(unlockMessages.at(-1) ?? '', /quarantined.*Ordinary unlock never clears/i);
 
-  assert.equal(await runCli(['recover', 'safe', '--yes', '--remote-command-stopped'], process.cwd(), () => undefined), 0);
-  assert.equal(await loadManualRecovery(stateDir, 'safe'), undefined);
+  assert.equal(await runCli(['recover', 'safe', '--yes', '--remote-command-stopped'], process.cwd(), () => undefined), 1);
+  assert.ok(await loadManualRecovery(stateDir, 'safe'));
   assert.equal((await loadMetadata(stateDir, 'safe'))?.containerId, '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef');
-  let acquired = false;
-  await withWorkspaceLock(stateDir, 'safe', async () => { acquired = true; });
-  assert.equal(acquired, true, 'the explicit acknowledgement permits a later lifecycle operation');
+  await assert.rejects(() => withWorkspaceLock(stateDir, 'safe', async () => undefined, { timeoutMs: 0 }), /quarantined|lock/i);
 });
 
-test('recover retires a retained lock when quarantine rename fails before moving it', async (t) => {
+test('recover refuses a retained lock whose recorded owner remains alive', async (t) => {
   const stateHome = await mkdtemp(join(tmpdir(), 'agent-containers-cli-retained-recover-'));
   const stateDir = join(stateHome, 'agent-containers');
   const previousStateHome = process.env.XDG_STATE_HOME;
@@ -142,10 +140,8 @@ test('recover retires a retained lock when quarantine rename fails before moving
   const messages: string[] = [];
   assert.equal(await runCli(['unlock', 'safe', '--yes'], process.cwd(), (message) => messages.push(message)), 1);
   assert.match(messages.at(-1) ?? '', /quarantined.*Ordinary unlock never clears/i);
-  assert.equal(await runCli(['recover', 'safe', '--yes', '--remote-command-stopped'], process.cwd(), () => undefined), 0);
-  let acquired = false;
-  await withWorkspaceLock(stateDir, 'safe', async () => { acquired = true; });
-  assert.equal(acquired, true);
+  assert.equal(await runCli(['recover', 'safe', '--yes', '--remote-command-stopped'], process.cwd(), () => undefined), 1);
+  await assert.rejects(() => withWorkspaceLock(stateDir, 'safe', async () => undefined, { timeoutMs: 0 }), /quarantined|lock/i);
 });
 
 test('validate refuses a Dev Container config absent from the configured local base branch', async () => {

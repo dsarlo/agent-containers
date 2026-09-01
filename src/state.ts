@@ -36,6 +36,8 @@ interface LockOwner {
 
 export interface ManualRecovery {
   version: 1;
+  /** Immutable identity used to prevent a stale acknowledgement clearing a later barrier. */
+  generation: string;
   reason: 'operation-may-be-active' | 'remote-exec-interrupted' | 'devcontainer-up-ambiguous' | 'local-process-reap-unconfirmed';
   containerIds: string[];
   worktree: string;
@@ -151,7 +153,7 @@ export async function bootstrapManualRecoveryJournal(stateDir: string, name: str
 
 /** Persist an append-only, checksummed recovery barrier before remote lifecycle work. */
 export async function recordManualRecovery(stateDir: string, name: string, input: ManualRecoveryInput): Promise<void> {
-  const recovery: ManualRecovery = { version: 1, ...input, containerIds: input.containerIds.filter(isCanonicalContainerId), createdAt: new Date().toISOString() };
+  const recovery: ManualRecovery = { version: 1, generation: randomUUID(), ...input, containerIds: [...new Set(input.containerIds.filter(isCanonicalContainerId))], createdAt: new Date().toISOString() };
   if (!isManualRecovery(recovery)) throw new Error('Refusing to save invalid manual recovery state.');
   const durability = stateDurability();
   await durability.assertStateWriteSupport();
@@ -160,6 +162,7 @@ export async function recordManualRecovery(stateDir: string, name: string, input
 }
 
 async function appendManualRecoveryJournalEvent(path: string, event: ManualRecoveryJournalEvent, durability: StateDurabilityAdapter): Promise<void> {
+  await repairManualRecoveryJournalTail(path, durability);
   const entry: CheckedManualRecoveryJournalEvent = { ...event, checksum: journalChecksum(event) };
   let file: FileHandle | undefined;
   try {
@@ -174,6 +177,16 @@ async function appendManualRecoveryJournalEvent(path: string, event: ManualRecov
     await file?.close();
     throw error;
   }
+}
+
+async function repairManualRecoveryJournalTail(path: string, durability: StateDurabilityAdapter): Promise<void> {
+  const source = await readFile(path, 'utf8');
+  if (source === '' || source.endsWith('\n')) return;
+  // The parser tolerates only an interrupted final record. Publish a complete
+  // replacement before appending so that record can never corrupt the next one.
+  const committed = source.slice(0, source.lastIndexOf('\n') + 1);
+  const directory = dirname(path);
+  await durableReplace(join(directory, `.${randomUUID()}.manual-recovery.journal.tmp`), path, directory, committed, durability);
 }
 
 async function durableReplace(temporaryPath: string, path: string, directory: string, content: string, durability: StateDurabilityAdapter): Promise<void> {
@@ -212,7 +225,7 @@ async function loadLegacyManualRecovery(stateDir: string, name: string): Promise
   try {
     const recovery: unknown = JSON.parse(await readFile(legacyManualRecoveryPath(stateDir, name), 'utf8'));
     if (!isManualRecovery(recovery)) throw new Error(`Manual recovery state for ${name} is invalid; refusing to release lifecycle protection.`);
-    return recovery;
+    return normalizeManualRecovery(recovery);
   } catch (error: unknown) {
     if (isNodeError(error, 'ENOENT')) return undefined;
     throw error;
@@ -229,7 +242,7 @@ function parseManualRecoveryJournal(source: string, name: string): ManualRecover
     let entry: unknown;
     try { entry = JSON.parse(line); } catch { throw new Error(`Manual recovery journal for ${name} is corrupt before its final record; refusing to release lifecycle protection.`); }
     if (!isCheckedManualRecoveryJournalEvent(entry)) throw new Error(`Manual recovery journal for ${name} is corrupt before its final record; refusing to release lifecycle protection.`);
-    if (entry.event === 'set') recovery = entry.recovery;
+    if (entry.event === 'set') recovery = normalizeManualRecovery(entry.recovery);
     else recovery = undefined;
   }
   return recovery;
@@ -247,7 +260,16 @@ function journalChecksum(event: ManualRecoveryJournalEvent): string {
 
 /** This is deliberately separate from `unlock`: it records an operator's explicit remote-state acknowledgement. */
 export async function clearManualRecovery(stateDir: string, name: string): Promise<void> {
-  if (!await loadManualRecovery(stateDir, name)) throw new Error(`No manual recovery block exists for workspace "${name}".`);
+  const recovery = await loadManualRecovery(stateDir, name);
+  if (!recovery) throw new Error(`No manual recovery block exists for workspace "${name}".`);
+  await clearManualRecoveryIfCurrent(stateDir, name, recovery.generation);
+}
+
+/** Clear only the exact recovery barrier the caller observed while holding its lifecycle lock. */
+export async function clearManualRecoveryIfCurrent(stateDir: string, name: string, generation: string): Promise<void> {
+  const current = await loadManualRecovery(stateDir, name);
+  if (!current) throw new Error(`No manual recovery block exists for workspace "${name}".`);
+  if (current.generation !== generation) throw new Error(`Manual recovery block for workspace "${name}" changed since it was acknowledged; refusing to clear the newer record.`);
   const durability = stateDurability();
   await durability.assertStateWriteSupport();
   await bootstrapManualRecoveryJournal(stateDir, name);
@@ -340,9 +362,17 @@ function isCleanupState(value: unknown): boolean {
 function isManualRecovery(value: unknown): value is ManualRecovery {
   const candidate = typeof value === 'object' && value !== null ? value as Partial<ManualRecovery> : undefined;
   return candidate?.version === 1 &&
+    (!('generation' in candidate) || candidate.generation === undefined || (typeof candidate.generation === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(candidate.generation))) &&
     (candidate.reason === 'operation-may-be-active' || candidate.reason === 'remote-exec-interrupted' || candidate.reason === 'devcontainer-up-ambiguous' || candidate.reason === 'local-process-reap-unconfirmed') &&
     Array.isArray(candidate.containerIds) && candidate.containerIds.every(isCanonicalContainerId) &&
     isCanonicalPath(candidate.worktree) && typeof candidate.createdAt === 'string';
+}
+
+function normalizeManualRecovery(recovery: ManualRecovery): ManualRecovery {
+  if (typeof recovery.generation === 'string') return recovery;
+  // Legacy durable records predate generations. Their content-derived identity
+  // remains stable until a new set record replaces them.
+  return { ...recovery, generation: `00000000-0000-4000-8000-${createHash('sha256').update(JSON.stringify(recovery)).digest('hex').slice(0, 12)}` };
 }
 
 function manualRecoveryError(name: string): Error {
@@ -523,18 +553,20 @@ export async function acknowledgeUnconfirmedProcessReap(stateDir: string, name: 
     if (await pathExists(quarantinePath)) {
       const owner = await readLockOwner(quarantinePath);
       if (!owner) throw malformedLockError(name, quarantinePath);
+      if (localPidIsAlive(owner.pid)) throw new Error(`Lifecycle lock for workspace "${name}" is owned by active PID ${owner.pid}; refusing to interrupt it.`);
       await retireAcknowledgedLock(quarantinePath, quarantinePath, locksDir, lockName, name, owner, durability);
       return;
     }
     const owner = await readLockOwner(lockPath);
     if (!owner) {
-      if (await pathExists(retainedMarker)) throw malformedLockError(name, lockPath);
+      if (await pathExists(retainedMarker) || await pathExists(reapGuardPath(lockPath))) throw malformedLockError(name, lockPath);
       return;
     }
     if (await pathExists(retainedMarker)) {
       // The marker is inside a retained ordinary lock after a pre-move failure.
       // Retire it directly: retrying the failed lock-to-quarantine move would
       // make explicit recovery impossible when that transition is unavailable.
+      if (localPidIsAlive(owner.pid)) throw new Error(`Lifecycle lock for workspace "${name}" is owned by active PID ${owner.pid}; refusing to interrupt it.`);
       await retireAcknowledgedLock(lockPath, quarantinePath, locksDir, lockName, name, owner, durability);
       return;
     }
@@ -548,17 +580,20 @@ export async function acknowledgeUnconfirmedProcessReap(stateDir: string, name: 
 }
 
 async function retireAcknowledgedLock(path: string, quarantinePath: string, locksDir: string, lockName: string, name: string, owner: LockOwner, durability: StateDurabilityAdapter): Promise<void> {
-  const retired = join(locksDir, `.${owner.token}.retired`);
   try {
-    await moveOwnedLock(path, retired, owner, locksDir, durability);
-    await durableRemove(retired, locksDir, false, durability);
+    // Publish a recognized barrier before retiring the source. A `.retired`
+    // directory is intentionally never relied on as recovery state.
+    if (path !== quarantinePath && !await pathExists(quarantinePath)) {
+      const barrier = await acquireOwnedDirectory(quarantinePath, locksDir, `${lockName}.reap-unconfirmed`, Date.now() + 30_000, name, durability);
+      if (!barrier) throw new Error('Timed out publishing recovery quarantine.');
+    }
+    await durableRemove(path, locksDir, false, durability);
+    if (path !== quarantinePath) await durableRemove(quarantinePath, locksDir, false, durability);
   } catch (error: unknown) {
     // A failed remove may have deleted its path before the directory durability
     // boundary. Keep (or republish) the recognized quarantine barrier instead.
     try {
-      if (!await pathExists(quarantinePath)) {
-        await acquireOwnedDirectory(quarantinePath, locksDir, `${lockName}.reap-unconfirmed`, Date.now() + 30_000, name, durability);
-      }
+      if (!await pathExists(quarantinePath)) await acquireOwnedDirectory(quarantinePath, locksDir, `${lockName}.reap-unconfirmed`, Date.now() + 30_000, name, durability);
     } catch {
       // The original transition error remains the actionable failure; any
       // surviving source, retired path, or partially published barrier is not

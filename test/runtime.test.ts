@@ -391,7 +391,7 @@ test('execWorkspace retains a single exact-label interrupted-up candidate as a r
     /manual recovery/,
   );
   assert.equal(saves, 0, 'ambiguous discovery cannot replace a recorded canonical ID');
-  assert.deepEqual(recovery, { reason: 'devcontainer-up-ambiguous', containerIds: [discoveredId], worktree: metadata.worktree });
+  assert.deepEqual(recovery, { reason: 'devcontainer-up-ambiguous', containerIds: [knownContainerId, discoveredId], worktree: metadata.worktree });
   const discovery = calls.filter((call) => call.command === 'docker');
   assert.deepEqual(discovery.map((call) => call.args[0]), ['ps', 'inspect']);
   assert.notEqual(discovery[0].signal, lifecycle.signal, 'reconciliation survives the interrupted lifecycle signal');
@@ -625,7 +625,7 @@ test('execWorkspace records recovery instead of adopting a terminal ID whose Doc
       /manual recovery/,
     );
     assert.equal(saves, 0);
-    assert.deepEqual(recovery, { reason: 'devcontainer-up-ambiguous', containerIds: [], worktree: metadata.worktree });
+    assert.deepEqual(recovery, { reason: 'devcontainer-up-ambiguous', containerIds: [untrackedContainerId], worktree: metadata.worktree });
   }
 });
 

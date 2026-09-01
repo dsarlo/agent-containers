@@ -76,6 +76,7 @@ export function createNodeProcessRunner({
         let windowsReaperLive = false;
         let windowsTaskkillSucceeded = false;
         let rootClosed = false;
+        let posixGroupGone = false;
         let rootTerminationAttempted = false;
         const terminateRootOnce = () => {
           if (rootTerminationAttempted) return;
@@ -125,14 +126,19 @@ export function createNodeProcessRunner({
           try {
             // Bound even an initial ESRCH race: the root may never emit close.
             cancellationDeadline = schedule(unconfirmed, posixGraceMs + posixVerificationTimeoutMs);
-            signalGroup('SIGTERM');
+            posixGroupGone = !signalGroup('SIGTERM');
+            if (posixGroupGone && rootClosed) return unconfirmed();
             cancellationTimer = schedule(() => {
               try {
-                signalGroup('SIGKILL');
-                // Root close cannot prove the group died, and a group cannot
-                // prove a setsid escapee died. A proven-dead group can report
-                // the existing uncertainty promptly; otherwise keep waiting.
-                if (!signalGroup(0)) unconfirmed();
+                // Probe immediately before escalation. This avoids a known-gone
+                // group, but cannot close the POSIX PGID-reuse race; once the
+                // original root closed, fail closed rather than risk SIGKILL.
+                posixGroupGone = !signalGroup(0);
+                if (!posixGroupGone && !rootClosed) {
+                  signalGroup('SIGKILL');
+                  posixGroupGone = !signalGroup(0);
+                }
+                if (posixGroupGone && rootClosed) unconfirmed();
               } catch { /* deadline reports uncertainty */ }
             }, posixGraceMs);
           } catch { unconfirmed(); }
@@ -208,6 +214,7 @@ export function createNodeProcessRunner({
           receive('stderr', Buffer.alloc(0), true);
           const rootResult = { code: code ?? 1, stdout, stderr };
           if (!cancellationStarted) settle(rootResult);
+          else if (platform !== 'win32' && posixGroupGone) finishCancellation();
           else if (platform === 'win32' && (windowsTaskkillSucceeded || !windowsReaperLive)) {
             finishCancellation();
           }

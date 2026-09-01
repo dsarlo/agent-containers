@@ -88,7 +88,7 @@ test('legacy recovery remains a barrier when every staged journal migration boun
     if (boundary === 'publication') setStateDurableRenameForTesting(async () => { throw new Error(boundary); });
     try {
       await assert.rejects(() => bootstrapManualRecoveryJournal(stateDir, 'safe'), new RegExp(boundary));
-      assert.deepEqual(await loadManualRecovery(stateDir, 'safe'), legacy, `${boundary} must retain the legacy barrier`);
+      assert.deepEqual(await loadManualRecovery(stateDir, 'safe'), { ...legacy, generation: (await loadManualRecovery(stateDir, 'safe'))?.generation }, `${boundary} must retain the legacy barrier`);
     } finally {
       fail = false;
       setStateDurableRenameForTesting(undefined);
@@ -205,6 +205,27 @@ test('manual recovery journal retains an earlier recovery record when its final 
   assert.match(journal, /"checksum"/);
   await writeFile(journalPath, `${journal}{"event":"clear"`);
   assert.equal((await loadManualRecovery(stateDir, 'safe'))?.reason, 'operation-may-be-active');
+});
+
+test('a partial journal tail is durably repaired before the next recovery append', async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), 'agent-containers-recovery-journal-repair-'));
+  await recordManualRecovery(stateDir, 'safe', { reason: 'operation-may-be-active', containerIds: [], worktree: metadata.worktree });
+  const journalPath = join(stateDir, 'locks', 'safe.manual-recovery.journal');
+  const journal = await readFile(journalPath, 'utf8');
+  await writeFile(journalPath, `${journal}{"event":"clear"`);
+  await recordManualRecovery(stateDir, 'safe', { reason: 'remote-exec-interrupted', containerIds: [], worktree: metadata.worktree });
+  assert.equal((await loadManualRecovery(stateDir, 'safe'))?.reason, 'remote-exec-interrupted');
+  assert.equal((await readFile(journalPath, 'utf8')).endsWith('\n'), true);
+});
+
+test('a stale recovery observation cannot clear a newer manual recovery record', async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), 'agent-containers-recovery-generation-'));
+  await recordManualRecovery(stateDir, 'safe', { reason: 'operation-may-be-active', containerIds: [], worktree: metadata.worktree });
+  const observed = await loadManualRecovery(stateDir, 'safe');
+  assert.ok(observed);
+  await recordManualRecovery(stateDir, 'safe', { reason: 'remote-exec-interrupted', containerIds: [], worktree: metadata.worktree });
+  await assert.rejects(() => state.clearManualRecoveryIfCurrent(stateDir, 'safe', observed.generation), /changed since it was acknowledged/i);
+  assert.equal((await loadManualRecovery(stateDir, 'safe'))?.reason, 'remote-exec-interrupted');
 });
 
 test('a durable manual recovery blocks lifecycle and stale-PID unlock until an explicit operator acknowledgement', async () => {
@@ -373,7 +394,7 @@ test('failed guarded-lock acknowledgement deletion leaves the recognized recover
   await assert.rejects(() => releaseStaleWorkspaceLock(stateDir, 'safe', () => false), /quarantined.*Ordinary unlock never clears/i);
 });
 
-test('failed uncertain-reap recovery publication quarantines the lock from stale unlock until explicit acknowledgement', async () => {
+test('failed uncertain-reap recovery publication refuses acknowledgement while its recorded owner remains alive', async () => {
   const stateDir = await mkdtemp(join(tmpdir(), 'agent-containers-quarantined-lock-'));
   const { UnconfirmedProcessReapError } = await import('../src/workspaces.js');
   await assert.rejects(
@@ -383,10 +404,7 @@ test('failed uncertain-reap recovery publication quarantines the lock from stale
     /recovery disk full/,
   );
   await assert.rejects(() => releaseStaleWorkspaceLock(stateDir, 'safe', () => false), /quarantined.*Ordinary unlock never clears/i);
-  await acknowledgeUnconfirmedProcessReap(stateDir, 'safe');
-  let acquired = false;
-  await withWorkspaceLock(stateDir, 'safe', async () => { acquired = true; });
-  assert.equal(acquired, true);
+  await assert.rejects(() => acknowledgeUnconfirmedProcessReap(stateDir, 'safe'), /active PID/);
 });
 
 test('explicit reap acknowledgement rejects an active lifecycle normal guard', async () => {
@@ -448,10 +466,7 @@ test('marker open, file sync, and parent publication failures still quarantine t
       writeUnconfirmedReapMarker: failure === 'open' ? async () => { throw new Error('marker open failed'); } : undefined,
     }), /journal unavailable/);
     await assert.rejects(() => releaseStaleWorkspaceLock(stateDir, 'safe', () => false), /quarantined.*Ordinary unlock never clears/i);
-    await acknowledgeUnconfirmedProcessReap(stateDir, 'safe');
-    let acquired = false;
-    await withWorkspaceLock(stateDir, 'safe', async () => { acquired = true; });
-    assert.equal(acquired, true);
+    await assert.rejects(() => acknowledgeUnconfirmedProcessReap(stateDir, 'safe'), /active PID/);
   }
 });
 
