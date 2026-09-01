@@ -1,13 +1,17 @@
 import { join, resolve } from 'node:path';
 import { readFile } from 'node:fs/promises';
+import { createInterface } from 'node:readline/promises';
 import { assertDevcontainerPathCommittedOnBaseBranch, configurationDiff, hashConfig, initConfig, initConfigV2, loadConfig, parseConfig, saveConfigAtomic } from './config.js';
-import { doctor } from './setup.js';
+import { doctor, validateCodespacesSetup } from './setup.js';
 import type { CodespacesAgentContainersConfig } from './types.js';
 import { acknowledgeUnconfirmedProcessReap, clearManualRecoveryIfCurrent, defaultStateDir, deleteMetadata, listMetadata, loadManualRecovery, loadMetadata, recordManualRecovery, releaseStaleWorkspaceLock, saveMetadata, withWorkspaceLock } from './state.js';
 import { execNamedWorkspaceLifecycle } from './runtime.js';
 import { createWorkspace, findGitRoot, nodeProcessRunner, removeWorkspace } from './workspaces.js';
 
-export async function runCli(args: string[], cwd = process.cwd(), write: (message: string) => void = console.log): Promise<number> {
+export interface CliIo { input: NodeJS.ReadableStream; output: NodeJS.WritableStream; isTTY: boolean }
+const processIo: CliIo = { input: process.stdin, output: process.stdout, isTTY: Boolean(process.stdin.isTTY) };
+
+export async function runCli(args: string[], cwd = process.cwd(), write: (message: string) => void = console.log, io: CliIo = processIo): Promise<number> {
   if (args.length === 1 && (args[0] === '--help' || args[0] === '-h')) {
     write(usage());
     return 0;
@@ -35,14 +39,17 @@ export async function runCli(args: string[], cwd = process.cwd(), write: (messag
         if (source && stdin) throw new UsageError('Use only one of --from FILE or --stdin.');
         if (rest.includes('--interactive')) {
           if (nonInteractive || source || stdin) throw new UsageError('Interactive init cannot be combined with noninteractive input.');
-          const next = await interactiveConfig();
-          await initConfigV2(root, next);
+          requireCodespacesExperimental();
+          if (!io.isTTY) throw new UsageError('Interactive configuration requires a TTY; use --non-interactive --stdin for unattended setup.');
+          const next = await interactiveConfig(io);
+          await initConfigV2(root, await withSetupEvidence(next, root));
         } else if (source || stdin) {
           const next = await loadConfigFromSource(source ? resolve(cwd, source) : undefined, stdin);
           if (next.version !== 2) throw new Error('Noninteractive init accepts strict schema-v2 nonsecret configuration only.');
           if (next.backends.enabled.includes('codespaces')) requireCodespacesExperimental();
-          write(configurationDiff(null, next));
-          await initConfigV2(root, next);
+          const validated = await withSetupEvidence(next, root);
+          write(configurationDiff(null, validated));
+          await initConfigV2(root, validated);
         } else if (!selection) await initConfig(root, false);
         else await initConfigV2(root, setupConfig(selection, optionValue(rest, '--default-backend')));
         write(`Wrote ${join(root, '.agent-containers.yml')}`);
@@ -53,11 +60,12 @@ export async function runCli(args: string[], cwd = process.cwd(), write: (messag
         const interactive = rest.includes('--interactive');
         const stdin = rest.includes('--stdin');
         if (interactive === stdin && !optionValue(rest, '--from')) throw new UsageError('Use exactly one of --interactive, --from FILE, or --stdin.');
-        if (interactive && !process.stdin.isTTY) throw new UsageError('Interactive configuration requires a TTY; use --non-interactive --stdin for unattended setup.');
+        if (interactive && !io.isTTY) throw new UsageError('Interactive configuration requires a TTY; use --non-interactive --stdin for unattended setup.');
         if (!interactive && !rest.includes('--non-interactive')) throw new UsageError('Noninteractive configuration requires --non-interactive.');
         const source = optionValue(rest, '--from');
         const root = await findGitRoot(cwd, nodeProcessRunner);
-        const next = interactive ? await interactiveConfig() : await loadConfigFromSource(source ? resolve(cwd, source) : undefined, stdin);
+        if (interactive) requireCodespacesExperimental();
+        const next = interactive ? await interactiveConfig(io) : await loadConfigFromSource(source ? resolve(cwd, source) : undefined, stdin);
         if (next.version !== 2) throw new Error('ac configure accepts strict schema-v2 nonsecret configuration only.');
         if (next.backends.enabled.includes('codespaces')) requireCodespacesExperimental();
         const path = join(root, '.agent-containers.yml');
@@ -70,18 +78,19 @@ export async function runCli(args: string[], cwd = process.cwd(), write: (messag
         } catch (error: unknown) {
           if (!(typeof error === 'object' && error !== null && 'code' in error && error.code === 'ENOENT')) throw error;
         }
-        write(configurationDiff(current, next));
-        write((await saveConfigAtomic(path, next, expectedCurrentHash)) === 'saved' ? `Saved ${path}` : 'No configuration changes.');
+        const validated = await withSetupEvidence(next, root);
+        write(configurationDiff(current, validated));
+        write((await saveConfigAtomic(path, validated, expectedCurrentHash)) === 'saved' ? `Saved ${path}` : 'No configuration changes.');
         return 0;
       }
       case 'doctor': {
-        ensureOptions(rest, ['--backend', '--workspace', '--json'], ['--json']);
+        ensureOptions(rest, ['--backend', '--json'], ['--json']);
         const requestedBackend = optionValue(rest, '--backend') ?? 'all';
         if (requestedBackend !== 'local' && requestedBackend !== 'codespaces' && requestedBackend !== 'all') throw new UsageError('--backend must be local, codespaces, or all.');
         const backend = requestedBackend === 'all' ? 'both' : requestedBackend;
         if (backend === 'codespaces' || backend === 'both') requireCodespacesExperimental();
         const root = await findGitRoot(cwd, nodeProcessRunner);
-        const report = await doctor(await loadConfig(join(root, '.agent-containers.yml')), backend, nodeProcessRunner);
+        const report = await doctor(await loadConfig(join(root, '.agent-containers.yml')), backend, nodeProcessRunner, root);
         if (rest.includes('--json')) write(JSON.stringify(report, null, 2));
         else write(renderDoctor(report));
         return report.overall === 'ready' ? 0 : 1;
@@ -120,6 +129,8 @@ export async function runCli(args: string[], cwd = process.cwd(), write: (messag
         const separator = rest.indexOf('--');
         if (separator !== 1) throw new UsageError(`Usage: agent-containers ${command} <name> -- <command...>`);
         const name = rest[0];
+        const root = await findGitRoot(cwd, nodeProcessRunner);
+        assertLocalBackendEnabled(await loadConfig(join(root, '.agent-containers.yml')));
         await execNamedWorkspaceLifecycle(name, rest.slice(separator + 1), nodeProcessRunner, stateDir);
         return 0;
       }
@@ -214,7 +225,7 @@ function ensureOptions(args: string[], allowed: string[], flags: string[] = []):
 }
 
 function usage(): string {
-  return 'Usage: agent-containers <init|configure|doctor|validate|create|exec|run|recover|unlock|status|remove> [options]\n  init [--interactive] [--backends local|codespaces|both] [--default-backend local|codespaces]\n       [--non-interactive (--from FILE|--stdin)]\n  configure --interactive | --non-interactive (--from FILE|--stdin)\n  doctor [--backend local|codespaces|all] [--json]';
+  return 'Usage: agent-containers <init|configure|doctor|validate|create|exec|run|recover|unlock|status|remove> [options]\n  init [--interactive] [--backends local] [--non-interactive (--from FILE|--stdin)]\n  configure --interactive | --non-interactive (--from FILE|--stdin)\n  doctor [--backend local|codespaces|all] [--json]';
 }
 
 function requireCodespacesExperimental(): void {
@@ -222,7 +233,7 @@ function requireCodespacesExperimental(): void {
 }
 
 function assertLocalBackendEnabled(config: import('./types.js').AgentContainersConfig): void {
-  if (config.version === 2 && !config.backends.enabled.includes('local')) throw new Error('Local backend is disabled by this configuration; Codespaces lifecycle is not implemented in this release.');
+  if (config.version === 2 && (!config.backends.enabled.includes('local') || config.backends.default !== 'local')) throw new Error('Local execution is unavailable because Codespaces is selected or local is disabled; Codespaces lifecycle is not implemented in this release.');
 }
 
 function setupConfig(selection: string, defaultBackend?: string): CodespacesAgentContainersConfig {
@@ -231,7 +242,14 @@ function setupConfig(selection: string, defaultBackend?: string): CodespacesAgen
   if (selection === 'both' && !defaultBackend) throw new UsageError('--default-backend is required when --backends both is selected.');
   const selectedDefault = defaultBackend ?? (selection === 'codespaces' ? 'codespaces' : 'local');
   if ((selectedDefault !== 'local' && selectedDefault !== 'codespaces') || !enabled.includes(selectedDefault)) throw new UsageError('--default-backend must be an enabled backend.');
-  return { version: 2, workspace: { worktreeRoot: '../.agent-containers-worktrees', baseBranch: 'main' }, project: {}, environment: { devcontainerPath: '.devcontainer/devcontainer.json' }, backends: { enabled: [...enabled], default: selectedDefault as 'local' | 'codespaces', local: {}, codespaces: { enabled: enabled.includes('codespaces'), machine: null, geo: 'auto', idleTimeoutMinutes: 30, retentionPeriodMinutes: 10080, maxTotal: 4, maxRunning: 2, maxCreating: 1, maxParallelCommandsPerWorkspace: 1, readiness: { providerTimeoutSeconds: 1200, sshTimeoutSeconds: 120, command: [], commandTimeoutSeconds: 600 }, transport: { reconnectWindowSeconds: 60, cancelGraceSeconds: 10, remoteLogBytesPerStream: 67108864, remoteLogRetentionHours: 168 }, ports: { allowVisibilityChanges: false, allowPublic: false }, secrets: { allowedRemoteSecretNames: [], allowCodespaceGitCredential: false } } } };
+  if (enabled.includes('codespaces')) throw new UsageError('Codespaces setup requires validated repository/ref/Dev Container evidence; use ac init --interactive or --non-interactive --from FILE.');
+  return { version: 2, workspace: { worktreeRoot: '../.agent-containers-worktrees', baseBranch: 'main' }, project: {}, environment: { devcontainerPath: '.devcontainer/devcontainer.json' }, backends: { enabled: [...enabled], default: selectedDefault as 'local' | 'codespaces', local: {}, codespaces: { enabled: false, machine: null, geo: 'auto', idleTimeoutMinutes: 30, retentionPeriodMinutes: 10080, maxTotal: 4, maxRunning: 2, maxCreating: 1, maxParallelCommandsPerWorkspace: 1, readiness: { providerTimeoutSeconds: 1200, sshTimeoutSeconds: 120, command: [], commandTimeoutSeconds: 600 }, transport: { reconnectWindowSeconds: 60, cancelGraceSeconds: 10, remoteLogBytesPerStream: 67108864, remoteLogRetentionHours: 168 }, ports: { allowVisibilityChanges: false, allowPublic: false }, secrets: { allowedRemoteSecretNames: [], allowCodespaceGitCredential: false } } } };
+}
+
+async function withSetupEvidence(next: CodespacesAgentContainersConfig, root: string): Promise<CodespacesAgentContainersConfig> {
+  if (!next.backends.enabled.includes('codespaces')) return next;
+  const evidence = await validateCodespacesSetup(next, root, nodeProcessRunner);
+  return { ...next, project: { ...next.project, expectedOid: evidence.expectedOid }, environment: { ...next.environment, devcontainerBlobOid: evidence.devcontainerBlobOid } };
 }
 
 async function loadConfigFromSource(source: string | undefined, stdin: boolean): Promise<CodespacesAgentContainersConfig | import('./types.js').LocalAgentContainersConfig> {
@@ -240,11 +258,39 @@ async function loadConfigFromSource(source: string | undefined, stdin: boolean):
   return parseConfig(await readStdin());
 }
 
-async function interactiveConfig(): Promise<CodespacesAgentContainersConfig> {
-  process.stdout.write('Paste a complete nonsecret schema-v2 configuration, then end input (Ctrl-D/Ctrl-Z Enter). No tokens, keys, or secret values are accepted.\n');
-  const config = await loadConfigFromSource(undefined, true);
-  if (config.version !== 2) throw new Error('Interactive configuration requires strict schema-v2 nonsecret configuration.');
-  return config;
+async function interactiveConfig(io: CliIo): Promise<CodespacesAgentContainersConfig> {
+  const prompt = createInterface({ input: io.input, output: io.output, terminal: io.isTTY });
+  try {
+    io.output.write('Agent Containers Codespaces setup. Enter cancel at any prompt to leave configuration unchanged. Do not enter tokens, keys, or secret values.\n');
+    const backend = await ask(prompt, 'Backend [codespaces|both] (codespaces): ', 'codespaces');
+    if (backend !== 'codespaces' && backend !== 'both') throw new Error('Backend must be codespaces or both.');
+    const defaultBackend = backend === 'both' ? await ask(prompt, 'Default backend [local|codespaces]: ') : 'codespaces';
+    if (defaultBackend !== 'local' && defaultBackend !== 'codespaces') throw new Error('Default backend must be local or codespaces.');
+    const repository = await ask(prompt, 'Repository [OWNER/REPOSITORY]: ');
+    const ref = await ask(prompt, 'Remote ref [refs/heads/main]: ', 'refs/heads/main');
+    const devcontainerPath = await ask(prompt, 'Committed Dev Container path [.devcontainer/devcontainer.json]: ', '.devcontainer/devcontainer.json');
+    const machine = await ask(prompt, 'Machine (leave blank for action-required): ', '');
+    const idleTimeoutMinutes = numberPrompt(await ask(prompt, 'Idle timeout minutes [30]: ', '30'), 'Idle timeout minutes');
+    const retentionPeriodMinutes = numberPrompt(await ask(prompt, 'Retention minutes [10080]: ', '10080'), 'Retention minutes');
+    const candidate = setupConfigTemplate(backend, defaultBackend as 'local' | 'codespaces', repository, ref, devcontainerPath, machine || null, idleTimeoutMinutes, retentionPeriodMinutes);
+    io.output.write(configurationDiff(null, candidate) + '\nNo workspace, key, secret, or GitHub setting will be created or changed.\n');
+    if ((await ask(prompt, 'Save this nonsecret configuration? [yes/no]: ', 'no')).toLowerCase() !== 'yes') throw new Error('Configuration cancelled; no changes were made.');
+    return candidate;
+  } finally { prompt.close(); }
+}
+
+async function ask(prompt: ReturnType<typeof createInterface>, label: string, fallback?: string): Promise<string> {
+  const entered = (await prompt.question(label)).trim();
+  if (entered.toLowerCase() === 'cancel') throw new Error('Configuration cancelled; no changes were made.');
+  const value = entered || fallback;
+  if (value === undefined) throw new Error('Configuration cancelled; no changes were made.');
+  return value;
+}
+function numberPrompt(value: string, label: string): number { const parsed = Number(value); if (!Number.isInteger(parsed) || parsed < 1) throw new Error(`${label} must be a positive integer.`); return parsed; }
+
+function setupConfigTemplate(selection: string, defaultBackend: 'local' | 'codespaces', repository: string, ref: string, devcontainerPath: string, machine: string | null, idleTimeoutMinutes: number, retentionPeriodMinutes: number): CodespacesAgentContainersConfig {
+  const enabled: Array<'local' | 'codespaces'> = selection === 'both' ? ['local', 'codespaces'] : ['codespaces'];
+  return { version: 2, workspace: { worktreeRoot: '../.agent-containers-worktrees', baseBranch: 'main' }, project: { repository, ref }, environment: { devcontainerPath }, backends: { enabled, default: defaultBackend, local: {}, codespaces: { enabled: true, machine, geo: 'auto', idleTimeoutMinutes, retentionPeriodMinutes, maxTotal: 4, maxRunning: 2, maxCreating: 1, maxParallelCommandsPerWorkspace: 1, readiness: { providerTimeoutSeconds: 1200, sshTimeoutSeconds: 120, command: [], commandTimeoutSeconds: 600 }, transport: { reconnectWindowSeconds: 60, cancelGraceSeconds: 10, remoteLogBytesPerStream: 67108864, remoteLogRetentionHours: 168 }, ports: { allowVisibilityChanges: false, allowPublic: false }, secrets: { allowedRemoteSecretNames: [], allowCodespaceGitCredential: false } } } };
 }
 
 async function readStdin(): Promise<string> {

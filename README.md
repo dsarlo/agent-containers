@@ -71,7 +71,7 @@ The defaults are `version: 1`, `workspace.worktreeRoot: ../.agent-containers-wor
 
 ### Experimental Codespaces setup
 
-Schema v2 introduces an experimental, opt-in Codespaces configuration surface without changing local v1 behavior. Set `AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES=1`, then import a complete nonsecret v2 document with `ac init --non-interactive --from <file>` or update one through `ac configure --non-interactive --from <file>`. Both display a nonsecret, cost-sensitive preview before the atomic local save. The setup file contains policy only: repository/ref, committed Dev Container path, machine, geo, timeouts, capacity, readiness argv, port policy, and named remote-secret capabilities. It never accepts, displays, or persists tokens, provider keys, SSH keys, secret values, or GitHub authentication. Codespaces lifecycle commands are not implemented in this release.
+Schema v2 introduces an experimental, opt-in Codespaces configuration surface without changing local v1 behavior. Set `AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES=1`, then use the field-oriented `ac init --interactive` / `ac configure --interactive` flow or import a complete nonsecret v2 document with `--non-interactive --from <file>` or `--stdin`. Every Codespaces save verifies the canonical GitHub origin, remote ref, immutable commit OID, and committed regular Dev Container blob through read-only injected provider commands; those immutable source facts are persisted with the policy. The preview calls out cost-sensitive settings and confirmation is required interactively. No tokens, provider keys, SSH keys, secret values, or GitHub authentication are accepted, displayed, or persisted. Codespaces lifecycle commands are not implemented in this release.
 
 `ac doctor --backend local|codespaces|all [--json]` is read-only. Codespaces diagnosis also requires `AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES=1`. It uses `gh --version` and machine-readable GET API identity/preflight checks with a pinned GitHub API version, never calls `gh auth token`, creates a key, prompts, creates or starts a Codespace, uploads a helper, or changes ports/secrets/configuration. It explicitly reports runtime checks as action-required until an exact recorded running workspace can be safely assessed.
 
@@ -81,7 +81,7 @@ Codespaces creation and command execution are intentionally not exposed by this 
 
 ```text
 agent-containers init [--force]
-agent-containers init [--backends local|codespaces|both] [--default-backend local|codespaces]
+agent-containers init [--backends local]
 agent-containers configure --non-interactive --from <nonsecret-config-file>
 agent-containers doctor [--backend local|codespaces|all] [--json]
 agent-containers validate [--config path]

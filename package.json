@@ -42,6 +42,7 @@
     "native:verify-prebuilds": "node scripts/verify-native-prebuilds.mjs",
     "verify:native-packaging-contract": "node scripts/verify-native-packaging-contract.mjs",
     "test:native-packaging-contract": "node scripts/test-native-packaging-contract.mjs",
+    "verify:ci-yaml": "node scripts/verify-ci-yaml.mjs",
     "verify:native-state-lifecycle-contract": "node scripts/verify-native-state-lifecycle-contract.mjs",
     "test:native": "npm run build:native && npm run build && npm run verify:native-state-lifecycle-contract && node scripts/test-native.mjs",
     "lint": "eslint .",

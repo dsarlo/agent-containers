@@ -25,9 +25,9 @@ Defaults are merged before validation. Supplied empty values, wrong types, unkno
 
 ## Schema v2 Codespaces setup
 
-Schema v1 remains local-only and unchanged. Schema v2 is experimental and requires `AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES=1`. Import a complete v2 document with `ac init --non-interactive --from FILE` or `ac init --non-interactive --stdin`; configuration updates use `ac configure --non-interactive --from FILE` or `ac configure --non-interactive --stdin`. It is a nonsecret policy document: unknown fields, public ports, invalid paths, and invalid limits are rejected before any side effect.
+Schema v1 remains local-only and unchanged. Schema v2 is experimental and requires `AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES=1`. Use `ac init --interactive` or `ac configure --interactive` for the field-oriented setup flow, or import a complete v2 document with `--non-interactive --from FILE` / `--stdin`. It is a nonsecret policy document: unknown fields, public ports, invalid paths, and invalid limits are rejected before any side effect.
 
-`ac configure --interactive` currently accepts a complete schema-v2 document from standard input; use the explicit noninteractive form for automation. Each path validates the same schema, shows a complete nonsecret diff that calls out machine, idle timeout, retention, and capacity, then atomically saves or reports no change. No configuration command accepts, displays, stores, or reads tokens, API keys, SSH keys, or secret values. Codespaces lifecycle is intentionally unavailable in this release.
+Interactive setup prompts for backend/default backend, repository, remote ref, Dev Container path, machine, and cost-sensitive timeouts. It shows the preview and requires `yes`; `cancel` or any other confirmation leaves no file write. It does not accept pasted configuration. Each Codespaces save validates the canonical GitHub origin, remote ref, immutable commit OID, and committed regular Dev Container blob through read-only `git`/`gh api GET` calls, then persists `project.expectedOid` and `environment.devcontainerBlobOid` as immutable source evidence. No configuration command accepts, displays, stores, or reads tokens, API keys, SSH keys, or secret values. Codespaces lifecycle is intentionally unavailable in this release.
 
 ```yaml
 version: 2
@@ -37,8 +37,10 @@ workspace:
 project:
   repository: OWNER/REPOSITORY
   ref: refs/heads/main
+  expectedOid: 0123456789012345678901234567890123456789
 environment:
   devcontainerPath: .devcontainer/devcontainer.json
+  devcontainerBlobOid: abcdefabcdefabcdefabcdefabcdefabcdefabcd
 backends:
   enabled: [codespaces]
   default: codespaces

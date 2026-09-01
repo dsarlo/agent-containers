@@ -5,6 +5,8 @@ const API_VERSION = '2022-11-28';
 export type CodespacesProviderProcess = Pick<ProcessRunner, 'run'>;
 export interface GithubActor { id: string; login: string }
 export interface CodespaceIdentity { id: string; name: string; environmentId: string; state: string }
+export interface RepositorySourceEvidence { repository: string; requestedRef: string; expectedOid: string; devcontainerPath: string; devcontainerBlobOid: string }
+export interface CodespacesPreflight { billableOwner: string; machines: readonly { name: string; geos: readonly string[] }[]; portsAllowed: boolean; secretsAllowed: boolean }
 
 /** Thin, replaceable adapter. It intentionally exposes no token or auth operation. */
 export class GhCodespacesProvider {
@@ -30,6 +32,22 @@ export class GhCodespacesProvider {
     return this.api(`/repos/${repository}/codespaces/new${query}`);
   }
 
+  async resolveRef(repository: string, requestedRef: string): Promise<string> {
+    assertRepository(repository);
+    if (!safeRef(requestedRef)) throw new Error('Requested Git ref is unsafe.');
+    const value = await this.api(`/repos/${repository}/commits/${encodeURIComponent(requestedRef)}`);
+    if (!isRecord(value) || !oid(value.sha)) throw new Error('Requested ref is not available to Codespaces as an immutable commit.');
+    return value.sha;
+  }
+
+  async committedDevcontainerBlob(repository: string, expectedOid: string, path: string): Promise<string> {
+    assertRepository(repository);
+    if (!oid(expectedOid) || !safeRepositoryPath(path)) throw new Error('Dev Container path or expected commit is unsafe.');
+    const value = await this.api(`/repos/${repository}/contents/${encodeURIComponent(path)}?ref=${encodeURIComponent(expectedOid)}`);
+    if (!isRecord(value) || value.type !== 'file' || !oid(value.sha)) throw new Error('Configured Dev Container path is not a committed regular file at the requested immutable commit.');
+    return value.sha;
+  }
+
   private async api(path: string): Promise<unknown> {
     if (!path.startsWith('/')) throw new Error('Provider API path must be absolute.');
     const args = ['api', '--method', 'GET', '-H', `X-GitHub-Api-Version: ${API_VERSION}`];
@@ -38,6 +56,18 @@ export class GhCodespacesProvider {
     if (result.code !== 0) throw providerError('GET', path, result);
     try { return JSON.parse(result.stdout); } catch { throw new Error(`GitHub GET ${path} returned invalid JSON; refusing to infer remote state.`); }
   }
+}
+
+/** Reject incomplete provider data rather than treating a descriptive response as policy evidence. */
+export function parseCodespacesPreflight(value: unknown): CodespacesPreflight {
+  if (!isRecord(value) || !isRecord(value.billable_owner) || !losslessId(value.billable_owner.id)) throw new Error('Codespaces preflight lacks a non-null billable owner.');
+  if (!Array.isArray(value.machines) || value.machines.length === 0) throw new Error('Codespaces preflight lacks a non-empty machine inventory.');
+  const machines = value.machines.map((machine) => {
+    if (!isRecord(machine) || typeof machine.name !== 'string' || !machine.name || !Array.isArray(machine.geos) || machine.geos.length === 0 || machine.geos.some((geo) => typeof geo !== 'string' || !geo)) throw new Error('Codespaces preflight has an invalid machine or geo inventory.');
+    return { name: machine.name, geos: machine.geos as string[] };
+  });
+  if (typeof value.ports_allowed !== 'boolean' || typeof value.secrets_allowed !== 'boolean') throw new Error('Codespaces preflight lacks port and secret policy evidence.');
+  return { billableOwner: String(value.billable_owner.id), machines, portsAllowed: value.ports_allowed, secretsAllowed: value.secrets_allowed };
 }
 
 export interface SafeExecuteRequest { commandId: string; argv: readonly [string, ...string[]]; cwd?: string; mode: 'pipe' | 'pty'; stdin: 'closed' | 'stream' }
@@ -57,3 +87,7 @@ function redactDiagnostic(value: string): string {
 function isRecord(value: unknown): value is Record<string, unknown> { return typeof value === 'object' && value !== null && !Array.isArray(value); }
 function losslessId(value: unknown): boolean { return (typeof value === 'number' && Number.isSafeInteger(value) && value > 0) || (typeof value === 'string' && /^[1-9][0-9]*$/.test(value)); }
 function safeName(value: string): boolean { return /^[A-Za-z0-9-]+$/.test(value); }
+function oid(value: unknown): value is string { return typeof value === 'string' && /^[0-9a-f]{40,64}$/i.test(value); }
+function safeRef(value: string): boolean { return value.length > 0 && value.length <= 512 && !/[\0\r\n~^:?*\x5b\\]/.test(value) && !value.includes('..') && !value.endsWith('.') && !value.startsWith('/'); }
+function safeRepositoryPath(value: string): boolean { return value.length > 0 && !/[\0\r\n]/.test(value) && !value.startsWith('/') && !value.split('/').some((part) => !part || part === '.' || part === '..'); }
+function assertRepository(value: string): void { if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(value)) throw new Error('Invalid GitHub repository selector.'); }

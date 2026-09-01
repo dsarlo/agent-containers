@@ -1,8 +1,9 @@
-import { lstat, readFile, rename, rm, unlink, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { createHash, randomUUID } from 'node:crypto';
 import { basename, dirname, isAbsolute, join, posix, win32 } from 'node:path';
 import { parse } from 'yaml';
 import type { AgentContainersConfig, CodespacesAgentContainersConfig, LocalAgentContainersConfig, ProcessResult, ProcessRunner, ProcessRunOptions } from './types.js';
+import { getProductionStateDurabilityAdapter, type StateDurabilityAdapter } from './durability.js';
 
 export const CONFIG_OUTLINE = `# Agent Containers workspace configuration (schema version 1).
 # workspace.worktreeRoot is relative to the source repository unless absolute.
@@ -66,7 +67,7 @@ export async function initConfigV2(directory: string, config: CodespacesAgentCon
   const path = join(directory, '.agent-containers.yml');
   try { await lstat(path); throw new Error(`${path} already exists; use ac configure to review and update it.`); }
   catch (error: unknown) { if (!isNodeError(error, 'ENOENT')) throw error; }
-  await saveConfigAtomic(path, config);
+  await saveConfigAtomic(path, config, null);
 }
 
 export async function loadConfig(path: string): Promise<AgentContainersConfig> {
@@ -174,8 +175,8 @@ function parseV2Config(input: Record<string, unknown>): CodespacesAgentContainer
   for (const key of ['workspace', 'project', 'environment', 'backends']) if (!isRecord(input[key])) throw new Error(`Invalid configuration: ${key} must be an object`);
   const workspace = input.workspace as Record<string, unknown>, project = input.project as Record<string, unknown>, environment = input.environment as Record<string, unknown>, backends = input.backends as Record<string, unknown>;
   rejectUnknownKeys(workspace, ['worktreeRoot', 'baseBranch'], 'workspace');
-  rejectUnknownKeys(project, ['repository', 'ref'], 'project');
-  rejectUnknownKeys(environment, ['devcontainerPath'], 'environment');
+  rejectUnknownKeys(project, ['repository', 'ref', 'expectedOid'], 'project');
+  rejectUnknownKeys(environment, ['devcontainerPath', 'devcontainerBlobOid'], 'environment');
   rejectUnknownKeys(backends, ['enabled', 'default', 'local', 'codespaces'], 'backends');
   if (!isRecord(backends.local) || !isRecord(backends.codespaces) || Object.keys(backends.local).length) throw new Error('Invalid configuration: backends.local and backends.codespaces must be strict objects');
   const enabled = backends.enabled;
@@ -183,9 +184,10 @@ function parseV2Config(input: Record<string, unknown>): CodespacesAgentContainer
   if ((backends.default !== 'local' && backends.default !== 'codespaces') || !enabled.includes(backends.default)) throw new Error('Invalid configuration: backends.default must be enabled');
   const codespaces = parseCodespaces(backends.codespaces);
   if (codespaces.enabled !== enabled.includes('codespaces')) throw new Error('Invalid configuration: codespaces.enabled must agree with backends.enabled');
-  const config: CodespacesAgentContainersConfig = { version: 2, workspace: { worktreeRoot: requiredString(workspace.worktreeRoot, 'workspace.worktreeRoot'), baseBranch: requiredString(workspace.baseBranch, 'workspace.baseBranch') }, project: { repository: repository(project.repository), ref: optionalString(project.ref, 'project.ref') }, environment: { devcontainerPath: requiredString(environment.devcontainerPath, 'environment.devcontainerPath') }, backends: { enabled: [...enabled] as ('local' | 'codespaces')[], default: backends.default as 'local' | 'codespaces', local: {}, codespaces } };
+  const config: CodespacesAgentContainersConfig = { version: 2, workspace: { worktreeRoot: requiredString(workspace.worktreeRoot, 'workspace.worktreeRoot'), baseBranch: requiredString(workspace.baseBranch, 'workspace.baseBranch') }, project: { repository: repository(project.repository), ref: optionalString(project.ref, 'project.ref'), expectedOid: optionalOid(project.expectedOid, 'project.expectedOid') }, environment: { devcontainerPath: requiredString(environment.devcontainerPath, 'environment.devcontainerPath'), devcontainerBlobOid: optionalOid(environment.devcontainerBlobOid, 'environment.devcontainerBlobOid') }, backends: { enabled: [...enabled] as ('local' | 'codespaces')[], default: backends.default as 'local' | 'codespaces', local: {}, codespaces } };
   if (enabled.includes('codespaces') && !config.project.repository) throw new Error('Invalid configuration: project.repository is required when Codespaces is enabled');
   if (enabled.includes('codespaces') && !config.project.ref) throw new Error('Invalid configuration: project.ref is required when Codespaces is enabled');
+  if (enabled.includes('codespaces') && (!config.project.expectedOid || !config.environment.devcontainerBlobOid)) throw new Error('Invalid configuration: Codespaces requires validated project.expectedOid and environment.devcontainerBlobOid evidence');
   const devcontainerPath = safeRepositoryPath(config.environment.devcontainerPath);
   if (!devcontainerPath) throw new Error('Invalid configuration: environment.devcontainerPath must be a safe repository-relative path.');
   config.environment.devcontainerPath = devcontainerPath;
@@ -214,36 +216,90 @@ export function configurationDiff(current: AgentContainersConfig | null, next: A
   return `Configuration preview (nonsecret; cost-sensitive settings): ${cost}\n- ${current ? JSON.stringify(current, null, 2) : '(no configuration)'}\n+ ${JSON.stringify(next, null, 2)}`;
 }
 export function hashConfig(source: string): string { return createHash('sha256').update(source).digest('hex'); }
-export async function saveConfigAtomic(path: string, next: AgentContainersConfig, expectedCurrentHash?: string): Promise<'saved' | 'no-change'> {
+export interface ConfigPublicationOptions {
+  durabilityAdapter?: StateDurabilityAdapter;
+  abortSignal?: AbortSignal;
+  deadlineMs?: number;
+  ownerAlive?: (pid: number) => boolean;
+  now?: () => number;
+  sleep?: (milliseconds: number) => Promise<void>;
+}
+interface ConfigLockOwner { pid: number; operation: 'configuration-publication'; token: string; createdAt: string }
+
+/** Publishes only a schema-valid candidate with owner-aware durable serialization. */
+export async function saveConfigAtomic(path: string, next: AgentContainersConfig, expectedCurrentHash?: string | null, options: ConfigPublicationOptions = {}): Promise<'saved' | 'no-change'> {
   const source = `${JSON.stringify(next, null, 2)}\n`;
   // Reparse the serialized candidate at the publication boundary so callers
   // cannot bypass the strict schema by constructing an object directly.
   parseConfig(source);
+  const adapter = options.durabilityAdapter ?? getProductionStateDurabilityAdapter();
+  await adapter.assertStateWriteSupport();
   const lock = `${path}.lock`;
-  await acquireConfigLock(lock);
+  const release = await acquireConfigLock(lock, adapter, options);
   try {
-    try { const current = await readFile(path, 'utf8'); if (current === source) return 'no-change'; if (expectedCurrentHash && hashConfig(current) !== expectedCurrentHash) throw new Error('Configuration changed concurrently; reload and review the new diff.'); } catch (error: unknown) { if (!isNodeError(error, 'ENOENT')) throw error; if (expectedCurrentHash) throw new Error('Configuration changed concurrently; it no longer exists.', { cause: error }); }
-    const temporary = join(dirname(path), `.${basename(path)}.${randomUUID()}.tmp`);
+    try { const current = await readFile(path, 'utf8'); if (current === source) return 'no-change'; if (expectedCurrentHash === null || (expectedCurrentHash !== undefined && hashConfig(current) !== expectedCurrentHash)) throw new Error('Configuration changed concurrently; reload and review the new diff.'); } catch (error: unknown) { if (!isNodeError(error, 'ENOENT')) throw error; if (expectedCurrentHash !== undefined) throw new Error('Configuration changed concurrently; it no longer exists.', { cause: error }); }
+    const directory = dirname(path);
+    const temporary = join(directory, `.${basename(path)}.${randomUUID()}.tmp`);
     await writeFile(temporary, source, { encoding: 'utf8', flag: 'wx', mode: 0o600 });
-    try { await rename(temporary, path); } catch (error) { await rm(temporary, { force: true }); throw error; }
+    try {
+      await adapter.syncFile(temporary);
+      if (await adapter.publicationMode() === 'strict') {
+        await rename(temporary, path);
+        await adapter.syncDirectory(directory);
+      } else await adapter.moveFileWriteThrough(temporary, path);
+    } catch (error) { await rm(temporary, { force: true }); throw error; }
     return 'saved';
   } finally {
-    await unlink(lock).catch((error: unknown) => { if (!isNodeError(error, 'ENOENT')) throw new Error(`Could not release configuration lock ${lock}.`, { cause: error }); });
+    await release();
   }
 }
-async function acquireConfigLock(lock: string): Promise<void> {
-  const deadline = Date.now() + 5_000;
+async function acquireConfigLock(lock: string, adapter: StateDurabilityAdapter, options: ConfigPublicationOptions): Promise<() => Promise<void>> {
+  const now = options.now ?? Date.now;
+  const deadline = now() + (options.deadlineMs ?? 5_000);
+  const sleep = options.sleep ?? ((milliseconds: number) => new Promise<void>((resolveDelay) => setTimeout(resolveDelay, milliseconds)));
+  const ownerAlive = options.ownerAlive ?? ((pid: number) => { try { process.kill(pid, 0); return true; } catch (error: unknown) { return !isNodeError(error, 'ESRCH'); } });
   for (;;) {
-    try { await writeFile(lock, `${process.pid}\n`, { encoding: 'utf8', flag: 'wx', mode: 0o600 }); return; }
+    if (options.abortSignal?.aborted) throw new Error('Configuration publication was cancelled while waiting for the active owner.');
+    let pending: string | undefined;
+    try {
+      const pendingPath = `${lock}.${randomUUID()}.pending`;
+      pending = pendingPath;
+      await mkdir(pendingPath, { mode: 0o700 });
+      const owner: ConfigLockOwner = { pid: process.pid, operation: 'configuration-publication', token: randomUUID(), createdAt: new Date(now()).toISOString() };
+      const ownerPath = join(pendingPath, 'owner.json');
+      await writeFile(ownerPath, JSON.stringify(owner), { encoding: 'utf8', flag: 'wx', mode: 0o600 });
+      await adapter.syncFile(ownerPath);
+      if (await adapter.publicationMode() === 'strict') {
+        await adapter.syncDirectory(pendingPath);
+        await rename(pendingPath, lock);
+        await adapter.syncDirectory(dirname(lock));
+      } else await adapter.moveFileWriteThrough(pendingPath, lock);
+      return async () => { await rm(lock, { recursive: true, force: true }); if (await adapter.publicationMode() === 'strict') await adapter.syncDirectory(dirname(lock)); };
+    }
     catch (error: unknown) {
-      if (!isNodeError(error, 'EEXIST')) throw new Error(`Could not acquire configuration lock ${lock}.`, { cause: error });
-      if (Date.now() >= deadline) throw new Error('Configuration is being updated by another process; retry after reviewing the latest configuration.', { cause: error });
-      await new Promise((resolveDelay) => setTimeout(resolveDelay, 10));
+      if (pending) await rm(pending, { recursive: true, force: true });
+      if (!isNodeError(error, 'EEXIST') && !isNodeError(error, 'ENOTEMPTY')) throw new Error(`Could not acquire configuration lock ${lock}.`, { cause: error });
+      const owner = await readConfigLockOwner(lock);
+      if (owner && !ownerAlive(owner.pid)) {
+        await rm(lock, { recursive: true, force: false });
+        if (await adapter.publicationMode() === 'strict') await adapter.syncDirectory(dirname(lock));
+        continue;
+      }
+      if (now() >= deadline) throw new Error('Configuration is being updated by an active or unverifiable owner; retry after reviewing the latest configuration.', { cause: error });
+      await sleep(10);
     }
   }
 }
+async function readConfigLockOwner(lock: string): Promise<ConfigLockOwner | undefined> {
+  try {
+    const value: unknown = JSON.parse(await readFile(join(lock, 'owner.json'), 'utf8'));
+    if (isRecord(value) && typeof value.pid === 'number' && Number.isInteger(value.pid) && value.pid > 0 && value.operation === 'configuration-publication' && typeof value.token === 'string' && typeof value.createdAt === 'string') return value as ConfigLockOwner;
+  } catch { /* A malformed owner is never blindly removed. */ }
+  return undefined;
+}
 function requiredString(value: unknown, label: string): string { if (!nonEmptyString(value)) throw new Error(`Invalid configuration: ${label} must be a non-empty string`); return value; }
 function optionalString(value: unknown, label: string): string | undefined { return value === undefined ? undefined : requiredString(value, label); }
+function optionalOid(value: unknown, label: string): string | undefined { if (value === undefined) return undefined; const oid = requiredString(value, label); if (!/^[0-9a-f]{40,64}$/i.test(oid)) throw new Error(`Invalid configuration: ${label} must be a full Git object ID`); return oid; }
 function repository(value: unknown): string | undefined { if (value === undefined) return undefined; const result = requiredString(value, 'project.repository'); if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(result)) throw new Error('Invalid configuration: project.repository must be OWNER/REPOSITORY'); return result; }
 function requiredBoolean(value: unknown, label: string): boolean { if (typeof value !== 'boolean') throw new Error(`Invalid configuration: ${label} must be boolean`); return value; }
 function requiredInteger(value: unknown, label: string, minimum: number, maximum = Number.MAX_SAFE_INTEGER): number { if (typeof value !== 'number' || !Number.isInteger(value) || value < minimum || value > maximum) throw new Error(`Invalid configuration: ${label} must be an integer between ${minimum} and ${maximum}`); return value; }

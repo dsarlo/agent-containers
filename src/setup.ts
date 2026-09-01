@@ -1,61 +1,105 @@
-import { GhCodespacesProvider } from './codespaces.js';
-import type { AgentContainersConfig, BackendKind, BackendSelection, DoctorCheck, DoctorReport, ProcessRunner, SetupState } from './types.js';
+import { GhCodespacesProvider, parseCodespacesPreflight } from './codespaces.js';
+import type { AgentContainersConfig, BackendKind, BackendSelection, DoctorCheck, DoctorReport, ProcessResult, ProcessRunner, SetupState } from './types.js';
 
-export async function doctor(config: AgentContainersConfig, selection: BackendSelection, runner: ProcessRunner): Promise<DoctorReport> {
-  const selectedBackends = select(config, selection);
-  const checks: DoctorCheck[] = [];
-  for (const backend of selectedBackends) {
-    if (backend === 'local') checks.push(localCheck());
-    else checks.push(...await codespacesChecks(config, runner));
-  }
-  return { schemaVersion: 1, selectedBackends, overall: overall(checks), checks };
+export interface CodespacesSetupEvidence { repository: string; requestedRef: string; expectedOid: string; devcontainerPath: string; devcontainerBlobOid: string }
+export interface DoctorOptions { abortSignal?: AbortSignal; timeoutMs?: number }
+
+/** Read-only repository discovery used by init, configure, and doctor. */
+export async function validateCodespacesSetup(config: AgentContainersConfig, root: string, runner: ProcessRunner): Promise<CodespacesSetupEvidence> {
+  if (config.version !== 2 || !config.backends.enabled.includes('codespaces') || !config.project.repository || !config.project.ref) throw new Error('Codespaces requires an explicit repository and remotely resolvable ref.');
+  const remote = await runner.run('git', ['remote', 'get-url', 'origin'], { cwd: root });
+  if (remote.code !== 0) throw new Error('No origin remote is configured; explicitly configure the GitHub repository before enabling Codespaces.');
+  const discovered = canonicalGithubRepository(remote.stdout.trim());
+  if (!discovered || discovered.toLowerCase() !== config.project.repository.toLowerCase()) throw new Error('Configured repository does not match a canonical github.com origin.');
+  const provider = new GhCodespacesProvider(runner);
+  let expectedOid: string;
+  try { expectedOid = await provider.resolveRef(config.project.repository, config.project.ref); }
+  catch { throw new Error(`Requested ref ${config.project.ref} is not available to Codespaces; push it to ${config.project.repository} or select a remote ref.`); }
+  const devcontainerBlobOid = await provider.committedDevcontainerBlob(config.project.repository, expectedOid, config.environment.devcontainerPath);
+  return { repository: config.project.repository, requestedRef: config.project.ref, expectedOid, devcontainerPath: config.environment.devcontainerPath, devcontainerBlobOid };
 }
 
+function canonicalGithubRepository(remote: string): string | undefined {
+  return /^(?:https:\/\/github\.com\/|git@github\.com:)([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+?)(?:\.git)?\/?$/.exec(remote)?.[1];
+}
+
+/** A bounded, shell-free diagnostic report. Every runner failure becomes a check result. */
+export async function doctor(config: AgentContainersConfig, selection: BackendSelection, runner: ProcessRunner, root = process.cwd(), options: DoctorOptions = {}): Promise<DoctorReport> {
+  const selectedBackends = select(config, selection);
+  const safeRunner = boundedRunner(runner, options);
+  const checks: DoctorCheck[] = [];
+  for (const backend of selectedBackends) checks.push(...(backend === 'local' ? await localChecks(config, safeRunner, root) : await codespacesChecks(config, safeRunner, root)));
+  return { schemaVersion: 1, selectedBackends, overall: overall(checks), checks };
+}
 function select(config: AgentContainersConfig, selection: BackendSelection): BackendKind[] {
   const enabled: BackendKind[] = config.version === 1 ? ['local'] : config.backends.enabled;
   if (selection === 'both') return enabled;
   if (!enabled.includes(selection)) throw new Error(`Backend ${selection} is not enabled by this configuration.`);
   return [selection];
 }
-function localCheck(): DoctorCheck { return { id: 'local.runtime.workspace', backend: 'local', phase: 'provisioned-runtime', state: 'action-required', summary: 'No exact recorded local workspace was supplied for runtime diagnosis.', remediation: ['Create or select a local workspace explicitly.', 'Run ac doctor --backend local again.'] }; }
-async function codespacesChecks(config: AgentContainersConfig, runner: ProcessRunner): Promise<DoctorCheck[]> {
-  const checks: DoctorCheck[] = [];
-  const version = await runner.run('gh', ['--version']);
-  checks.push(version.code === 0 ? ready('codespaces.gh', 'GitHub CLI is available.') : action('codespaces.gh', 'GitHub CLI is unavailable.', ['Install a supported gh CLI.', 'Run ac doctor --backend codespaces again.']));
+async function localChecks(config: AgentContainersConfig, runner: ProcessRunner, root: string): Promise<DoctorCheck[]> {
+  const git = await attempt(runner, 'git', ['--version'], root);
+  const repository = await attempt(runner, 'git', ['rev-parse', '--is-inside-work-tree'], root);
+  const worktree = await attempt(runner, 'git', ['worktree', 'add', '-h'], root);
+  const docker = await attempt(runner, 'docker', ['--version'], root);
+  const devcontainer = await attempt(runner, 'devcontainer', ['--version'], root);
+  const configured = config.version === 1 || config.backends.enabled.includes('local');
+  return [
+    result('local.os', process.platform === 'win32' || process.platform === 'darwin' || process.platform === 'linux', 'Host OS is supported.', 'Host OS is unsupported.'),
+    result('local.git', git?.code === 0, 'Git is available.', 'Git is unavailable.'),
+    result('local.repository', repository?.code === 0 && repository.stdout.trim() === 'true', 'Git repository is available.', 'Git repository cannot be verified.'),
+    result('local.worktree', worktree?.code === 0 && /relative-paths/.test(`${worktree.stdout}${worktree.stderr}`), 'Git worktree relative paths are supported.', 'Git worktree relative paths are unsupported.'),
+    result('local.docker', docker?.code === 0, 'Docker is available.', 'Docker is unavailable.'),
+    result('local.devcontainers', devcontainer?.code === 0, 'Dev Containers CLI is available.', 'Dev Containers CLI is unavailable.'),
+    result('local.config', configured, 'Local backend is enabled by configuration.', 'Local backend is disabled by configuration.'),
+    { id: 'local.state.durability', backend: 'local', phase: 'pre-provision', state: 'action-required', summary: 'State durability is checked before lifecycle dispatch.', remediation: ['Run a lifecycle command only with the packaged native durability addon.', 'Run ac doctor --backend local again.'] },
+    runtime('local.runtime.workspace', 'No exact recorded local workspace was supplied; provisioned runtime remains uninspected.'),
+  ];
+}
+async function codespacesChecks(config: AgentContainersConfig, runner: ProcessRunner, root: string): Promise<DoctorCheck[]> {
   const v2 = config.version === 2 ? config : undefined;
-  if (version.code === 0) {
-    try { const actor = await new GhCodespacesProvider(runner).actor(); checks.push({ ...ready('codespaces.actor', 'Authenticated GitHub actor was read successfully.'), evidence: { actorId: actor.id, actorLogin: actor.login } }); }
-    catch { checks.push(action('codespaces.actor', 'GitHub actor cannot be read through the read-only API.', ['Authenticate gh with Codespaces access.', 'Run ac doctor --backend codespaces again.'])); }
-  } else checks.push(action('codespaces.actor', 'GitHub actor cannot be checked until gh is installed.', ['Install a supported gh CLI.', 'Run ac doctor --backend codespaces again.']));
-  const repository = v2?.project.repository;
-  const ref = v2?.project.ref;
-  checks.push(repository ? ready('codespaces.repository', `GitHub repository ${repository} is explicitly configured.`) : action('codespaces.repository', 'No GitHub repository is configured.', ['Set project.repository to OWNER/REPOSITORY with ac configure.', 'Run ac doctor --backend codespaces again.']));
-  checks.push(ref ? ready('codespaces.ref', `Remote ref ${ref} is explicitly configured.`) : action('codespaces.ref', 'No remotely resolvable Git ref is configured.', ['Set project.ref to a remote branch or commit with ac configure.', 'Run ac doctor --backend codespaces again.']));
-  checks.push(v2 ? ready('codespaces.devcontainer', `Committed Dev Container path ${v2.environment.devcontainerPath} is configured.`) : action('codespaces.devcontainer', 'Schema v2 is required for Codespaces.', ['Run ac init --backends codespaces or ac configure with a schema-v2 file.', 'Run ac doctor --backend codespaces again.']));
-  if (version.code === 0 && repository) {
+  const gh = await attempt(runner, 'gh', ['--version'], root);
+  const ghReady = gh?.code === 0;
+  const provider = new GhCodespacesProvider(runner);
+  const actor = ghReady ? await attemptValue(() => provider.actor()) : undefined;
+  const source = ghReady && v2 ? await attemptValue(() => validateCodespacesSetup(config, root, runner)) : undefined;
+  const preflight = ghReady && v2?.project.repository ? await attemptValue(async () => parseCodespacesPreflight(await provider.preflight(v2.project.repository!, v2.project.ref))) : undefined;
+  const selected = v2?.backends.codespaces.machine;
+  const selectedMachine = preflight?.machines.find((machine) => machine.name === selected);
+  const geoEligible = selectedMachine && (v2!.backends.codespaces.geo === 'auto' || selectedMachine.geos.includes(v2!.backends.codespaces.geo));
+  return [
+    result('codespaces.experimental', process.env.AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES === '1', 'Experimental Codespaces gate is enabled.', 'Set AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES=1.'),
+    result('codespaces.gh', ghReady, 'GitHub CLI is available.', 'GitHub CLI is unavailable.'),
+    actor ? { ...ready('codespaces.actor', 'Authenticated GitHub actor was read successfully.'), evidence: { actorId: actor.id, actorLogin: actor.login } } : action('codespaces.actor', 'GitHub actor cannot be read through the read-only API.'),
+    source ? { ...ready('codespaces.repository', `GitHub repository ${source.repository} was verified from origin.`), evidence: { repository: source.repository } } : action('codespaces.repository', 'GitHub repository identity is not verified from the configured origin.'),
+    source ? { ...ready('codespaces.ref', `Remote ref resolves to immutable ${source.expectedOid}.`), evidence: { expectedOid: source.expectedOid } } : action('codespaces.ref', 'No remotely resolvable Git ref/OID evidence is available.'),
+    source ? { ...ready('codespaces.devcontainer', 'Committed regular Dev Container blob was verified.'), evidence: { devcontainerBlobOid: source.devcontainerBlobOid } } : action('codespaces.devcontainer', 'Dev Container path is not verified as a committed regular file.'),
+    preflight ? { ...ready('codespaces.preflight', 'Codespaces preflight policy is complete.'), evidence: { billableOwner: preflight.billableOwner, machineCount: preflight.machines.length } } : action('codespaces.preflight', 'Codespaces preflight could not be read as complete structured policy.'),
+    result('codespaces.machine', Boolean(selectedMachine), 'Configured machine appears in provider inventory.', 'Configured machine is absent from provider inventory.'),
+    result('codespaces.geo', Boolean(geoEligible), 'Configured geo is eligible for selected machine.', 'Configured geo is not eligible for selected machine.'),
+    result('codespaces.ports', Boolean(preflight && (!v2!.backends.codespaces.ports.allowVisibilityChanges || preflight.portsAllowed)), 'Port policy is compatible with provider policy.', 'Port policy is not validated by provider policy.'),
+    result('codespaces.secrets', Boolean(preflight && (!v2!.backends.codespaces.secrets.allowedRemoteSecretNames.length || preflight.secretsAllowed)), 'Named secret capability policy is compatible with provider policy.', 'Secret capability policy is not validated by provider policy.'),
+    action('codespaces.ssh-key', 'A pre-existing SSH key/config is required later and was not inspected.'),
+    runtime('codespaces.runtime.workspace', 'No exact recorded running Codespace was supplied; provisioned runtime remains uninspected.'),
+  ];
+}
+function boundedRunner(runner: ProcessRunner, options: DoctorOptions): ProcessRunner {
+  return { run: async (command, args, runOptions) => {
+    if (options.abortSignal?.aborted) throw new Error('Doctor operation aborted.');
+    const controller = new AbortController();
+    const relay = () => controller.abort();
+    options.abortSignal?.addEventListener('abort', relay, { once: true });
     try {
-      const preflight = await new GhCodespacesProvider(runner).preflight(repository, ref);
-      if (!validPreflight(preflight)) throw new Error('preflight schema is incomplete');
-      checks.push(ready('codespaces.preflight', 'GitHub Codespaces preflight is readable.'));
-    } catch {
-      checks.push(action('codespaces.preflight', 'GitHub Codespaces preflight could not be read.', ['Verify repository access and Codespaces policy with gh.', 'Run ac doctor --backend codespaces again.']));
-    }
-  } else checks.push(action('codespaces.preflight', 'GitHub Codespaces preflight requires gh and an explicit repository.', ['Configure gh and project.repository.', 'Run ac doctor --backend codespaces again.']));
-  if (!v2?.backends.codespaces.machine) checks.push(action('codespaces.machine', 'No explicit Codespaces machine is configured.', ['Use ac configure to select a machine from provider preflight.', 'Run ac doctor --backend codespaces again.']));
-  else checks.push(ready('codespaces.machine', `Explicit Codespaces machine ${v2.backends.codespaces.machine} is configured.`));
-  checks.push(action('codespaces.ssh-key', 'A pre-existing SSH key/config is required later for Codespaces transport and was not inspected.', ['Provide a suitable existing SSH key/config before explicit transport.', 'Run ac doctor --backend codespaces again.']));
-  checks.push({ id: 'codespaces.runtime.workspace', backend: 'codespaces', phase: 'provisioned-runtime', state: 'action-required', summary: 'No exact recorded running Codespace was supplied; runtime checks were not performed.', remediation: ['Codespaces lifecycle is not implemented in this release.', 'Run ac doctor --backend codespaces again after enabling a future lifecycle release.'] });
-  const preflightReady = checks.some((check) => check.id === 'codespaces.preflight' && check.state === 'ready');
-  for (const id of ['codespaces.repository', 'codespaces.ref', 'codespaces.devcontainer']) {
-    const index = checks.findIndex((check) => check.id === id);
-    if (index >= 0 && checks[index].state === 'ready' && !preflightReady) checks[index] = action(id, `${checks[index].summary} Provider validation is still required.`, ['Fix Codespaces preflight access and configuration.', 'Run ac doctor --backend codespaces again.']);
-  }
-  return checks;
+      const operation = runner.run(command, args, { ...runOptions, signal: controller.signal });
+      const timeout = new Promise<never>((_, reject) => setTimeout(() => { controller.abort(); reject(new Error('Doctor operation timed out.')); }, options.timeoutMs ?? 5_000));
+      return await Promise.race([operation, timeout]);
+    } finally { options.abortSignal?.removeEventListener('abort', relay); }
+  } };
 }
-function validPreflight(value: unknown): boolean {
-  return typeof value === 'object' && value !== null && !Array.isArray(value) &&
-    'billable_owner' in value && typeof (value as { billable_owner?: unknown }).billable_owner === 'object';
-}
-function ready(id: string, summary: string): DoctorCheck { return { id, backend: 'codespaces', phase: 'pre-provision', state: 'ready', summary, remediation: [] }; }
-function action(id: string, summary: string, remediation: string[]): DoctorCheck { return { id, backend: 'codespaces', phase: 'pre-provision', state: 'action-required', summary, remediation }; }
+async function attempt(runner: ProcessRunner, command: string, args: string[], cwd: string): Promise<ProcessResult | undefined> { try { return await runner.run(command, args, { cwd }); } catch { return undefined; } }
+async function attemptValue<T>(operation: () => Promise<T>): Promise<T | undefined> { try { return await operation(); } catch { return undefined; } }
+function result(id: string, ok: boolean, yes: string, no: string): DoctorCheck { return ok ? ready(id, yes) : action(id, no); }
+function ready(id: string, summary: string): DoctorCheck { return { id, backend: id.startsWith('local.') ? 'local' : 'codespaces', phase: 'pre-provision', state: 'ready', summary, remediation: [] }; }
+function action(id: string, summary: string): DoctorCheck { return { id, backend: id.startsWith('local.') ? 'local' : 'codespaces', phase: 'pre-provision', state: 'action-required', summary, remediation: [`Correct ${id} prerequisite.`, `Run ac doctor --backend ${id.startsWith('local.') ? 'local' : 'codespaces'} again.`] }; }
+function runtime(id: string, summary: string): DoctorCheck { return { ...action(id, summary), phase: 'provisioned-runtime' }; }
 function overall(checks: readonly DoctorCheck[]): SetupState { return checks.some((check) => check.state === 'unsupported') ? 'unsupported' : checks.some((check) => check.state === 'action-required') ? 'action-required' : 'ready'; }

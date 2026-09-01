@@ -34,8 +34,8 @@ export interface CodespacesConfig {
 export interface CodespacesAgentContainersConfig {
   version: 2;
   workspace: { worktreeRoot: string; baseBranch: string };
-  project: { repository?: string; ref?: string };
-  environment: { devcontainerPath: string };
+  project: { repository?: string; ref?: string; expectedOid?: string };
+  environment: { devcontainerPath: string; devcontainerBlobOid?: string };
   backends: { enabled: BackendKind[]; default: BackendKind; local: Record<string, never>; codespaces: CodespacesConfig };
 }
 
