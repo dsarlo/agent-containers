@@ -19,6 +19,7 @@ const requiredPackage = {
 };
 
 const packageArchiveDirectory = 'native-package';
+const packageInstallArchiveGlob = `./${packageArchiveDirectory}/*.tgz`;
 const liveNativeBuildStep = '      - run: npm run build:native';
 const actionRefs = Object.freeze({
   'actions/checkout': '11d5960a326750d5838078e36cf38b85af677262',
@@ -68,7 +69,7 @@ ${actionStep('actions/download-artifact', refs['actions/download-artifact'])}
         with:
           name: native-package
           path: ${archiveDirectory}
-      - run: mkdir .packed-native && npm install --prefix .packed-native ${archiveDirectory}/*.tgz
+      - run: mkdir .packed-native && npm install --prefix .packed-native ./${archiveDirectory}/*.tgz
       - run: node scripts/test-native.mjs
         env:
           PACKED_NATIVE_PACKAGE_DIR: ${'${{ github.workspace }}'}/.packed-native/node_modules/@dsarlo/agent-containers
@@ -466,6 +467,27 @@ try {
     );
   }
 
+  const legacyPackageInstallWorkflow = workflowFor(allSupportedArchitectures).replace(
+    `npm install --prefix .packed-native ${packageInstallArchiveGlob}`,
+    `npm install --prefix .packed-native ${packageArchiveDirectory}/*.tgz`,
+  );
+  await writeFixture(legacyPackageInstallWorkflow);
+  const legacyPackageInstallResult = verifyFixture();
+
+  const correctedPackageInstallWorkflow = workflowFor(allSupportedArchitectures);
+  await writeFixture(correctedPackageInstallWorkflow);
+  const correctedPackageInstallResult = verifyFixture();
+  assert.notEqual(
+    legacyPackageInstallResult.status,
+    0,
+    'the static packaging contract must reject a non-prefixed tarball path because npm can parse it as a GitHub shorthand',
+  );
+  assert.equal(
+    correctedPackageInstallResult.status,
+    0,
+    `the static packaging contract must accept the exact ./native-package/*.tgz filesystem path for portable bash npm installs:\n${correctedPackageInstallResult.output}`,
+  );
+
   const packageAssemblyAndSmokeContractFixtures = [
     {
       name: 'assemble-native-package job if',
@@ -517,7 +539,7 @@ try {
     },
     {
       name: 'smoke package installation if',
-      workflow: (fixture) => fixture.replace(`      - run: mkdir .packed-native && npm install --prefix .packed-native ${packageArchiveDirectory}/*.tgz`, `      - if: always()\n        run: mkdir .packed-native && npm install --prefix .packed-native ${packageArchiveDirectory}/*.tgz`),
+      workflow: (fixture) => fixture.replace(`      - run: mkdir .packed-native && npm install --prefix .packed-native ${packageInstallArchiveGlob}`, `      - if: always()\n        run: mkdir .packed-native && npm install --prefix .packed-native ${packageInstallArchiveGlob}`),
     },
     {
       name: 'removed production package smoke command',

@@ -22,6 +22,7 @@ const requiredNativeBuilds = [
 
 const packageArchiveDirectory = 'native-package';
 const packageArchiveGlob = `${packageArchiveDirectory}/*.tgz`;
+const packageInstallArchiveGlob = `./${packageArchiveGlob}`;
 
 function assertUnconditional(target, description) {
   assert.equal(Object.hasOwn(target, 'if'), false, `${description} must not define if`);
@@ -229,7 +230,7 @@ const nativePackageDownload = artifactStep('native-package-smoke', 'actions/down
 assertUnconditional(nativePackageDownload, 'native-package-smoke package download step');
 assert.equal(nativePackageDownload.with?.name, 'native-package', 'package smoke tests must download the assembled tarball artifact');
 assert.equal(nativePackageDownload.with?.path, packageArchiveDirectory, 'package smoke tests must restore the assembled tarball to its non-hidden archive directory');
-const nativePackageInstall = runStep('native-package-smoke', `mkdir .packed-native && npm install --prefix .packed-native ${packageArchiveGlob}`, 'package smoke tests must install the exact assembled tarball without lifecycle downloads', (run) => /\bnpm install\b/.test(run));
+const nativePackageInstall = runStep('native-package-smoke', `mkdir .packed-native && npm install --prefix .packed-native ${packageInstallArchiveGlob}`, 'package smoke tests must install the exact assembled tarball with an unambiguous filesystem path and without lifecycle downloads', (run) => /\bnpm install\b/.test(run));
 const nativePackageSmokeExecution = runStep('native-package-smoke', 'node scripts/test-native.mjs', 'package smoke tests must execute the installed production package smoke command', (run) => /\bnode scripts\/test-native\.mjs\b/.test(run));
 assertUnconditional(nativePackageInstall, 'native-package-smoke package installation step');
 assertUnconditional(nativePackageSmokeExecution, 'native-package-smoke production package smoke step');
