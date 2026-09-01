@@ -1,6 +1,6 @@
 ---
 name: Issue
-about: Report a bug, propose a capability, or request a design decision
+about: Report a bug, propose a capability, security improvement, design decision, or documentation update
 labels: ''
 assignees: ''
 ---
@@ -51,7 +51,7 @@ result. Mark proposed syntax as proposed rather than current behavior.
 - **Read-only diagnostics:** <!-- what list/status/doctor may inspect without mutation -->
 - **Destructive operations:** <!-- stop/remove/delete/rebuild; required confirmation and exact identity check -->
 - **Ambiguous/interrupted outcome:** <!-- recovery record/operator acknowledgement; never automatic cleanup by discovery -->
-- **Credential, mount, network, or port impact:** <!-- defaults must remain least-privilege/private -->
+- **Credential, mount, network, or port impact:** <!-- describe current and requested privilege/visibility boundaries; state whether private-by-default and least-privilege behavior is required -->
 
 ## Acceptance criteria
 
@@ -61,11 +61,13 @@ result. Mark proposed syntax as proposed rather than current behavior.
 
 ## Validation plan
 
-- [ ] Focused regression/contract tests cover the requested behavior and failure path.
-- [ ] Linux, macOS, and Windows control-plane impact is specified or explicitly unsupported.
+<!-- Complete applicable items. For documentation-only or design issues, mark implementation/E2E items N/A and state the accuracy, link, example, or rendering validation instead. -->
+
+- [ ] Focused regression/contract tests cover the requested behavior and failure path, or N/A with an alternative validation stated.
+- [ ] Linux, macOS, and Windows control-plane impact is specified, explicitly unsupported, or N/A.
 - [ ] Read-only, cancellation, recovery, ownership-mismatch, and no-adoption behavior are covered where applicable.
-- [ ] Live/Docker/cloud E2E requirements, dedicated test environment, and budget/cleanup constraints are stated.
-- [ ] Documentation is updated if user-visible behavior or safety boundaries change.
+- [ ] Live/Docker/cloud E2E requirements, dedicated test environment, and budget/cleanup constraints are stated where applicable.
+- [ ] Documentation is updated when user-visible behavior or safety boundaries change; documentation-only work validates accuracy, links, examples, and rendering.
 
 ## Alternatives considered
 
