@@ -523,7 +523,7 @@ export async function acknowledgeUnconfirmedProcessReap(stateDir: string, name: 
     if (await pathExists(quarantinePath)) {
       const owner = await readLockOwner(quarantinePath);
       if (!owner) throw malformedLockError(name, quarantinePath);
-      await retireOwnedLock(quarantinePath, locksDir, owner, durability);
+      await retireAcknowledgedLock(quarantinePath, quarantinePath, locksDir, lockName, name, owner, durability);
       return;
     }
     const owner = await readLockOwner(lockPath);
@@ -533,17 +533,39 @@ export async function acknowledgeUnconfirmedProcessReap(stateDir: string, name: 
     }
     if (await pathExists(retainedMarker)) {
       // The marker is inside a retained ordinary lock after a pre-move failure.
-      // Explicit acknowledgement, not unlock, deliberately retires both.
-      await moveOwnedLock(lockPath, quarantinePath, owner, locksDir, durability);
-      await durableRemove(quarantinePath, locksDir, false, durability);
+      // Retire it directly: retrying the failed lock-to-quarantine move would
+      // make explicit recovery impossible when that transition is unavailable.
+      await retireAcknowledgedLock(lockPath, quarantinePath, locksDir, lockName, name, owner, durability);
       return;
     }
     if (!await pathExists(reapGuardPath(lockPath))) return;
     if (localPidIsAlive(owner.pid)) throw new Error(`Lifecycle lock for workspace "${name}" is owned by active PID ${owner.pid}; refusing to interrupt it.`);
     await moveOwnedLock(lockPath, quarantinePath, owner, locksDir, durability);
-    await durableRemove(quarantinePath, locksDir, false, durability);
+    await retireAcknowledgedLock(quarantinePath, quarantinePath, locksDir, lockName, name, owner, durability);
   } finally {
     await retireOwnedLock(recoveryPath, locksDir, recoveryOwner, durability);
+  }
+}
+
+async function retireAcknowledgedLock(path: string, quarantinePath: string, locksDir: string, lockName: string, name: string, owner: LockOwner, durability: StateDurabilityAdapter): Promise<void> {
+  const retired = join(locksDir, `.${owner.token}.retired`);
+  try {
+    await moveOwnedLock(path, retired, owner, locksDir, durability);
+    await durableRemove(retired, locksDir, false, durability);
+  } catch (error: unknown) {
+    // A failed remove may have deleted its path before the directory durability
+    // boundary. Keep (or republish) the recognized quarantine barrier instead.
+    try {
+      if (!await pathExists(quarantinePath)) {
+        await acquireOwnedDirectory(quarantinePath, locksDir, `${lockName}.reap-unconfirmed`, Date.now() + 30_000, name, durability);
+      }
+    } catch {
+      // The original transition error remains the actionable failure; any
+      // surviving source, retired path, or partially published barrier is not
+      // safe for ordinary unlock to interpret as success.
+    }
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(`Could not durably acknowledge the uncertain lifecycle reap for workspace "${name}"; it remains blocked for explicit recovery: ${detail}`, { cause: error });
   }
 }
 

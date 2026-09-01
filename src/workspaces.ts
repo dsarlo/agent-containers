@@ -12,7 +12,7 @@ export type { ProcessRunner } from './types.js';
 export const PROCESS_OUTPUT_LIMIT = 1024 * 1024;
 const PROCESS_OUTPUT_EVENT_LIMIT = 64 * 1024;
 const WINDOWS_REAP_TIMEOUT_MS = 5_000;
-const POSIX_REAP_GRACE_MS = 5_000;
+const POSIX_REAP_GRACE_MS = 1_000;
 const POSIX_REAP_VERIFICATION_TIMEOUT_MS = 5_000;
 
 export interface NodeProcessRunnerDependencies {
@@ -111,13 +111,13 @@ export function createNodeProcessRunner({
         // Root exit cannot prove descendants remained in the local boundary.
         const finishCancellation = () => unconfirmed();
         const unconfirmed = () => fail(options.kind === 'lifecycle' ? new UnconfirmedProcessReapError() : processReapTimeoutError(platform));
-        const signalGroup = (signal: NodeJS.Signals | 0): void => {
-          if (child.pid === undefined) return;
+        const signalGroup = (signal: NodeJS.Signals | 0): boolean => {
+          if (child.pid === undefined) return false;
           try {
             processKill(-child.pid, signal);
-            return;
+            return true;
           } catch (error: unknown) {
-            if (isNodeError(error, 'ESRCH')) return;
+            if (isNodeError(error, 'ESRCH')) return false;
             throw error;
           }
         };
@@ -130,8 +130,9 @@ export function createNodeProcessRunner({
               try {
                 signalGroup('SIGKILL');
                 // Root close cannot prove the group died, and a group cannot
-                // prove a setsid escapee died. Keep the bounded deadline.
-                try { signalGroup(0); } catch { /* deadline reports uncertainty */ }
+                // prove a setsid escapee died. A proven-dead group can report
+                // the existing uncertainty promptly; otherwise keep waiting.
+                if (!signalGroup(0)) unconfirmed();
               } catch { /* deadline reports uncertainty */ }
             }, posixGraceMs);
           } catch { unconfirmed(); }
