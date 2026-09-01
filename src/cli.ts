@@ -1,7 +1,7 @@
 import { join, resolve } from 'node:path';
 import { readFile } from 'node:fs/promises';
 import { createInterface } from 'node:readline/promises';
-import { assertDevcontainerPathCommittedOnBaseBranch, configurationDiff, hashConfig, initConfig, initConfigV2, loadConfig, parseConfig, saveConfigAtomic } from './config.js';
+import { assertDevcontainerPathCommittedOnBaseBranch, configurationDiff, hashConfig, initConfig, initConfigV2, loadConfig, parseCodespacesDraft, parseConfig, saveConfigAtomic } from './config.js';
 import { doctor, validateCodespacesSetup } from './setup.js';
 import type { CodespacesAgentContainersConfig } from './types.js';
 import { acknowledgeUnconfirmedProcessReap, clearManualRecoveryIfCurrent, defaultStateDir, deleteMetadata, listMetadata, loadManualRecovery, loadMetadata, recordManualRecovery, releaseStaleWorkspaceLock, saveMetadata, withWorkspaceLock } from './state.js';
@@ -87,10 +87,11 @@ export async function runCli(args: string[], cwd = process.cwd(), write: (messag
         ensureOptions(rest, ['--backend', '--json'], ['--json']);
         const requestedBackend = optionValue(rest, '--backend') ?? 'all';
         if (requestedBackend !== 'local' && requestedBackend !== 'codespaces' && requestedBackend !== 'all') throw new UsageError('--backend must be local, codespaces, or all.');
-        const backend = requestedBackend === 'all' ? 'both' : requestedBackend;
-        if (backend === 'codespaces' || backend === 'both') requireCodespacesExperimental();
         const root = await findGitRoot(cwd, nodeProcessRunner);
-        const report = await doctor(await loadConfig(join(root, '.agent-containers.yml')), backend, nodeProcessRunner, root);
+        const config = await loadConfig(join(root, '.agent-containers.yml'));
+        const backend = requestedBackend === 'all' ? (config.version === 1 ? 'local' : 'both') : requestedBackend;
+        if (backend === 'codespaces' || (backend === 'both' && config.version === 2 && config.backends.enabled.includes('codespaces'))) requireCodespacesExperimental();
+        const report = await doctor(config, backend, nodeProcessRunner, root);
         if (rest.includes('--json')) write(JSON.stringify(report, null, 2));
         else write(renderDoctor(report));
         return report.overall === 'ready' ? 0 : 1;
@@ -253,9 +254,9 @@ async function withSetupEvidence(next: CodespacesAgentContainersConfig, root: st
 }
 
 async function loadConfigFromSource(source: string | undefined, stdin: boolean): Promise<CodespacesAgentContainersConfig | import('./types.js').LocalAgentContainersConfig> {
-  if (source) return loadConfig(source);
+  if (source) return parseCodespacesDraft(await readFile(source, 'utf8'));
   if (!stdin) throw new UsageError('Usage: agent-containers configure --non-interactive (--from FILE|--stdin)');
-  return parseConfig(await readStdin());
+  return parseCodespacesDraft(await readStdin());
 }
 
 async function interactiveConfig(io: CliIo): Promise<CodespacesAgentContainersConfig> {

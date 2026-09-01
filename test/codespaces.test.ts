@@ -13,6 +13,18 @@ test('Codespaces provider uses documented gh api argument vectors and never a sh
   assert.deepEqual(calls, [{ command: 'gh', args: ['api', '--method', 'GET', '-H', 'X-GitHub-Api-Version: 2022-11-28', '/user'] }]);
 });
 
+test('provider reads only the documented repository machine inventory and validates its response', async () => {
+  const calls: Array<{ command: string; args: string[] }> = [];
+  const provider = new GhCodespacesProvider({ async run(command, args) {
+    calls.push({ command, args });
+    return { code: 0, stdout: '{"total_count":1,"machines":[{"name":"basicLinux32gb"}]}', stderr: '' };
+  } });
+  assert.deepEqual(await provider.machines('owner/repo', 'refs/heads/main', 'us-east'), { machines: [{ name: 'basicLinux32gb' }] });
+  assert.deepEqual(calls, [{ command: 'gh', args: ['api', '--method', 'GET', '-H', 'X-GitHub-Api-Version: 2022-11-28', '/repos/owner/repo/codespaces/machines?ref=refs%2Fheads%2Fmain&location=us-east'] }]);
+  const malformed = new GhCodespacesProvider({ async run() { return { code: 0, stdout: '{"total_count":1,"machines":[]}', stderr: '' }; } });
+  await assert.rejects(() => malformed.machines('owner/repo', 'refs/heads/main'), /incomplete/);
+});
+
 test('provider rejects incomplete identity and never adopts by name', async () => {
   const provider = new GhCodespacesProvider({ async run() { return { code: 0, stdout: JSON.stringify({ name: 'same-name' }), stderr: '' }; } });
   await assert.rejects(() => provider.get('same-name'), /complete Codespace identity/);

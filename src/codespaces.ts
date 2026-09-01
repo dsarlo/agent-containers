@@ -7,6 +7,7 @@ export interface GithubActor { id: string; login: string }
 export interface CodespaceIdentity { id: string; name: string; environmentId: string; state: string }
 export interface RepositorySourceEvidence { repository: string; requestedRef: string; expectedOid: string; devcontainerPath: string; devcontainerBlobOid: string }
 export interface CodespacesPreflight { billableOwner: string; machines: readonly { name: string; geos: readonly string[] }[]; portsAllowed: boolean; secretsAllowed: boolean }
+export interface CodespacesMachineInventory { machines: readonly { name: string }[] }
 
 /** Thin, replaceable adapter. It intentionally exposes no token or auth operation. */
 export class GhCodespacesProvider {
@@ -26,10 +27,19 @@ export class GhCodespacesProvider {
     return { id: String(value.id), name: value.name, environmentId: value.environment_id, state: value.state };
   }
 
-  async preflight(repository: string, ref?: string): Promise<unknown> {
-    if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository)) throw new Error('Invalid GitHub repository selector.');
-    const query = ref ? `?ref=${encodeURIComponent(ref)}` : '';
-    return this.api(`/repos/${repository}/codespaces/new${query}`);
+  /** GitHub's documented repository machine inventory, optionally filtered by ref/location. */
+  async machines(repository: string, ref: string, location?: string): Promise<CodespacesMachineInventory> {
+    assertRepository(repository);
+    if (!safeRef(ref) || (location !== undefined && !/^[A-Za-z0-9-]{1,64}$/.test(location))) throw new Error('Codespaces machine inventory selector is unsafe.');
+    const query = new URLSearchParams({ ref });
+    if (location) query.set('location', location);
+    const value = await this.api(`/repos/${repository}/codespaces/machines?${query}`);
+    if (!isRecord(value) || typeof value.total_count !== 'number' || !Number.isSafeInteger(value.total_count) || value.total_count < 0 || !Array.isArray(value.machines) || value.total_count !== value.machines.length) throw new Error('Codespaces machine inventory response is incomplete.');
+    const machines = value.machines.map((machine) => {
+      if (!isRecord(machine) || typeof machine.name !== 'string' || !machine.name) throw new Error('Codespaces machine inventory contains an invalid machine.');
+      return { name: machine.name };
+    });
+    return { machines };
   }
 
   async resolveRef(repository: string, requestedRef: string): Promise<string> {
@@ -79,10 +89,11 @@ export function assertSafeExecuteRequest(request: SafeExecuteRequest): void {
 
 function providerError(method: string, path: string, result: ProcessResult): Error { return new Error(`GitHub ${method} ${path} failed: ${redactDiagnostic(result.stderr || result.stdout || `exit code ${result.code}`)}`); }
 function redactDiagnostic(value: string): string {
-  return value.slice(0, 1024)
+  return value
     .replace(/https?:\/\/[^\s]+/gi, '[url redacted]')
     .replace(/\b(authorization|token|password|secret)\s*[:=]\s*(?:Bearer\s+)?\S+/gi, '$1: [redacted]')
-    .replace(/\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,})\b/g, '[credential redacted]');
+    .replace(/\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,})\b/g, '[credential redacted]')
+    .slice(0, 1024);
 }
 function isRecord(value: unknown): value is Record<string, unknown> { return typeof value === 'object' && value !== null && !Array.isArray(value); }
 function losslessId(value: unknown): boolean { return (typeof value === 'number' && Number.isSafeInteger(value) && value > 0) || (typeof value === 'string' && /^[1-9][0-9]*$/.test(value)); }

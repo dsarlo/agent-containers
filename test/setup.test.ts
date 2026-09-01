@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
-import { configurationDiff, loadConfig, parseConfig, saveConfigAtomic } from '../src/config.js';
+import { configurationDiff, loadConfig, parseCodespacesDraft, parseConfig, saveConfigAtomic } from '../src/config.js';
 import { doctor, validateCodespacesSetup } from '../src/setup.js';
 import { parseCodespacesPreflight } from '../src/codespaces.js';
 import type { CodespacesAgentContainersConfig, ProcessRunner } from '../src/types.js';
@@ -58,6 +58,15 @@ test('doctor converts missing commands, rejected runners, aborts, and timeouts i
   assert.equal(aborted.overall, 'action-required');
 });
 
+test('local doctor accepts Git worktree capability from bounded help output when Git exits 129', async () => {
+  const runner: ProcessRunner = { async run(command, args) {
+    if (command === 'git' && args.join(' ') === 'worktree add -h') return { code: 129, stdout: '', stderr: 'usage: git worktree add [--relative-paths] <path>' };
+    return { code: 0, stdout: args.join(' ') === 'rev-parse --is-inside-work-tree' ? 'true\n' : 'git version 2', stderr: '' };
+  } };
+  const report = await doctor({ version: 1, workspace: { worktreeRoot: 'worktrees', baseBranch: 'main' }, environment: { devcontainerPath: '.devcontainer/devcontainer.json' }, commands: {} }, 'local', runner);
+  assert.equal(report.checks.find((check) => check.id === 'local.worktree')?.state, 'ready');
+});
+
 test('atomic configuration save preserves the prior file on compare-and-swap conflict', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'agent-containers-setup-'));
   const path = join(directory, '.agent-containers.yml');
@@ -84,6 +93,16 @@ test('strict v2 rejects secret-shaped fields and incomplete Codespaces repositor
   await assert.doesNotReject(() => loadConfig(path));
   assert.throws(() => parseConfig(JSON.stringify({ ...codespaces, project: { repository: 'owner/repo' } })), /project\.ref is required/);
   assert.throws(() => parseConfig(JSON.stringify({ ...codespaces, project: { ref: 'refs/heads/main' } })), /project\.repository is required/);
+});
+
+test('v2 setup drafts may omit discovered evidence, while persisted v2 configurations may not', () => {
+  const draft = structuredClone(codespaces);
+  delete draft.project.expectedOid;
+  delete draft.environment.devcontainerBlobOid;
+  const parsed = parseCodespacesDraft(JSON.stringify(draft));
+  assert.equal(parsed.project.expectedOid, undefined);
+  assert.equal(parsed.environment.devcontainerBlobOid, undefined);
+  assert.throws(() => parseConfig(JSON.stringify(draft)), /requires validated project.expectedOid/);
 });
 
 test('concurrent configuration saves serialize their compare-and-swap and only one writer publishes', async () => {
@@ -125,6 +144,18 @@ test('configuration publication rejects invalid candidates, leaves no-change unw
   replacement.backends.codespaces.machine = 'basicLinux32gb';
   await assert.rejects(() => saveConfigAtomic(path, replacement, undefined, { durabilityAdapter: broken }), /sync failed/);
   assert.equal(await readFile(path, 'utf8'), JSON.stringify(codespaces));
+});
+
+test('configuration publication reports the committed generation when final directory durability confirmation fails', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'agent-containers-config-final-sync-'));
+  const path = join(directory, '.agent-containers.yml');
+  await writeFile(path, JSON.stringify(codespaces));
+  const replacement = structuredClone(codespaces);
+  replacement.backends.codespaces.machine = 'basicLinux32gb';
+  let directorySyncs = 0;
+  const broken: StateDurabilityAdapter = { ...durability, syncDirectory: async () => { directorySyncs += 1; if (directorySyncs === 3) throw new Error('directory sync failed'); } };
+  await assert.rejects(() => saveConfigAtomic(path, replacement, undefined, { durabilityAdapter: broken }), /committed configuration is present.*directory sync failed/);
+  assert.deepEqual(parseConfig(await readFile(path, 'utf8')), replacement);
 });
 
 test('configuration publication recognizes equivalent YAML and JSON configurations as unchanged', async () => {
@@ -182,12 +213,12 @@ test('doctor has a stable complete Codespaces inventory and uses only its positi
     calls.push([command, ...args]);
     if (args[0] === '--version') return { code: 0, stdout: 'gh version 2', stderr: '' };
     if (args.at(-1) === '/user') return { code: 0, stdout: '{"id":"1","login":"octo"}', stderr: '' };
-    return { code: 0, stdout: '{"billable_owner":{"id":"1"}}', stderr: '' };
+    return { code: 0, stdout: '{"total_count":1,"machines":[{"name":"basic"}]}', stderr: '' };
   } };
   const report = await doctor(codespaces, 'codespaces', runner);
   assert.deepEqual(report.checks.map((check) => check.id), [
     'codespaces.experimental', 'codespaces.gh', 'codespaces.actor', 'codespaces.repository',
-    'codespaces.ref', 'codespaces.devcontainer', 'codespaces.preflight', 'codespaces.machine',
+    'codespaces.ref', 'codespaces.devcontainer', 'codespaces.owner-billing', 'codespaces.machine',
     'codespaces.geo', 'codespaces.ports', 'codespaces.secrets', 'codespaces.ssh-key',
     'codespaces.runtime.workspace',
   ]);
@@ -196,14 +227,14 @@ test('doctor has a stable complete Codespaces inventory and uses only its positi
   assert.ok(report.checks.filter((check) => check.state !== 'ready').every((check) => check.remediation.at(-1)?.startsWith('Run ac doctor')));
 });
 
-test('doctor never marks configured repository facts ready when provider preflight is malformed', async () => {
+test('doctor never marks configured repository facts ready when documented machine inventory is malformed', async () => {
   const runner: ProcessRunner = { async run(_command, args) {
     if (args[0] === '--version') return { code: 0, stdout: 'gh version 2', stderr: '' };
     if (args.at(-1) === '/user') return { code: 0, stdout: '{"id":"1","login":"octo"}', stderr: '' };
     return { code: 0, stdout: '{}', stderr: '' };
   } };
   const report = await doctor(codespaces, 'codespaces', runner);
-  for (const id of ['codespaces.repository', 'codespaces.ref', 'codespaces.devcontainer', 'codespaces.preflight']) {
+  for (const id of ['codespaces.repository', 'codespaces.ref', 'codespaces.devcontainer', 'codespaces.machine']) {
     assert.notEqual(report.checks.find((check) => check.id === id)?.state, 'ready', `${id} requires provider evidence`);
   }
 });

@@ -333,6 +333,23 @@ test('Codespaces setup commands are unavailable without the explicit experimenta
   assert.match(messages.at(-1) ?? '', /AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES=1/);
 });
 
+test('doctor resolves a v1 local configuration before applying the Codespaces experimental gate', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agent-containers-cli-doctor-local-'));
+  assert.equal(spawnSync('git', ['init', '-b', 'main'], { cwd: root }).status, 0);
+  await writeFile(join(root, '.agent-containers.yml'), 'version: 1\n');
+  const previous = process.env.AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES;
+  delete process.env.AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES;
+  const messages: string[] = [];
+  try {
+    await runCli(['doctor', '--json'], root, (message) => messages.push(message));
+  } finally {
+    if (previous === undefined) delete process.env.AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES;
+    else process.env.AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES = previous;
+  }
+  assert.doesNotMatch(messages.at(-1) ?? '', /experimental/i);
+  assert.match(messages.at(-1) ?? '', /"local"/);
+});
+
 test('local create fails closed when schema v2 disables the local backend', async () => {
   const root = await mkdtemp(join(tmpdir(), 'agent-containers-cli-local-disabled-'));
   assert.equal(spawnSync('git', ['init', '-b', 'main'], { cwd: root }).status, 0);

@@ -25,7 +25,7 @@ Defaults are merged before validation. Supplied empty values, wrong types, unkno
 
 ## Schema v2 Codespaces setup
 
-Schema v1 remains local-only and unchanged. Schema v2 is experimental and requires `AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES=1`. Use `ac init --interactive` or `ac configure --interactive` for the field-oriented setup flow, or import a complete v2 document with `--non-interactive --from FILE` / `--stdin`. It is a nonsecret policy document: unknown fields, public ports, invalid paths, and invalid limits are rejected before any side effect.
+Schema v1 remains local-only and unchanged. Schema v2 is experimental and requires `AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES=1`. Use `ac init --interactive` or `ac configure --interactive` for the field-oriented setup flow, or import a v2 onboarding draft with `--non-interactive --from FILE` / `--stdin`. Drafts omit only discovered OID/blob evidence; persisted v2 documents always contain it. It is a nonsecret policy document: unknown fields, public ports, invalid paths, and invalid limits are rejected before any side effect.
 
 Interactive setup prompts for backend/default backend, repository, remote ref, Dev Container path, machine, and cost-sensitive timeouts. It shows the preview and requires `yes`; `cancel` or any other confirmation leaves no file write. It does not accept pasted configuration. Each Codespaces save validates the canonical GitHub origin, remote ref, immutable commit OID, and committed regular Dev Container blob through read-only `git`/`gh api GET` calls, then persists `project.expectedOid` and `environment.devcontainerBlobOid` as immutable source evidence. No configuration command accepts, displays, stores, or reads tokens, API keys, SSH keys, or secret values. Codespaces lifecycle is intentionally unavailable in this release.
 
@@ -61,7 +61,7 @@ backends:
     secrets: { allowedRemoteSecretNames: [], allowCodespaceGitCredential: false }
 ```
 
-`ac doctor --backend local|codespaces|all [--json]` is noninteractive and read-only. Codespaces setup and diagnosis require `AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES=1`. Its Codespaces provider calls are pinned-version, machine-readable `gh api` GET requests only; it never retrieves a token, alters authentication, creates an SSH key, changes a resource/configuration/secret/port, or starts a Codespace. Runtime checks are action-required until an exact running workspace is available to a later execution phase.
+`ac doctor --backend local|codespaces|all [--json]` is noninteractive and read-only. Local-only configurations do not require the Codespaces gate; a selected Codespaces diagnostic requires `AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES=1`. Its Codespaces provider calls are pinned-version, machine-readable `gh api` GET requests only. Machine availability uses GitHub's documented repository machine inventory endpoint. Owner/billing, port, secret, and runtime facts are action-required when no documented read-only endpoint proves them. It never retrieves a token, alters authentication, creates an SSH key, changes a resource/configuration/secret/port, or starts a Codespace.
 
 ## v0.1 Dev Container compatibility
 

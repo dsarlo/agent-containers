@@ -1,4 +1,4 @@
-import { GhCodespacesProvider, parseCodespacesPreflight } from './codespaces.js';
+import { GhCodespacesProvider } from './codespaces.js';
 import type { AgentContainersConfig, BackendKind, BackendSelection, DoctorCheck, DoctorReport, ProcessResult, ProcessRunner, SetupState } from './types.js';
 
 export interface CodespacesSetupEvidence { repository: string; requestedRef: string; expectedOid: string; devcontainerPath: string; devcontainerBlobOid: string }
@@ -48,7 +48,7 @@ async function localChecks(config: AgentContainersConfig, runner: ProcessRunner,
     result('local.os', process.platform === 'win32' || process.platform === 'darwin' || process.platform === 'linux', 'Host OS is supported.', 'Host OS is unsupported.'),
     result('local.git', git?.code === 0, 'Git is available.', 'Git is unavailable.'),
     result('local.repository', repository?.code === 0 && repository.stdout.trim() === 'true', 'Git repository is available.', 'Git repository cannot be verified.'),
-    result('local.worktree', worktree?.code === 0 && /relative-paths/.test(`${worktree.stdout}${worktree.stderr}`), 'Git worktree relative paths are supported.', 'Git worktree relative paths are unsupported.'),
+    result('local.worktree', Boolean(worktree && /relative-paths/.test(`${worktree.stdout}${worktree.stderr}`)), 'Git worktree relative paths are supported.', 'Git worktree relative paths are unsupported.'),
     result('local.docker', docker?.code === 0, 'Docker is available.', 'Docker is unavailable.'),
     result('local.devcontainers', devcontainer?.code === 0, 'Dev Containers CLI is available.', 'Dev Containers CLI is unavailable.'),
     result('local.config', configured, 'Local backend is enabled by configuration.', 'Local backend is disabled by configuration.'),
@@ -63,10 +63,12 @@ async function codespacesChecks(config: AgentContainersConfig, runner: ProcessRu
   const provider = new GhCodespacesProvider(runner);
   const actor = ghReady ? await attemptValue(() => provider.actor()) : undefined;
   const source = ghReady && v2 ? await attemptValue(() => validateCodespacesSetup(config, root, runner)) : undefined;
-  const preflight = ghReady && v2?.project.repository ? await attemptValue(async () => parseCodespacesPreflight(await provider.preflight(v2.project.repository!, v2.project.ref))) : undefined;
+  const machines = ghReady && v2?.project.repository && v2.project.ref ? await attemptValue(() => provider.machines(v2.project.repository!, v2.project.ref!)) : undefined;
   const selected = v2?.backends.codespaces.machine;
-  const selectedMachine = preflight?.machines.find((machine) => machine.name === selected);
-  const geoEligible = selectedMachine && (v2!.backends.codespaces.geo === 'auto' || selectedMachine.geos.includes(v2!.backends.codespaces.geo));
+  const selectedMachine = machines?.machines.find((machine) => machine.name === selected);
+  const geoEligible = !v2 || v2.backends.codespaces.geo === 'auto'
+    ? Boolean(selectedMachine)
+    : Boolean(selectedMachine && await attemptValue(async () => (await provider.machines(v2.project.repository!, v2.project.ref!, v2.backends.codespaces.geo)).machines.some((machine) => machine.name === selected)));
   return [
     result('codespaces.experimental', process.env.AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES === '1', 'Experimental Codespaces gate is enabled.', 'Set AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES=1.'),
     result('codespaces.gh', ghReady, 'GitHub CLI is available.', 'GitHub CLI is unavailable.'),
@@ -74,11 +76,11 @@ async function codespacesChecks(config: AgentContainersConfig, runner: ProcessRu
     source ? { ...ready('codespaces.repository', `GitHub repository ${source.repository} was verified from origin.`), evidence: { repository: source.repository } } : action('codespaces.repository', 'GitHub repository identity is not verified from the configured origin.'),
     source ? { ...ready('codespaces.ref', `Remote ref resolves to immutable ${source.expectedOid}.`), evidence: { expectedOid: source.expectedOid } } : action('codespaces.ref', 'No remotely resolvable Git ref/OID evidence is available.'),
     source ? { ...ready('codespaces.devcontainer', 'Committed regular Dev Container blob was verified.'), evidence: { devcontainerBlobOid: source.devcontainerBlobOid } } : action('codespaces.devcontainer', 'Dev Container path is not verified as a committed regular file.'),
-    preflight ? { ...ready('codespaces.preflight', 'Codespaces preflight policy is complete.'), evidence: { billableOwner: preflight.billableOwner, machineCount: preflight.machines.length } } : action('codespaces.preflight', 'Codespaces preflight could not be read as complete structured policy.'),
+    action('codespaces.owner-billing', 'The documented read-only machine endpoint does not prove owner or billing policy.'),
     result('codespaces.machine', Boolean(selectedMachine), 'Configured machine appears in provider inventory.', 'Configured machine is absent from provider inventory.'),
     result('codespaces.geo', Boolean(geoEligible), 'Configured geo is eligible for selected machine.', 'Configured geo is not eligible for selected machine.'),
-    result('codespaces.ports', Boolean(preflight && (!v2!.backends.codespaces.ports.allowVisibilityChanges || preflight.portsAllowed)), 'Port policy is compatible with provider policy.', 'Port policy is not validated by provider policy.'),
-    result('codespaces.secrets', Boolean(preflight && (!v2!.backends.codespaces.secrets.allowedRemoteSecretNames.length || preflight.secretsAllowed)), 'Named secret capability policy is compatible with provider policy.', 'Secret capability policy is not validated by provider policy.'),
+    action('codespaces.ports', 'Port policy is unavailable because no documented read-only endpoint proves it.'),
+    action('codespaces.secrets', 'Secret policy is unavailable because no documented read-only endpoint proves it.'),
     action('codespaces.ssh-key', 'A pre-existing SSH key/config is required later and was not inspected.'),
     runtime('codespaces.runtime.workspace', 'No exact recorded running Codespace was supplied; provisioned runtime remains uninspected.'),
   ];

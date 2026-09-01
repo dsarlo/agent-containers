@@ -116,6 +116,13 @@ export function parseConfig(source: string): AgentContainersConfig {
   return { ...config, environment: { ...config.environment, devcontainerPath } };
 }
 
+/** Parse a nonsecret v2 onboarding candidate before remote discovery supplies immutable evidence. */
+export function parseCodespacesDraft(source: string): CodespacesAgentContainersConfig {
+  const raw = parse(source);
+  if (!isRecord(raw) || raw.version !== 2 || raw.backends === undefined) throw new Error('Invalid Codespaces setup draft: schema version 2 is required');
+  return parseV2Config(raw, false);
+}
+
 /** Verify that every newly-created linked worktree receives the configured file. */
 export async function assertDevcontainerPathCommittedOnBaseBranch(config: AgentContainersConfig, repoRoot: string, runner: ProcessRunner, baseBranch = config.workspace.baseBranch, kind: ProcessRunOptions['kind'] = 'readonly-probe', signal?: AbortSignal): Promise<void> {
   const path = safeRepositoryPath(config.environment.devcontainerPath);
@@ -170,7 +177,7 @@ function validateConfig(config: LocalAgentContainersConfig): string[] {
   return errors;
 }
 
-function parseV2Config(input: Record<string, unknown>): CodespacesAgentContainersConfig {
+function parseV2Config(input: Record<string, unknown>, requireEvidence = true): CodespacesAgentContainersConfig {
   rejectUnknownKeys(input, ['version', 'workspace', 'project', 'environment', 'backends'], 'root');
   for (const key of ['workspace', 'project', 'environment', 'backends']) if (!isRecord(input[key])) throw new Error(`Invalid configuration: ${key} must be an object`);
   const workspace = input.workspace as Record<string, unknown>, project = input.project as Record<string, unknown>, environment = input.environment as Record<string, unknown>, backends = input.backends as Record<string, unknown>;
@@ -187,7 +194,7 @@ function parseV2Config(input: Record<string, unknown>): CodespacesAgentContainer
   const config: CodespacesAgentContainersConfig = { version: 2, workspace: { worktreeRoot: requiredString(workspace.worktreeRoot, 'workspace.worktreeRoot'), baseBranch: requiredString(workspace.baseBranch, 'workspace.baseBranch') }, project: { repository: repository(project.repository), ref: optionalString(project.ref, 'project.ref'), expectedOid: optionalOid(project.expectedOid, 'project.expectedOid') }, environment: { devcontainerPath: requiredString(environment.devcontainerPath, 'environment.devcontainerPath'), devcontainerBlobOid: optionalOid(environment.devcontainerBlobOid, 'environment.devcontainerBlobOid') }, backends: { enabled: [...enabled] as ('local' | 'codespaces')[], default: backends.default as 'local' | 'codespaces', local: {}, codespaces } };
   if (enabled.includes('codespaces') && !config.project.repository) throw new Error('Invalid configuration: project.repository is required when Codespaces is enabled');
   if (enabled.includes('codespaces') && !config.project.ref) throw new Error('Invalid configuration: project.ref is required when Codespaces is enabled');
-  if (enabled.includes('codespaces') && (!config.project.expectedOid || !config.environment.devcontainerBlobOid)) throw new Error('Invalid configuration: Codespaces requires validated project.expectedOid and environment.devcontainerBlobOid evidence');
+  if (requireEvidence && enabled.includes('codespaces') && (!config.project.expectedOid || !config.environment.devcontainerBlobOid)) throw new Error('Invalid configuration: Codespaces requires validated project.expectedOid and environment.devcontainerBlobOid evidence');
   const devcontainerPath = safeRepositoryPath(config.environment.devcontainerPath);
   if (!devcontainerPath) throw new Error('Invalid configuration: environment.devcontainerPath must be a safe repository-relative path.');
   config.environment.devcontainerPath = devcontainerPath;
@@ -254,7 +261,17 @@ export async function saveConfigAtomic(path: string, next: AgentContainersConfig
       await adapter.syncFile(temporary);
       if (await adapter.publicationMode() === 'strict') {
         await rename(temporary, path);
-        await adapter.syncDirectory(directory);
+        try {
+          await adapter.syncDirectory(directory);
+        } catch (error: unknown) {
+          // rename is already the visibility boundary. Never imply the old
+          // generation survived a post-rename durability failure.
+          const committed = await readFile(path, 'utf8').catch(() => undefined);
+          if (committed === source) {
+            throw new Error(`Configuration publication committed configuration is present but directory durability confirmation failed: ${error instanceof Error ? error.message : String(error)}. Reload and review the committed configuration before retrying.`, { cause: error });
+          }
+          throw error;
+        }
       } else await adapter.moveFileWriteThrough(temporary, path);
     } catch (error) { await rm(temporary, { force: true }); throw error; }
     return 'saved';
@@ -290,17 +307,34 @@ async function acquireConfigLock(lock: string, adapter: StateDurabilityAdapter, 
     }
     catch (error: unknown) {
       if (pending) await rm(pending, { recursive: true, force: true });
-      if (!isNodeError(error, 'EEXIST') && !isNodeError(error, 'ENOTEMPTY')) throw error;
+      if (!isLockContention(error)) throw error;
       const owner = await readConfigLockOwner(lock);
       if (owner && !ownerAlive(owner.pid)) {
-        await rm(lock, { recursive: true, force: false });
-        if (await adapter.publicationMode() === 'strict') await adapter.syncDirectory(dirname(lock));
-        continue;
+        // Move the observed generation out of the acquisition name first.
+        // A subsequent owner can publish a fresh lock without being removed by
+        // this reclaimer; Windows sharing violations are handled as contention.
+        const quarantine = `${lock}.${randomUUID()}.reclaiming`;
+        try {
+          if (await adapter.publicationMode() === 'strict') await rename(lock, quarantine);
+          else await adapter.moveFileWriteThrough(lock, quarantine);
+          const quarantinedOwner = await readConfigLockOwner(quarantine);
+          if (!quarantinedOwner || quarantinedOwner.token !== owner.token || quarantinedOwner.pid !== owner.pid) {
+            throw new Error('Configuration lock ownership changed during reclamation; retry without removing the new owner.', { cause: error });
+          }
+          await rm(quarantine, { recursive: true, force: false });
+          if (await adapter.publicationMode() === 'strict') await adapter.syncDirectory(dirname(lock));
+          continue;
+        } catch (reclaimError: unknown) {
+          if (!isLockContention(reclaimError)) throw reclaimError;
+        }
       }
       if (now() >= deadline) throw new Error('Configuration is being updated by an active or unverifiable owner; retry after reviewing the latest configuration.', { cause: error });
       await sleep(10);
     }
   }
+}
+function isLockContention(error: unknown): boolean {
+  return isNodeError(error, 'EEXIST') || isNodeError(error, 'ENOTEMPTY') || isNodeError(error, 'EPERM') || isNodeError(error, 'EACCES');
 }
 async function readConfigLockOwner(lock: string): Promise<ConfigLockOwner | undefined> {
   try {
