@@ -64,7 +64,7 @@ export async function execNamedWorkspaceLifecycle(name: string, command: string[
   });
 }
 
-export async function execWorkspace(metadata: WorkspaceMetadata, command: string[], runner: ProcessRunner, save: (metadata: WorkspaceMetadata) => Promise<void>, readConfig: ConfigReader = readDevcontainerConfig, signal?: AbortSignal, recordRecovery: RecoveryRecorder = missingRecoveryRecorder, clearRecovery: RecoveryClearer = missingRecoveryClearer, resolvePath: PathResolver = readConfig === readDevcontainerConfig ? realpath : resolveSyntheticPath, devcontainer: DevcontainerInvocation = resolveDevcontainerInvocation()): Promise<ProcessResult> {
+export async function execWorkspace(metadata: WorkspaceMetadata, command: string[], runner: ProcessRunner, save: (metadata: WorkspaceMetadata) => Promise<void>, readConfig: ConfigReader = readDevcontainerConfig, signal?: AbortSignal, recordRecovery: RecoveryRecorder = missingRecoveryRecorder, clearRecovery: RecoveryClearer = missingRecoveryClearer, resolvePath: PathResolver = readConfig === readDevcontainerConfig ? realpath : resolveSyntheticPath, devcontainer: DevcontainerInvocation = readConfig === readDevcontainerConfig ? resolveDevcontainerInvocation() : { command: 'devcontainer', prefixArgs: [] }): Promise<ProcessResult> {
   if (command.length === 0) throw new Error('A command is required after --.');
   if (metadata.containerId !== undefined && !isCanonicalContainerId(metadata.containerId)) throw new Error(`Workspace ${metadata.name} has a legacy or non-canonical container ID. Verify the container manually, then clear or repair the recorded metadata before running lifecycle commands.`);
   const configPath = await resolveDevcontainerConfigPath(metadata.worktree, metadata.devcontainerPath, resolvePath);

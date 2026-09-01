@@ -272,7 +272,32 @@ test('a failed strict clear retains a durable recovery barrier and a retry clear
   assert.equal(await loadManualRecovery(stateDir, 'safe'), undefined);
 });
 
-test('a post-delete failsafe sync failure retains the journal barrier until the same generation is retried', async () => {
+test('a journal-clear parent sync failure never admits lifecycle after its visible clear', async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), 'agent-containers-recovery-clear-journal-sync-'));
+  await recordManualRecovery(stateDir, 'safe', { reason: 'operation-may-be-active', containerIds: [], worktree: metadata.worktree });
+  const observed = await loadManualRecovery(stateDir, 'safe');
+  assert.ok(observed);
+  let locksSyncs = 0;
+  setStateDurabilityAdapterForTesting({
+    ...testDurabilityAdapter,
+    syncDirectory: async (path) => {
+      if (path === join(stateDir, 'locks') && ++locksSyncs === 2) throw new Error('journal-clear parent sync failed');
+    },
+  });
+  try {
+    await assert.rejects(() => state.clearManualRecoveryIfCurrent(stateDir, 'safe', observed.generation), /journal-clear parent sync failed/);
+    assert.equal((await loadManualRecovery(stateDir, 'safe'))?.generation, observed.generation);
+    let lifecycleRan = false;
+    await assert.rejects(() => withWorkspaceLock(stateDir, 'safe', async () => { lifecycleRan = true; }), /manual recovery/i);
+    assert.equal(lifecycleRan, false);
+  } finally {
+    setStateDurabilityAdapterForTesting(testDurabilityAdapter);
+  }
+  await state.clearManualRecoveryIfCurrent(stateDir, 'safe', observed.generation);
+  assert.equal(await loadManualRecovery(stateDir, 'safe'), undefined);
+});
+
+test('a post-clear failsafe cleanup sync failure leaves the committed clear authoritative', async () => {
   const stateDir = await mkdtemp(join(tmpdir(), 'agent-containers-recovery-clear-post-delete-'));
   await recordManualRecovery(stateDir, 'safe', { reason: 'operation-may-be-active', containerIds: [], worktree: metadata.worktree });
   const observed = await loadManualRecovery(stateDir, 'safe');
@@ -298,15 +323,13 @@ test('a post-delete failsafe sync failure retains the journal barrier until the 
     },
   });
   try {
-    await assert.rejects(() => state.clearManualRecoveryIfCurrent(stateDir, 'safe', observed.generation), /post-delete failsafe sync failed/);
-    assert.equal(locksSyncs, 2, 'the injected failure is the failsafe removal parent sync');
-    const retained = await loadManualRecovery(stateDir, 'safe');
-    assert.equal(retained?.generation, observed.generation, 'a rejected clear must leave the acknowledged generation as a barrier');
-    setStateDurabilityAdapterForTesting(testDurabilityAdapter);
-    await assert.rejects(() => withWorkspaceLock(stateDir, 'safe', async () => undefined), /manual recovery/i);
-    failPostDeleteSync = false;
     await state.clearManualRecoveryIfCurrent(stateDir, 'safe', observed.generation);
-    assert.equal(await loadManualRecovery(stateDir, 'safe'), undefined);
+    assert.equal(locksSyncs, 3, 'the journal clear is durably published before failsafe cleanup');
+    const retained = await loadManualRecovery(stateDir, 'safe');
+    assert.equal(retained, undefined, 'a durable journal clear is authoritative even if stale failsafe cleanup is retried later');
+    setStateDurabilityAdapterForTesting(testDurabilityAdapter);
+    await withWorkspaceLock(stateDir, 'safe', async () => undefined);
+    failPostDeleteSync = false;
   } finally {
     setStateDurabilityAdapterForTesting(testDurabilityAdapter);
   }

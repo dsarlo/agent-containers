@@ -221,18 +221,20 @@ async function durableReplace(temporaryPath: string, path: string, directory: st
 
 export async function loadManualRecovery(stateDir: string, name: string): Promise<ManualRecovery | undefined> {
   const journalPath = manualRecoveryJournalPath(stateDir, name);
+  // A clear record whose parent-directory durability boundary failed can be
+  // visible despite not being crash durable. Its separately published
+  // failsafe remains authoritative until it is durably removed.
+  const failsafe = await loadManualRecoveryFile(manualRecoveryClearFailsafePath(stateDir, name), name);
   try {
     const source = await readFile(journalPath, 'utf8');
     const recovery = parseManualRecoveryJournal(source, name);
     if (recovery) return recovery;
-    const failsafe = await loadManualRecoveryFile(manualRecoveryClearFailsafePath(stateDir, name), name);
     if (failsafe) return failsafe;
     // An empty authoritative journal from an interrupted older migration is
     // not evidence that its legacy barrier was cleared.
     return source.trim() === '' ? loadLegacyManualRecovery(stateDir, name) : undefined;
   } catch (error: unknown) {
     if (!isNodeError(error, 'ENOENT')) throw error;
-    const failsafe = await loadManualRecoveryFile(manualRecoveryClearFailsafePath(stateDir, name), name);
     if (failsafe) return failsafe;
     return loadLegacyManualRecovery(stateDir, name);
   }
@@ -301,8 +303,10 @@ export async function clearManualRecoveryIfCurrent(stateDir: string, name: strin
     // this published copy authoritative.
     const failsafePath = manualRecoveryClearFailsafePath(stateDir, name);
     await durableReplace(join(directory, `.${randomUUID()}.manual-recovery.clear-failsafe.tmp`), failsafePath, directory, `${JSON.stringify(current)}\n`, durability);
-    await durableRemove(failsafePath, directory, false, durability);
     await appendManualRecoveryJournalEvent(manualRecoveryJournalPath(stateDir, name), { event: 'clear' }, durability);
+    // The clear is now durable. Retiring the redundant copy afterward cannot
+    // turn an uncertain clear into permission to run lifecycle work.
+    await durableRemove(failsafePath, directory, false, durability);
   });
 }
 
@@ -589,6 +593,7 @@ export async function acknowledgeUnconfirmedProcessReap(stateDir: string, name: 
   const lockPath = join(locksDir, `${lockName}.lock`);
   const retainedMarker = unconfirmedReapMarkerPath(lockPath);
   const recoveryOwner = await acquireRecoveryLock(recoveryPath, locksDir, lockName, Date.now() + timeoutMs, name, localPidIsAlive, durability);
+  let releaseRecoveryLock = true;
   try {
     if (await pathExists(quarantinePath)) {
       const owner = await readLockOwner(quarantinePath);
@@ -614,8 +619,13 @@ export async function acknowledgeUnconfirmedProcessReap(stateDir: string, name: 
     if (localPidIsAlive(owner.pid)) throw new Error(`Lifecycle lock for workspace "${name}" is owned by active PID ${owner.pid}; refusing to interrupt it.`);
     await moveOwnedLock(lockPath, quarantinePath, owner, locksDir, durability);
     await retireAcknowledgedLock(quarantinePath, quarantinePath, locksDir, lockName, name, owner, durability);
+  } catch (error: unknown) {
+    // If every attempt to retain a recognized barrier failed after a destructive
+    // boundary, retain the recovery lock rather than allowing lifecycle work.
+    if (!await hasUnconfirmedReapBarrier(lockPath, quarantinePath)) releaseRecoveryLock = false;
+    throw error;
   } finally {
-    await retireOwnedLock(recoveryPath, locksDir, recoveryOwner, durability);
+    if (releaseRecoveryLock) await retireOwnedLock(recoveryPath, locksDir, recoveryOwner, durability);
   }
 }
 
@@ -624,8 +634,7 @@ async function retireAcknowledgedLock(path: string, quarantinePath: string, lock
     // Publish a recognized barrier before retiring the source. A `.retired`
     // directory is intentionally never relied on as recovery state.
     if (path !== quarantinePath && !await pathExists(quarantinePath)) {
-      const barrier = await acquireOwnedDirectory(quarantinePath, locksDir, `${lockName}.reap-unconfirmed`, Date.now() + 30_000, name, durability);
-      if (!barrier) throw new Error('Timed out publishing recovery quarantine.');
+      await publishOwnedBarrier(quarantinePath, locksDir, `${lockName}.reap-unconfirmed`, owner, durability);
     }
     await durableRemoveOwned(path, locksDir, owner, durability);
     if (path !== quarantinePath) {
@@ -639,7 +648,7 @@ async function retireAcknowledgedLock(path: string, quarantinePath: string, lock
     // A failed remove may have deleted its path before the directory durability
     // boundary. Keep (or republish) the recognized quarantine barrier instead.
     try {
-      if (!await pathExists(quarantinePath)) await acquireOwnedDirectory(quarantinePath, locksDir, `${lockName}.reap-unconfirmed`, Date.now() + 30_000, name, durability);
+      if (!await pathExists(quarantinePath)) await publishOwnedBarrier(quarantinePath, locksDir, `${lockName}.reap-unconfirmed`, owner, durability);
     } catch {
       // The original transition error remains the actionable failure; any
       // surviving source, retired path, or partially published barrier is not
@@ -647,6 +656,26 @@ async function retireAcknowledgedLock(path: string, quarantinePath: string, lock
     }
     const detail = error instanceof Error ? error.message : String(error);
     throw new Error(`Could not durably acknowledge the uncertain lifecycle reap for workspace "${name}"; it remains blocked for explicit recovery: ${detail}`, { cause: error });
+  }
+}
+
+/** Publish a recovery barrier which remains attributable to the dead owner. */
+async function publishOwnedBarrier(path: string, locksDir: string, temporaryStem: string, owner: LockOwner, durability: StateDurabilityAdapter): Promise<void> {
+  const temporaryPath = join(locksDir, `.${temporaryStem}.${randomUUID()}.pending`);
+  let ownerFile: FileHandle | undefined;
+  try {
+    await mkdir(temporaryPath, { recursive: false, mode: 0o700 });
+    ownerFile = await open(join(temporaryPath, 'owner.json'), 'wx', 0o600);
+    await ownerFile.writeFile(`${JSON.stringify(owner)}\n`, 'utf8');
+    await ownerFile.close();
+    ownerFile = undefined;
+    await durability.syncFile(join(temporaryPath, 'owner.json'));
+    await syncDirectory(temporaryPath, durability);
+    await durableRename(temporaryPath, path, locksDir, durability);
+  } catch (error: unknown) {
+    await ownerFile?.close();
+    await rm(temporaryPath, { recursive: true, force: true });
+    throw error;
   }
 }
 
