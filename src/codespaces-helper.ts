@@ -254,8 +254,10 @@ export async function bootstrapRemoteHelper(deps: RemoteHelperBootstrapDependenc
 
   await runFixed(deps, ['mkdir', '-p', binDir]);
   await runFixed(deps, ['tee', tmpPath], { input: artifact.bytes });
-  await verifyFileOnRemote(deps, tmpPath, artifact);
+  /* The verifier demands owner-only 0700; the stream write above lands as 0666,
+   * so the mode check must observe the POST-chmod stat (B1). */
   await runFixed(deps, ['chmod', '0700', tmpPath]);
+  await verifyFileOnRemote(deps, tmpPath, artifact);
   await runFixed(deps, ['mv', tmpPath, finalPath]);
   await verifyFileOnRemote(deps, finalPath, artifact);
   const handshake = await handshakeRemoteHelper(deps, finalPath, arch);

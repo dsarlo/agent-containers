@@ -149,6 +149,47 @@ test('bootstrap copies only the package-owned artifact over controlled argv and 
   await rm(root, { recursive: true, force: true });
 });
 
+test('bootstrap performs the owner-only mode check AFTER chmod so a tee-staged 0666 helper succeeds (B1)', async () => {
+  const root = await fixtureRoot();
+  let chmodCount = 0;
+  const dispatched: string[][] = [];
+  const runner = bootstrapProcess({
+    overrides: {
+      statFor: (path) => (path.includes('.tmp.')
+        ? (chmodCount > 0 ? 'regular file|700|1000|1000' : 'regular file|666|1000|1000')
+        : 'regular file|700|1000|1000'),
+    },
+    onArgs: (args) => {
+      dispatched.push(args);
+      if (args.slice(args.indexOf('--') + 1).join(' ').startsWith('chmod 0700')) chmodCount += 1;
+    },
+  });
+  const deps = await bootstrapDeps(runner, root, false);
+  const result = await bootstrapRemoteHelper(deps);
+  assert.equal(result.arch, 'linux-x64');
+  assert.equal(result.protocolVersion, HELPER_PROTOCOL_VERSION);
+  const argv = dispatched.map((args) => args.slice(args.indexOf('--') + 1).join(' '));
+  const statBeforeChmod = dispatched.findIndex((args) => args.slice(args.indexOf('--') + 1).join(' ').startsWith('stat -c'));
+  const chmodIndex = dispatched.findIndex((args) => args.slice(args.indexOf('--') + 1).join(' ').startsWith('chmod 0700'));
+  assert.ok(chmodIndex !== -1 && statBeforeChmod !== -1 && chmodIndex < statBeforeChmod, 'the mode check must observe the stat AFTER chmod 0700');
+  assert.ok(argv.some((line) => line.endsWith(' handshake')));
+
+  const fastTrack: string[][] = [];
+  const verifyRunner = bootstrapProcess({
+    onArgs: (args) => { fastTrack.push(args); },
+  });
+  const verifyDeps: RemoteHelperBootstrapDependencies = {
+    ...deps,
+    provider: new GhCodespacesProvider(verifyRunner),
+    verifyKnown: true,
+  };
+  const known = await bootstrapRemoteHelper(verifyDeps);
+  assert.equal(known.arch, 'linux-x64', 'a recorded, matching helper must take the verifyKnown fast path after one success');
+  const fastArgv = fastTrack.map((args) => args.slice(args.indexOf('--') + 1).join(' '));
+  assert.ok(!fastArgv.some((line) => line.startsWith('tee ')), 'the verifyKnown fast path must not re-copy the helper artifact');
+  await rm(root, { recursive: true, force: true });
+});
+
 test('bootstrap blocks execution on a mismatched remote architecture (no fallback)', async () => {
   const root = await fixtureRoot();
   const runner = bootstrapProcess({ overrides: { uname: 'armv7l' } });
