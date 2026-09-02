@@ -1,6 +1,7 @@
 import { GhCodespacesProvider } from './codespaces.js';
+import { runReadinessProbes, readinessGateDoctorChecks } from './codespaces-readiness.js';
 import { parseConfig } from './config.js';
-import { isCanonicalContainerId, loadManualRecovery, loadMetadata } from './state.js';
+import { isCanonicalContainerId, loadManualRecovery, loadMetadata, type CodespacesWorkspaceMetadata } from './state.js';
 import { getProductionStateDurabilityAdapter } from './durability.js';
 import type { AgentContainersConfig, BackendKind, BackendSelection, DoctorCheck, DoctorReport, ProcessResult, ProcessRunner, SetupState } from './types.js';
 
@@ -158,7 +159,20 @@ async function codespacesChecks(config: AgentContainersConfig, runner: ProcessRu
     if (metadata.error) workspaceChecks.push(action('codespaces.workspace.metadata', `Codespaces workspace metadata for ${options.workspaceName} is unreadable or corrupt; repair or quarantine it and verify backend identity before remote operations.`, 'provisioned-runtime'));
     else if (!metadata.value) workspaceChecks.push(action('codespaces.workspace.metadata', `No Codespaces workspace metadata exists for ${options.workspaceName}.`, 'provisioned-runtime'));
     else if ('repoRoot' in metadata.value) workspaceChecks.push(action('codespaces.workspace.metadata', `Workspace ${options.workspaceName} belongs to the local backend.`, 'provisioned-runtime'));
-    else workspaceChecks.push({ ...ready('codespaces.workspace.metadata', `Codespaces workspace metadata for ${options.workspaceName} is valid.`), phase: 'provisioned-runtime' }, action('codespaces.workspace.runtime', 'Codespaces lifecycle is phase-gated; provisioned runtime was not contacted.', 'provisioned-runtime'));
+    else {
+      workspaceChecks.push({ ...ready('codespaces.workspace.metadata', `Codespaces workspace metadata for ${options.workspaceName} is valid.`), phase: 'provisioned-runtime' });
+      const record = metadata.value as CodespacesWorkspaceMetadata;
+      const normalized = record.lifecycle.normalized;
+      if (['recovery-required', 'identity-mismatch', 'revision-mismatch', 'resource-missing', 'provider-error', 'ambiguous-create'].includes(normalized)) {
+        workspaceChecks.push(action('codespaces.workspace.runtime', `Workspace ${options.workspaceName} is in ${normalized}; read-only diagnosis cannot reach ready and nothing is restarted.`, 'provisioned-runtime'));
+      } else if (normalized === 'stopped' || normalized === 'deleted') {
+        workspaceChecks.push(action('codespaces.workspace.runtime', `Workspace ${options.workspaceName} is ${normalized}; doctor never starts or restores a stopped Codespace.`, 'provisioned-runtime'));
+      } else if (v2) {
+        const report = await observe(() => runReadinessProbes({ stateDir: options.stateDir!, name: options.workspaceName!, provider, config: v2, loadMetadata }));
+        if (report.error) workspaceChecks.push(action('codespaces.workspace.runtime', 'Provisioned-runtime readiness probes could not complete; no repair or restart was attempted.', 'provisioned-runtime'));
+        else workspaceChecks.push(...readinessGateDoctorChecks(record, report.value));
+      }
+    }
   }
   return [
     result('codespaces.experimental', process.env.AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES === '1', 'Experimental Codespaces gate is enabled.', 'Set AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES=1.'),

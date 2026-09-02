@@ -15,6 +15,23 @@ export type BackendSelection = BackendKind | 'both';
 export type SetupState = 'ready' | 'action-required' | 'unsupported';
 export type DoctorPhase = 'pre-provision' | 'provisioned-runtime';
 
+/** Independently observable readiness gate as yielded by the Codespaces backend. */
+export interface ReadinessGateResult {
+  id: string;
+  state: 'passed' | 'blocked' | 'timeout' | 'skipped';
+  observedAt: string;
+  detail: string;
+  timeoutMs: number | null;
+}
+export interface ReadinessReport {
+  terminal: string;
+  workspaceId: string;
+  name: string;
+  gates: readonly ReadinessGateResult[];
+  startedAt: string;
+}
+export interface ReadinessEvent { type: 'readiness'; report: ReadinessReport }
+
 /** Backend-neutral identities intentionally never overload local Docker fields. */
 export type WorkspaceHandle =
   | { kind: 'local' }
@@ -28,7 +45,7 @@ export interface ExecutionBackend {
   readonly kind: BackendKind;
   create(request: { name: string; backend: BackendKind }, signal?: AbortSignal): Promise<WorkspaceHandle>;
   observe(handle: WorkspaceHandle, signal?: AbortSignal): Promise<WorkspaceObservation>;
-  waitReady(handle: WorkspaceHandle, signal?: AbortSignal): AsyncIterable<WorkspaceObservation>;
+  waitReady(handle: WorkspaceHandle, signal?: AbortSignal): AsyncIterable<WorkspaceObservation | ReadinessEvent>;
   execute(handle: WorkspaceHandle, request: { commandId: string; argv: readonly [string, ...string[]] }, signal?: AbortSignal): AsyncIterable<CommandEvent>;
   attach(handle: WorkspaceHandle, commandId: string, signal?: AbortSignal): AsyncIterable<CommandEvent>;
   cancel(handle: WorkspaceHandle, commandId: string, signal?: AbortSignal): Promise<void>;

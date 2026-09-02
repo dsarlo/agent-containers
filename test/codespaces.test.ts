@@ -38,12 +38,12 @@ test('provider strictly parses documented defaults and complete machine inventor
 
 test('provider rejects incomplete identity and never adopts by name', async () => {
   const provider = new GhCodespacesProvider({ async run() { return { code: 0, stdout: JSON.stringify({ name: 'same-name' }), stderr: '' }; } });
-  await assert.rejects(() => provider.get('same-name'), /complete Codespace identity/);
+  await assert.rejects(() => provider.get('same-name'), /complete Codespaces identity/);
 });
 
-test('provider requires the observed Codespace name to equal the exact requested name', async () => {
+test('provider requires the observed Codespaces name to equal the exact requested name', async () => {
   const provider = new GhCodespacesProvider({ async run() { return { code: 0, stdout: JSON.stringify({ id: '42', name: 'other', environment_id: 'env', state: 'Available' }), stderr: '' }; } });
-  await assert.rejects(() => provider.get('requested'), /requested Codespace name/);
+  await assert.rejects(() => provider.get('requested'), /requested Codespaces name/);
 });
 
 test('provider diagnostics redact URLs, query strings, and credential-shaped values', async () => {

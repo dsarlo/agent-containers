@@ -1,5 +1,7 @@
 import { setStateDurabilityAdapterForTesting } from '../src/state.js';
 import { setConfigDurabilityAdapterForTesting } from '../src/config.js';
+import { setCodespacesOpsDurabilityAdapterForTesting } from '../src/codespaces-ops.js';
+import { setCodespacesCapacityDurabilityAdapterForTesting } from '../src/codespaces-capacity.js';
 import type { StateDurabilityAdapter } from '../src/durability.js';
 
 const testDurabilityAdapter: StateDurabilityAdapter = {
@@ -12,3 +14,5 @@ const testDurabilityAdapter: StateDurabilityAdapter = {
 
 setStateDurabilityAdapterForTesting(testDurabilityAdapter);
 setConfigDurabilityAdapterForTesting(testDurabilityAdapter);
+setCodespacesOpsDurabilityAdapterForTesting(testDurabilityAdapter);
+setCodespacesCapacityDurabilityAdapterForTesting(testDurabilityAdapter);
