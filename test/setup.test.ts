@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import test from 'node:test';
 import { configurationDiff, loadConfig, parseCodespacesDraft, parseConfig, saveConfigAtomic } from '../src/config.js';
 import { discoverProjectSetup, doctor, validateCodespacesSetup } from '../src/setup.js';
@@ -283,13 +283,13 @@ test('doctor reports persisted immutable evidence drift as action-required', asy
 
 test('local doctor reports a no-container workspace with every manual recovery reason as possibly active', async () => {
   const stateDir = join(await mkdtemp(join(tmpdir(), 'agent-containers-doctor-recovery-')), 'state');
-  const root = '/repo';
+  const root = join(dirname(stateDir), 'repo');
   setStateDurabilityAdapterForTesting(durability);
   try {
     for (const reason of ['operation-may-be-active', 'remote-exec-interrupted', 'devcontainer-up-ambiguous', 'local-process-reap-unconfirmed'] as const) {
       const name = `safe-${reason.replaceAll('-', '').slice(0, 12)}`;
-      await saveMetadata(stateDir, { version: 1, name, repoRoot: root, worktree: `${root}/worktrees/${name}`, branch: `agent-containers/${name}`, baseRef: 'refs/heads/main', devcontainerPath: '.devcontainer/devcontainer.json', createdAt: '2026-01-01T00:00:00.000Z' });
-      await recordManualRecovery(stateDir, name, { reason, containerIds: [], worktree: `${root}/worktrees/${name}` });
+      await saveMetadata(stateDir, { version: 1, name, repoRoot: root, worktree: join(root, 'worktrees', name), branch: `agent-containers/${name}`, baseRef: 'refs/heads/main', devcontainerPath: '.devcontainer/devcontainer.json', createdAt: '2026-01-01T00:00:00.000Z' });
+      await recordManualRecovery(stateDir, name, { reason, containerIds: [], worktree: join(root, 'worktrees', name) });
       const report = await doctor({ version: 1, workspace: { worktreeRoot: 'worktrees', baseBranch: 'main' }, environment: { devcontainerPath: '.devcontainer/devcontainer.json' }, commands: {} }, 'local', { async run(_command, args) { return { code: 0, stdout: args[0] === 'rev-parse' ? `${root}\n` : '--relative-paths\n', stderr: '' }; } }, root, { stateDir, workspaceName: name });
       const recovery = report.checks.find((check) => check.id === 'local.workspace.recovery');
       assert.equal(recovery?.state, 'action-required');
@@ -300,13 +300,13 @@ test('local doctor reports a no-container workspace with every manual recovery r
 
 test('local doctor recognizes an owned running Docker inspection with Windows CRLF output', async () => {
   const stateDir = join(await mkdtemp(join(tmpdir(), 'agent-containers-doctor-crlf-')), 'state');
-  const root = '/repo';
+  const root = join(dirname(stateDir), 'repo');
   const id = 'a'.repeat(64);
   setStateDurabilityAdapterForTesting(durability);
   try {
-    await saveMetadata(stateDir, { version: 1, name: 'safe', repoRoot: root, worktree: `${root}/worktrees/safe`, branch: 'agent-containers/safe', baseRef: 'refs/heads/main', devcontainerPath: '.devcontainer/devcontainer.json', createdAt: '2026-01-01T00:00:00.000Z', containerId: id });
+    await saveMetadata(stateDir, { version: 1, name: 'safe', repoRoot: root, worktree: join(root, 'worktrees', 'safe'), branch: 'agent-containers/safe', baseRef: 'refs/heads/main', devcontainerPath: '.devcontainer/devcontainer.json', createdAt: '2026-01-01T00:00:00.000Z', containerId: id });
     const report = await doctor({ version: 1, workspace: { worktreeRoot: 'worktrees', baseBranch: 'main' }, environment: { devcontainerPath: '.devcontainer/devcontainer.json' }, commands: {} }, 'local', { async run(command, args) {
-      if (command === 'docker' && args[0] === 'inspect') return { code: 0, stdout: `${id}\r\n${root}/worktrees/safe\r\ntrue\r\n`, stderr: '' };
+      if (command === 'docker' && args[0] === 'inspect') return { code: 0, stdout: `${id}\r\n${join(root, 'worktrees', 'safe')}\r\ntrue\r\n`, stderr: '' };
       return { code: 0, stdout: args[0] === 'rev-parse' ? `${root}\n` : '--relative-paths\n', stderr: '' };
     } }, root, { stateDir, workspaceName: 'safe' });
     assert.equal(report.checks.find((check) => check.id === 'local.workspace.runtime')?.state, 'ready');
@@ -315,11 +315,11 @@ test('local doctor recognizes an owned running Docker inspection with Windows CR
 
 test('doctor treats malformed, checksum-invalid, and unreadable recovery journals as action-required instead of stopped', async () => {
   const stateDir = join(await mkdtemp(join(tmpdir(), 'agent-containers-doctor-corrupt-recovery-')), 'state');
-  const root = '/repo';
+  const root = join(dirname(stateDir), 'repo');
   setStateDurabilityAdapterForTesting(durability);
   try {
     for (const [name, journal] of [['malformed', '{not json}\n'], ['checksum', `${JSON.stringify({ event: 'clear', checksum: 'wrong' })}\n`], ['unreadable', undefined]] as const) {
-      await saveMetadata(stateDir, { version: 1, name, repoRoot: root, worktree: `${root}/worktrees/${name}`, branch: `agent-containers/${name}`, baseRef: 'refs/heads/main', devcontainerPath: '.devcontainer/devcontainer.json', createdAt: '2026-01-01T00:00:00.000Z' });
+      await saveMetadata(stateDir, { version: 1, name, repoRoot: root, worktree: join(root, 'worktrees', name), branch: `agent-containers/${name}`, baseRef: 'refs/heads/main', devcontainerPath: '.devcontainer/devcontainer.json', createdAt: '2026-01-01T00:00:00.000Z' });
       const journalPath = join(stateDir, 'locks', `${name}.manual-recovery.journal`);
       if (journal === undefined) await mkdir(journalPath);
       else await writeFile(journalPath, journal);
@@ -334,7 +334,7 @@ test('doctor treats malformed, checksum-invalid, and unreadable recovery journal
 
 test('doctor independently reports corrupt metadata and recovery without a stopped or ready runtime claim', async () => {
   const stateDir = join(await mkdtemp(join(tmpdir(), 'agent-containers-doctor-corrupt-metadata-')), 'state');
-  const root = '/repo';
+  const root = join(dirname(stateDir), 'repo');
   setStateDurabilityAdapterForTesting(durability);
   try {
     for (const metadata of ['malformed', 'schema-invalid', 'unreadable'] as const) for (const recovery of ['valid', 'corrupt'] as const) {
@@ -344,7 +344,7 @@ test('doctor independently reports corrupt metadata and recovery without a stopp
       else await writeFile(metadataPath, metadata === 'malformed' ? '{not metadata}' : '{}');
       await mkdir(join(stateDir, 'locks'), { recursive: true });
       const journal = join(stateDir, 'locks', 'safe.manual-recovery.journal');
-      if (recovery === 'valid') await recordManualRecovery(stateDir, 'safe', { reason: 'operation-may-be-active', containerIds: [], worktree: `${root}/worktrees/safe` });
+      if (recovery === 'valid') await recordManualRecovery(stateDir, 'safe', { reason: 'operation-may-be-active', containerIds: [], worktree: join(root, 'worktrees', 'safe') });
       else await writeFile(journal, '{not journal}\n');
       const report = await doctor({ version: 1, workspace: { worktreeRoot: 'worktrees', baseBranch: 'main' }, environment: { devcontainerPath: '.devcontainer/devcontainer.json' }, commands: {} }, 'local', { async run(_command, args) { return { code: 0, stdout: args[0] === 'rev-parse' ? `${root}\n` : '--relative-paths\n', stderr: '' }; } }, root, { stateDir, workspaceName: 'safe' });
       assert.equal(report.checks.find((check) => check.id === 'local.workspace.metadata')?.state, 'action-required');

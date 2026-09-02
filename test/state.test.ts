@@ -91,7 +91,7 @@ test('metadata expected generation and immutable identity reject stale or cross-
   assert.ok(observed);
   await saveMetadata(stateDir, { ...metadata, containerId: 'a'.repeat(64) }, { expectedGeneration: metadataGeneration(observed) });
   await assert.rejects(() => saveMetadata(stateDir, { ...metadata, containerId: 'b'.repeat(64) }, { expectedGeneration: metadataGeneration(observed) }), /changed concurrently/);
-  await assert.rejects(() => saveMetadata(stateDir, { ...metadata, repoRoot: '/other-repository' }), /immutable backend\/resource identity/);
+  await assert.rejects(() => saveMetadata(stateDir, { ...metadata, repoRoot: join(repoRoot, 'other-repository') }), /immutable backend\/resource identity/);
 });
 
 test('metadata expected absence is a durable no-replace boundary in strict and recoverable publication modes', async () => {

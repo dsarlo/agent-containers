@@ -329,7 +329,7 @@ test('init and implicit validation resolve the repository root from a subdirecto
   assert.equal(spawnSync('git', ['init', '-b', 'main'], { cwd: root }).status, 0);
   const messages: string[] = [];
   assert.equal(await runCli(['init'], nested, (message) => messages.push(message)), 0);
-  assert.match(messages[0], new RegExp(`Wrote ${root.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/\\.agent-containers\\.yml`));
+  assert.match(messages[0], new RegExp(`Wrote ${root.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}[\\\\/]\\.agent-containers\\.yml`));
   assert.match(await readFile(join(root, '.agent-containers.yml'), 'utf8'), /"version": 2/);
   await writeFile(join(root, '.agent-containers.yml'), 'version: 1\n');
   await mkdir(join(root, '.devcontainer'), { recursive: true });
@@ -402,7 +402,7 @@ test('exec dispatches a recorded local workspace without reading mutable checkou
   const { saveMetadata, setStateDurabilityAdapterForTesting } = await import('../src/state.js');
   setStateDurabilityAdapterForTesting({ publicationMode: async () => 'strict', assertStateWriteSupport: async () => undefined, syncFile: async () => undefined, syncDirectory: async () => undefined, moveFileWriteThrough: async () => undefined });
   try {
-    await saveMetadata(stateDir, { version: 1, name: 'recorded', repoRoot: '/repo', worktree: '/repo/worktrees/recorded', branch: 'agent-containers/recorded', baseRef: 'refs/heads/main', devcontainerPath: '.devcontainer/devcontainer.json', createdAt: '2026-01-01T00:00:00.000Z' });
+    await saveMetadata(stateDir, { version: 1, name: 'recorded', repoRoot: join(stateHome, 'repo'), worktree: join(stateHome, 'repo', 'worktrees', 'recorded'), branch: 'agent-containers/recorded', baseRef: 'refs/heads/main', devcontainerPath: '.devcontainer/devcontainer.json', createdAt: '2026-01-01T00:00:00.000Z' });
     const messages: string[] = [];
     assert.equal(await runCli(['exec', 'recorded', '--', 'true'], tmpdir(), (message) => messages.push(message)), 1);
     assert.doesNotMatch(messages.at(-1) ?? '', /Configuration not found|Codespaces is selected/);
