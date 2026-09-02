@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, realpath, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -22,7 +22,7 @@ test('validateWorkspaceName rejects unsafe names', () => {
 });
 
 test('createWorkspace only accepts and records a verified canonical local base ref', async () => {
-  const directory = await mkdtemp(join(tmpdir(), 'agent-containers-base-ref-'));
+  const directory = await realpath(await mkdtemp(join(tmpdir(), 'agent-containers-base-ref-')));
   const config: AgentContainersConfig = { version: 1, workspace: { worktreeRoot: 'worktrees', baseBranch: 'main' }, environment: { devcontainerPath: '.devcontainer/devcontainer.json' }, commands: {} };
   for (const base of ['origin/main', 'refs/tags/v1', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa']) {
     const calls: string[][] = [];
@@ -54,7 +54,7 @@ test('createWorkspace only accepts and records a verified canonical local base r
 
 
 test('createWorkspace uses relative Git directory pointers when Git supports them', async () => {
-  const directory = await mkdtemp(join(tmpdir(), 'agent-containers-workspace-'));
+  const directory = await realpath(await mkdtemp(join(tmpdir(), 'agent-containers-workspace-')));
   const calls: Array<{ command: string; args: string[]; cwd?: string; stdio?: string }> = [];
   const runner: ProcessRunner = {
     async run(command, args, options) {
@@ -118,7 +118,7 @@ test('createWorkspace reports exact branch and worktree recovery details after a
 });
 
 test('create lifecycle preserves unconfirmed worktree-add reaping without probes and records durable recovery', async () => {
-  const directory = await mkdtemp(join(tmpdir(), 'agent-containers-add-unconfirmed-'));
+  const directory = await realpath(await mkdtemp(join(tmpdir(), 'agent-containers-add-unconfirmed-')));
   const stateDir = join(directory, 'state');
   const calls: string[][] = [];
   const controller = new AbortController();
@@ -182,7 +182,7 @@ test('createWorkspace preserves its worktree and branch if metadata persistence 
 });
 
 test('createWorkspace constructs git commands through the injected runner and writes metadata', async () => {
-  const directory = await mkdtemp(join(tmpdir(), 'agent-containers-workspace-'));
+  const directory = await realpath(await mkdtemp(join(tmpdir(), 'agent-containers-workspace-')));
   const stateDir = join(directory, 'state');
   const calls: Array<{ command: string; args: string[] }> = [];
   const runner: ProcessRunner = {

@@ -419,6 +419,55 @@ test('withWorkspaceLock serializes same-name lifecycle operations across contend
   assert.deepEqual(events, ['first-start', 'first-end', 'second']);
 });
 
+test('withWorkspaceLock retries a Windows-style EPERM only when a recovery lock was concurrently published', async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), 'agent-containers-windows-recovery-collision-'));
+  let recoveryPublications = 0;
+  let releaseFirst!: () => void;
+  const firstMayFinish = new Promise<void>((resolveFirst) => { releaseFirst = resolveFirst; });
+  let firstStarted!: () => void;
+  const firstHasStarted = new Promise<void>((resolveFirstStarted) => { firstStarted = resolveFirstStarted; });
+  let collisionObserved!: () => void;
+  const collisionWasObserved = new Promise<void>((resolveCollision) => { collisionObserved = resolveCollision; });
+  setStateDurableRenameForTesting(async (source, destination) => {
+    if (destination.endsWith('safe.recovery') && recoveryPublications++ === 1) {
+      collisionObserved();
+      throw Object.assign(new Error('Windows directory collision'), { code: 'EPERM' });
+    }
+    await rename(source, destination);
+  });
+  try {
+    const first = withWorkspaceLock(stateDir, 'safe', async () => {
+      firstStarted();
+      await firstMayFinish;
+    });
+    await firstHasStarted;
+    let secondRan = false;
+    const second = withWorkspaceLock(stateDir, 'safe', async () => { secondRan = true; });
+    await collisionWasObserved;
+    releaseFirst();
+    await Promise.all([first, second]);
+    assert.equal(secondRan, true);
+  } finally {
+    setStateDurableRenameForTesting(undefined);
+  }
+});
+
+test('withWorkspaceLock does not retry an EPERM without a published recovery-lock collision', async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), 'agent-containers-windows-recovery-permission-'));
+  setStateDurableRenameForTesting(async (source, destination) => {
+    if (destination.endsWith('safe.recovery')) throw Object.assign(new Error('Windows permission denied'), { code: 'EPERM' });
+    await rename(source, destination);
+  });
+  try {
+    await assert.rejects(
+      () => withWorkspaceLock(stateDir, 'safe', async () => undefined),
+      /Windows permission denied/,
+    );
+  } finally {
+    setStateDurableRenameForTesting(undefined);
+  }
+});
+
 test('lock publication durably syncs the owner, staging directory, and locks directory in order', async () => {
   const stateDir = await mkdtemp(join(tmpdir(), 'agent-containers-lock-durability-'));
   const steps: string[] = [];
@@ -442,12 +491,12 @@ test('a fully fresh state root and locks directory are created and synced progre
     'created:state',
     'directory-synced:state',
     'parent-directory-synced:.',
-    'created:state/agent-containers',
-    'directory-synced:state/agent-containers',
+    `created:${join('state', 'agent-containers')}`,
+    `directory-synced:${join('state', 'agent-containers')}`,
     'parent-directory-synced:state',
-    'created:state/agent-containers/locks',
-    'directory-synced:state/agent-containers/locks',
-    'parent-directory-synced:state/agent-containers',
+    `created:${join('state', 'agent-containers', 'locks')}`,
+    `directory-synced:${join('state', 'agent-containers', 'locks')}`,
+    `parent-directory-synced:${join('state', 'agent-containers')}`,
   ]);
 });
 

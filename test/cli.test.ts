@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { lstat, mkdtemp, mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { lstat, mkdtemp, mkdir, readFile, realpath, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -268,7 +268,7 @@ test('create with --base refuses a base missing its Dev Container config before 
 });
 
 test('public create passes its lock signal to validation and durably records uncertain worktree reaping without probes', async (t) => {
-  const root = await mkdtemp(join(tmpdir(), 'agent-containers-cli-unconfirmed-create-'));
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'agent-containers-cli-unconfirmed-create-')));
   const stateHome = await mkdtemp(join(tmpdir(), 'agent-containers-cli-unconfirmed-state-'));
   const stateDir = join(stateHome, 'agent-containers');
   const previousStateHome = process.env.XDG_STATE_HOME;
@@ -304,7 +304,7 @@ test('public create passes its lock signal to validation and durably records unc
 });
 
 test('init and implicit validation resolve the repository root from a subdirectory', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'agent-containers-cli-root-'));
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'agent-containers-cli-root-')));
   const nested = join(root, 'nested', 'deeper');
   await mkdir(nested, { recursive: true });
   assert.equal(spawnSync('git', ['init', '-b', 'main'], { cwd: root }).status, 0);

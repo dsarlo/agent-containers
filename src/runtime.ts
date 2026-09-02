@@ -64,15 +64,16 @@ export async function execNamedWorkspaceLifecycle(name: string, command: string[
   });
 }
 
-export async function execWorkspace(metadata: WorkspaceMetadata, command: string[], runner: ProcessRunner, save: (metadata: WorkspaceMetadata) => Promise<void>, readConfig: ConfigReader = readDevcontainerConfig, signal?: AbortSignal, recordRecovery: RecoveryRecorder = missingRecoveryRecorder, clearRecovery: RecoveryClearer = missingRecoveryClearer, resolvePath: PathResolver = readConfig === readDevcontainerConfig ? realpath : resolveSyntheticPath, devcontainer: DevcontainerInvocation = readConfig === readDevcontainerConfig ? resolveDevcontainerInvocation() : { command: 'devcontainer', prefixArgs: [] }): Promise<ProcessResult> {
+export async function execWorkspace(metadata: WorkspaceMetadata, command: string[], runner: ProcessRunner, save: (metadata: WorkspaceMetadata) => Promise<void>, readConfig: ConfigReader = readDevcontainerConfig, signal?: AbortSignal, recordRecovery: RecoveryRecorder = missingRecoveryRecorder, clearRecovery: RecoveryClearer = missingRecoveryClearer, resolvePath: PathResolver = readConfig === readDevcontainerConfig ? realpath : resolveSyntheticPath, devcontainer?: DevcontainerInvocation): Promise<ProcessResult> {
   if (command.length === 0) throw new Error('A command is required after --.');
   if (metadata.containerId !== undefined && !isCanonicalContainerId(metadata.containerId)) throw new Error(`Workspace ${metadata.name} has a legacy or non-canonical container ID. Verify the container manually, then clear or repair the recorded metadata before running lifecycle commands.`);
   const configPath = await resolveDevcontainerConfigPath(metadata.worktree, metadata.devcontainerPath, resolvePath);
   await assertSupportedDevcontainerConfig(configPath, readConfig);
+  const invocation = devcontainer ?? (readConfig === readDevcontainerConfig ? resolveDevcontainerInvocation() : { command: 'devcontainer', prefixArgs: [] });
   await recordRecovery({ reason: 'operation-may-be-active', containerIds: [], worktree: metadata.worktree });
   let up: ProcessResult;
   try {
-    up = await runner.run(devcontainer.command, [...devcontainer.prefixArgs, 'up', '--workspace-folder', metadata.worktree, '--config', configPath, '--log-format', 'json', '--mount-git-worktree-common-dir'], withSignal({ kind: 'lifecycle', stdio: 'pipe', onOutput: createDevcontainerProgressReporter((message) => process.stderr.write(`${message}\n`)) }, signal));
+    up = await runner.run(invocation.command, [...invocation.prefixArgs, 'up', '--workspace-folder', metadata.worktree, '--config', configPath, '--log-format', 'json', '--mount-git-worktree-common-dir'], withSignal({ kind: 'lifecycle', stdio: 'pipe', onOutput: createDevcontainerProgressReporter((message) => process.stderr.write(`${message}\n`)) }, signal));
   } catch (error: unknown) {
     if (error instanceof UnconfirmedProcessReapError) return unconfirmedReapRecovery(metadata, recordRecovery, error.message);
     return ambiguousUpRecovery(metadata, runner, save, recordRecovery, `devcontainer up did not return a trustworthy terminal outcome: ${error instanceof Error ? error.message : String(error)}`);
@@ -106,7 +107,7 @@ export async function execWorkspace(metadata: WorkspaceMetadata, command: string
   // cannot truthfully assert that the command inside the container stopped.
   let result: ProcessResult;
   try {
-    result = await runner.run(devcontainer.command, [...devcontainer.prefixArgs, 'exec', '--workspace-folder', metadata.worktree, '--config', configPath, '--container-id', containerId, '--mount-git-worktree-common-dir', ...command], withSignal({ kind: 'lifecycle', stdio: 'inherit' }, signal));
+    result = await runner.run(invocation.command, [...invocation.prefixArgs, 'exec', '--workspace-folder', metadata.worktree, '--config', configPath, '--container-id', containerId, '--mount-git-worktree-common-dir', ...command], withSignal({ kind: 'lifecycle', stdio: 'inherit' }, signal));
   } catch (error: unknown) {
     if (error instanceof UnconfirmedProcessReapError) return unconfirmedReapRecovery(metadata, recordRecovery, error.message, [containerId]);
     throw error;

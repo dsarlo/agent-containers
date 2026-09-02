@@ -26,6 +26,7 @@ test('create produces an isolated worktree without altering source checkout file
   git('init', '-b', 'main');
   git('config', 'user.email', 'test@example.com');
   git('config', 'user.name', 'Test');
+  git('config', 'core.autocrlf', 'false');
   await writeFile(join(repo, 'source.txt'), 'original\n');
   git('add', 'source.txt');
   git('commit', '-m', 'initial');
@@ -199,6 +200,7 @@ test('nodeProcessRunner ignores custom and UNC SystemRoot values without an auth
       process.env.SystemRoot = systemRoot;
       const runner = createNodeProcessRunner({
         platform: 'win32',
+        windowsDirectory: () => undefined,
         spawn: ((command: string) => { calls.push(command); return root; }) as typeof spawn,
         setTimeout: ((callback: () => void) => { timers.push(callback); return {} as NodeJS.Timeout; }) as typeof setTimeout,
         clearTimeout: (() => undefined) as typeof clearTimeout,

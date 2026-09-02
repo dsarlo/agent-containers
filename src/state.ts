@@ -761,7 +761,12 @@ async function acquireOwnedDirectory(path: string, locksDir: string, temporarySt
   } catch (error: unknown) {
     await ownerFile?.close();
     await rm(temporaryPath, { recursive: true, force: true });
-    if (!isNodeError(error, 'EEXIST') && !isNodeError(error, 'ENOTEMPTY')) throw error;
+    // Windows reports EPERM when renaming a directory over a concurrently
+    // published directory. Treat it as contention only when that destination
+    // is still present; unrelated permission failures must remain visible.
+    const collision = isNodeError(error, 'EEXIST') || isNodeError(error, 'ENOTEMPTY') ||
+      (isNodeError(error, 'EPERM') && await pathExists(path));
+    if (!collision) throw error;
     if (Date.now() >= deadline) throw lockTimeout(name, error);
     await delay();
     return undefined;
