@@ -52,7 +52,7 @@ ac remove search-page --yes
 
 ## Configuration
 
-Plain `ac init` writes a safe schema-v2 local-only `.agent-containers.yml`; `init --force` remains the explicit legacy-v1 outline path. `workspace.worktreeRoot` resolves from the source Git root. `environment.devcontainerPath` must be a safe repository-relative path because it is verified against, and resolved inside, each worktree.
+Plain `ac init` writes a safe schema-v2 local-only `.agent-containers.yml`. Existing configuration is never overwritten by init; use `ac configure` to preview and atomically publish a reviewed update. `workspace.worktreeRoot` resolves from the source Git root. `environment.devcontainerPath` must be a safe repository-relative path because it is verified against, and resolved inside, each worktree.
 
 ```yaml
 # Agent Containers workspace configuration, schema version 1
@@ -80,10 +80,9 @@ Codespaces creation and command execution are intentionally not exposed by this 
 ## Lifecycle commands
 
 ```text
-agent-containers init [--force]
 agent-containers init [--backends local]
 agent-containers configure --non-interactive --from <nonsecret-config-file>
-agent-containers doctor [--backend local|codespaces|all] [--json]
+agent-containers doctor [--backend local|codespaces|all] [--workspace NAME] [--json]
 agent-containers validate [--config path]
 agent-containers create <name> [--base branch] [--backend local|codespaces]
 agent-containers exec <name> -- <command...>
@@ -95,6 +94,8 @@ agent-containers remove <name> --yes [--force-worktree] [--skip-container-cleanu
 ```
 
 - `init --force` atomically replaces only the configuration path; it refuses symlinks and cannot overwrite a hard-link peer.
+`init --backends local --yes` is a noninteractive local setup route. Codespaces and both-backend setup require a strict nonsecret v2 draft plus immutable GitHub repository/ref/committed Dev Container evidence; `doctor --workspace NAME` adds read-only local metadata and recorded-container checks. Codespaces lifecycle and remote transport remain phase-gated.
+
 - `exec` and `run` are explicit aliases: each starts or reuses the workspace's Dev Container and executes the provided argument vector. They persist a native-durability-synced operation-may-be-active guard **before** dispatching Dev Containers, pass each argument directly without host-shell interpolation, and retain the worktree-common-dir mount protocol for Git worktrees. They inherit the invoking terminal for interactive tools. During a cold `up`, compact structured Dev Containers stage/progress messages stream to stderr while the terminal JSON record remains captured for validation; failed builds lead with the final meaningful BuildKit/Dev Container error instead of replaying an entire JSON transcript. The guard is cleared only after a confirmed successful remote command; a state-write failure refuses dispatch or retains the guard. Ctrl-C/SIGTERM is forwarded to the **local** Dev Containers CLI, but that cannot prove an in-container command stopped. POSIX process groups cannot prove containment after a descendant calls `setsid`, and Windows `taskkill /T /F` cannot authoritatively prove arbitrary descendant containment. Therefore every cancelled lifecycle transport is durably blocked for explicit manual recovery even when its local root or group closes; readonly probes fail with a bounded error instead. On Windows, Agent Containers uses `taskkill.exe` only when its packaged native bridge obtains the Windows directory from the OS; if that bridge is unavailable it does not execute a path supplied by `SystemRoot` and instead fails closed through bounded recovery. It invokes the public `@devcontainers/cli/devcontainer.js` entry point through the active Node executable, never `cmd.exe`; its PATH-resolved regular `devcontainer.cmd` shim and the exact package entry beneath that shim's npm prefix are verified before invocation.
 - `recover <name> --yes --remote-command-stopped` is an explicit operator acknowledgement, not remote cleanup: first inspect the container (and its logs/processes) yourself and stop or wait for the in-container command as appropriate; then use this command to clear the block. It neither stops nor removes a container. `unlock` never clears manual recovery, even after the original PID has died.
 - If `devcontainer up` is interrupted, exits nonzero, throws, or lacks a trustworthy terminal container ID, Agent Containers performs three short bounded `docker ps --all --quiet --filter label=devcontainer.local_folder=<recorded-worktree>` probes and independently verifies each candidate's exact label. A matching label is retained only as a manual-recovery hint, never adopted as workspace metadata; **every** untrustworthy-start result—including zero matches, multiple candidates, or Docker inspection failure—blocks for manual recovery because provisioning may still continue. It never deletes a discovered resource.

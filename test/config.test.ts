@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict';
-import { lstat, link, mkdtemp, readFile, symlink, writeFile } from 'node:fs/promises';
+import { lstat, link, mkdtemp, readFile, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
-import { CONFIG_OUTLINE, assertDevcontainerPathCommittedOnBaseBranch, initConfig, initConfigV2, loadConfig } from '../src/config.js';
+import { CONFIG_OUTLINE, assertDevcontainerPathCommittedOnBaseBranch, initConfig, initConfigV2, loadConfig, parseCodespacesDraft, saveConfigAtomic } from '../src/config.js';
 import type { AgentContainersConfig, ProcessRunner } from '../src/types.js';
 
 test('base-branch Dev Container validation uses a safe Git path through the injected runner', async () => {
@@ -206,4 +206,26 @@ test('loadConfig rejects unknown schema keys while allowing arbitrary command na
   assert.equal(config.version, 1);
   if (config.version !== 1) throw new Error('expected legacy local configuration');
   assert.equal(config.commands['any-user-defined-name'], 'npm test');
+});
+
+test('Codespaces setup rejects secret-shaped freeform values before preview or persistence', async () => {
+  const candidate = {
+    version: 2,
+    workspace: { worktreeRoot: 'worktrees', baseBranch: 'main' },
+    project: { repository: 'owner/repo', ref: 'refs/heads/main' },
+    environment: { devcontainerPath: '.devcontainer/devcontainer.json' },
+    backends: { enabled: ['codespaces'], default: 'codespaces', local: {}, codespaces: { enabled: true, machine: null, geo: 'auto', idleTimeoutMinutes: 30, retentionPeriodMinutes: 10080, maxTotal: 4, maxRunning: 2, maxCreating: 1, maxParallelCommandsPerWorkspace: 1, readiness: { providerTimeoutSeconds: 1200, sshTimeoutSeconds: 120, command: ['curl', 'Authorization: Bearer ghp_abcdefghijklmnopqrstuvwxyz1234567890'], commandTimeoutSeconds: 600 }, transport: { reconnectWindowSeconds: 60, cancelGraceSeconds: 10, remoteLogBytesPerStream: 67108864, remoteLogRetentionHours: 168 }, ports: { allowVisibilityChanges: false, allowPublic: false }, secrets: { allowedRemoteSecretNames: [], allowCodespaceGitCredential: false } } },
+  };
+  assert.throws(() => parseCodespacesDraft(JSON.stringify(candidate)), /secret-shaped/i);
+});
+
+test('equivalent canonical config returns no-change without durability or lock writes', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'agent-containers-config-no-change-'));
+  const path = join(directory, '.agent-containers.yml');
+  const config = { version: 2 as const, workspace: { worktreeRoot: 'worktrees', baseBranch: 'main' }, project: {}, environment: { devcontainerPath: '.devcontainer/devcontainer.json' }, backends: { enabled: ['local' as const], default: 'local' as const, local: {}, codespaces: { enabled: false, machine: null, geo: 'auto', idleTimeoutMinutes: 30, retentionPeriodMinutes: 10080, maxTotal: 4, maxRunning: 2, maxCreating: 1, maxParallelCommandsPerWorkspace: 1, readiness: { providerTimeoutSeconds: 1200, sshTimeoutSeconds: 120, command: [], commandTimeoutSeconds: 600 }, transport: { reconnectWindowSeconds: 60, cancelGraceSeconds: 10, remoteLogBytesPerStream: 67108864, remoteLogRetentionHours: 168 }, ports: { allowVisibilityChanges: false, allowPublic: false }, secrets: { allowedRemoteSecretNames: [], allowCodespaceGitCredential: false } } } };
+  await writeFile(path, `${JSON.stringify(config, null, 2)}\n`);
+  const before = await stat(path);
+  const result = await saveConfigAtomic(path, config, undefined, { durabilityAdapter: { assertStateWriteSupport: async () => { throw new Error('must not write'); }, publicationMode: async () => 'strict', syncFile: async () => undefined, syncDirectory: async () => undefined, moveFileWriteThrough: async () => undefined } });
+  assert.equal(result, 'no-change');
+  assert.equal((await stat(path)).mtimeMs, before.mtimeMs);
 });

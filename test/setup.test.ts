@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { configurationDiff, loadConfig, parseCodespacesDraft, parseConfig, saveConfigAtomic } from '../src/config.js';
-import { doctor, validateCodespacesSetup } from '../src/setup.js';
+import { discoverProjectSetup, doctor, validateCodespacesSetup } from '../src/setup.js';
 import type { CodespacesAgentContainersConfig, ProcessRunner } from '../src/types.js';
 import type { StateDurabilityAdapter } from '../src/durability.js';
 import { resolveExecutionBackend } from '../src/backend.js';
@@ -58,6 +58,30 @@ test('doctor converts missing commands, rejected runners, aborts, and timeouts i
   const abort = new AbortController(); abort.abort();
   const aborted = await doctor(codespaces, 'codespaces', rejected, '/repo', { abortSignal: abort.signal });
   assert.equal(aborted.overall, 'action-required');
+});
+
+test('doctor returns a stable report for malformed or inconsistent configuration instead of throwing', async () => {
+  const malformed = { version: 2, backends: { enabled: ['local', 'invalid'] } } as unknown as CodespacesAgentContainersConfig;
+  const report = await doctor(malformed, 'both', { async run() { throw new Error('must not probe malformed configuration'); } }, '/repo');
+  assert.deepEqual(report.selectedBackends, []);
+  assert.equal(report.schemaVersion, 1);
+  assert.equal(report.overall, 'action-required');
+  assert.deepEqual(report.checks.map((check) => check.id), ['configuration']);
+});
+
+test('project discovery accepts one committed regular Dev Container and rejects ambiguity', async () => {
+  const runner: ProcessRunner = { async run(command, args) {
+    if (command === 'git' && args.join(' ') === 'remote get-url origin') return { code: 0, stdout: 'git@github.com:owner/repo.git\n', stderr: '' };
+    if (command === 'git' && args.join(' ') === 'symbolic-ref --quiet --short refs/remotes/origin/HEAD') return { code: 0, stdout: 'origin/main\n', stderr: '' };
+    if (command === 'git' && args[0] === 'ls-tree') return { code: 0, stdout: '100644 blob 0123456789012345678901234567890123456789\t.devcontainer/devcontainer.json\0', stderr: '' };
+    throw new Error(`${command} ${args.join(' ')}`);
+  } };
+  assert.deepEqual(await discoverProjectSetup('/repo', runner), { repository: 'owner/repo', ref: 'refs/heads/main', devcontainerPath: '.devcontainer/devcontainer.json' });
+  const ambiguous: ProcessRunner = { async run(command, args) {
+    const result = await runner.run(command, args);
+    return args[0] === 'ls-tree' ? { ...result, stdout: '100644 blob 0123456789012345678901234567890123456789\t.devcontainer/devcontainer.json\0' + '100644 blob abcdefabcdefabcdefabcdefabcdefabcdefabcd\t.devcontainer.json\0' } : result;
+  } };
+  await assert.rejects(() => discoverProjectSetup('/repo', ambiguous), /exactly one/i);
 });
 
 test('local doctor accepts Git worktree capability from bounded help output when Git exits 129', async () => {

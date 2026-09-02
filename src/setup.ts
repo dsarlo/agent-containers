@@ -1,8 +1,35 @@
 import { GhCodespacesProvider } from './codespaces.js';
+import { parseConfig } from './config.js';
+import { loadMetadata } from './state.js';
 import type { AgentContainersConfig, BackendKind, BackendSelection, DoctorCheck, DoctorReport, ProcessResult, ProcessRunner, SetupState } from './types.js';
 
 export interface CodespacesSetupEvidence { repository: string; requestedRef: string; expectedOid: string; devcontainerPath: string; devcontainerBlobOid: string }
-export interface DoctorOptions { abortSignal?: AbortSignal; timeoutMs?: number }
+export interface DoctorOptions { abortSignal?: AbortSignal; timeoutMs?: number; stateDir?: string; workspaceName?: string }
+export interface DiscoveredProjectSetup { repository: string; ref: string; devcontainerPath: string }
+
+/** Discover only immutable Git-tree inputs suitable for first-project setup. */
+export async function discoverProjectSetup(root: string, runner: ProcessRunner): Promise<DiscoveredProjectSetup> {
+  const remote = await runner.run('git', ['remote', 'get-url', 'origin'], { cwd: root });
+  const repository = remote.code === 0 ? canonicalGithubRepository(remote.stdout.trim()) : undefined;
+  if (!repository) throw new Error('A canonical github.com origin remote is required for Codespaces discovery.');
+  const head = await runner.run('git', ['symbolic-ref', '--quiet', '--short', 'refs/remotes/origin/HEAD'], { cwd: root });
+  const branch = head.code === 0 ? /^origin\/([A-Za-z0-9._/-]+)$/.exec(head.stdout.trim())?.[1] : undefined;
+  if (!branch || branch.includes('..') || branch.startsWith('/') || branch.endsWith('/')) throw new Error('A safe origin default branch is required for Codespaces discovery.');
+  const ref = `refs/heads/${branch}`;
+  const tree = await runner.run('git', ['ls-tree', '-r', '-z', ref], { cwd: root });
+  if (tree.code !== 0) throw new Error(`Could not read committed Git tree for ${ref}.`);
+  const candidates = tree.stdout.split('\0').flatMap((entry) => {
+    const match = /^(100644|100755) blob [0-9a-f]{40,64}\t(.+)$/.exec(entry);
+    if (!match || !isDevcontainerCandidate(match[2])) return [];
+    return [match[2]];
+  });
+  if (candidates.length !== 1) throw new Error(candidates.length ? 'Codespaces discovery requires exactly one committed regular Dev Container candidate.' : 'Codespaces discovery found no committed regular Dev Container candidate.');
+  return { repository, ref, devcontainerPath: candidates[0] };
+}
+
+function isDevcontainerCandidate(path: string): boolean {
+  return path === '.devcontainer.json' || path === '.devcontainer/devcontainer.json' || /^\.devcontainer\/[^/]+\.json$/.test(path);
+}
 
 /** Read-only repository discovery used by init, configure, and doctor. */
 export async function validateCodespacesSetup(config: AgentContainersConfig, root: string, runner: ProcessRunner): Promise<CodespacesSetupEvidence> {
@@ -20,16 +47,32 @@ export async function validateCodespacesSetup(config: AgentContainersConfig, roo
 }
 
 function canonicalGithubRepository(remote: string): string | undefined {
-  return /^(?:https:\/\/github\.com\/|git@github\.com:)([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+?)(?:\.git)?\/?$/.exec(remote)?.[1];
+  return /^(?:https:\/\/github\.com\/|git@github\.com:|ssh:\/\/git@github\.com\/)([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+?)(?:\.git)?\/?$/.exec(remote)?.[1];
 }
 
 /** A bounded, shell-free diagnostic report. Every runner failure becomes a check result. */
 export async function doctor(config: AgentContainersConfig, selection: BackendSelection, runner: ProcessRunner, root = process.cwd(), options: DoctorOptions = {}): Promise<DoctorReport> {
-  const selectedBackends = select(config, selection);
+  let validated: AgentContainersConfig;
+  try {
+    // Doctor is an observational boundary. Validate even embedding-provided
+    // objects so malformed data cannot prevent a useful diagnostic report.
+    validated = parseConfig(JSON.stringify(config));
+  } catch {
+    return { schemaVersion: 1, selectedBackends: [], overall: 'action-required', checks: [configurationAction()] };
+  }
+  let selectedBackends: BackendKind[];
+  try {
+    selectedBackends = select(validated, selection);
+  } catch {
+    return { schemaVersion: 1, selectedBackends: [], overall: 'action-required', checks: [configurationAction()] };
+  }
   const safeRunner = boundedRunner(runner, options);
   const checks: DoctorCheck[] = [];
-  for (const backend of selectedBackends) checks.push(...(backend === 'local' ? await localChecks(config, safeRunner, root) : await codespacesChecks(config, safeRunner, root)));
+  for (const backend of selectedBackends) checks.push(...(backend === 'local' ? await localChecks(validated, safeRunner, root, options) : await codespacesChecks(validated, safeRunner, root)));
   return { schemaVersion: 1, selectedBackends, overall: overall(checks), checks };
+}
+function configurationAction(): DoctorCheck {
+  return { id: 'configuration', backend: 'local', phase: 'pre-provision', state: 'action-required', summary: 'Configuration is missing, malformed, or inconsistent; no runtime probes were attempted.', remediation: ['Correct the strict Agent Containers configuration.', 'Run ac doctor again.'] };
 }
 function select(config: AgentContainersConfig, selection: BackendSelection): BackendKind[] {
   const enabled: BackendKind[] = config.version === 1 ? ['local'] : config.backends.enabled;
@@ -37,13 +80,29 @@ function select(config: AgentContainersConfig, selection: BackendSelection): Bac
   if (!enabled.includes(selection)) throw new Error(`Backend ${selection} is not enabled by this configuration.`);
   return [selection];
 }
-async function localChecks(config: AgentContainersConfig, runner: ProcessRunner, root: string): Promise<DoctorCheck[]> {
+async function localChecks(config: AgentContainersConfig, runner: ProcessRunner, root: string, options: DoctorOptions): Promise<DoctorCheck[]> {
   const git = await attempt(runner, 'git', ['--version'], root);
   const repository = await attempt(runner, 'git', ['rev-parse', '--is-inside-work-tree'], root);
   const worktree = await attempt(runner, 'git', ['worktree', 'add', '-h'], root);
   const docker = await attempt(runner, 'docker', ['--version'], root);
   const devcontainer = await attempt(runner, 'devcontainer', ['--version'], root);
   const configured = config.version === 1 || config.backends.enabled.includes('local');
+  const workspaceChecks: DoctorCheck[] = [];
+  if (options.workspaceName && options.stateDir) {
+    const metadata = await attemptValue(() => loadMetadata(options.stateDir!, options.workspaceName!));
+    if (!metadata) workspaceChecks.push(action('local.workspace.metadata', `No local workspace metadata exists for ${options.workspaceName}.`, 'provisioned-runtime'));
+    else if (!('repoRoot' in metadata)) workspaceChecks.push(action('local.workspace.metadata', `Workspace ${options.workspaceName} belongs to the phase-gated Codespaces backend.`, 'provisioned-runtime'));
+    else {
+      workspaceChecks.push({ ...ready('local.workspace.metadata', `Local workspace metadata for ${options.workspaceName} is valid.`), phase: 'provisioned-runtime' });
+      if (!metadata.containerId) workspaceChecks.push(action('local.workspace.runtime', 'Local workspace is stopped; no recorded Dev Container is running.', 'provisioned-runtime'));
+      else {
+        const inspected = await attempt(runner, 'docker', ['inspect', '--format', '{{.State.Running}}', metadata.containerId], root);
+        workspaceChecks.push(inspected?.code === 0 && inspected.stdout.trim() === 'true'
+          ? { ...ready('local.workspace.runtime', `Recorded Dev Container ${metadata.containerId} is running.`), phase: 'provisioned-runtime' }
+          : action('local.workspace.runtime', `Recorded Dev Container ${metadata.containerId} is stopped or cannot be inspected.`, 'provisioned-runtime'));
+      }
+    }
+  }
   return [
     result('local.os', process.platform === 'win32' || process.platform === 'darwin' || process.platform === 'linux', 'Host OS is supported.', 'Host OS is unsupported.'),
     result('local.git', git?.code === 0, 'Git is available.', 'Git is unavailable.'),
@@ -52,7 +111,8 @@ async function localChecks(config: AgentContainersConfig, runner: ProcessRunner,
     result('local.docker', docker?.code === 0, 'Docker is available.', 'Docker is unavailable.'),
     result('local.devcontainers', devcontainer?.code === 0, 'Dev Containers CLI is available.', 'Dev Containers CLI is unavailable.'),
     result('local.config', configured, 'Local backend is enabled by configuration.', 'Local backend is disabled by configuration.'),
-    { id: 'local.state.durability', backend: 'local', phase: 'pre-provision', state: 'action-required', summary: 'Durability is not probed by read-only doctor; lifecycle dispatch verifies it before writing state.', remediation: ['Run a lifecycle command with the packaged native durability addon.', 'Run ac doctor --backend local again.'] },
+    { id: 'local.state.durability', backend: 'local', phase: 'pre-provision', state: 'action-required', summary: 'Durability is verified at lifecycle publication time; doctor does not write state.', remediation: ['Run a lifecycle command with the packaged native durability addon.'] },
+    ...workspaceChecks,
   ];
 }
 async function codespacesChecks(config: AgentContainersConfig, runner: ProcessRunner, root: string): Promise<DoctorCheck[]> {
@@ -105,5 +165,5 @@ async function attempt(runner: ProcessRunner, command: string, args: string[], c
 async function attemptValue<T>(operation: () => Promise<T>): Promise<T | undefined> { try { return await operation(); } catch { return undefined; } }
 function result(id: string, ok: boolean, yes: string, no: string): DoctorCheck { return ok ? ready(id, yes) : action(id, no); }
 function ready(id: string, summary: string): DoctorCheck { return { id, backend: id.startsWith('local.') ? 'local' : 'codespaces', phase: 'pre-provision', state: 'ready', summary, remediation: [] }; }
-function action(id: string, summary: string): DoctorCheck { return { id, backend: id.startsWith('local.') ? 'local' : 'codespaces', phase: 'pre-provision', state: 'action-required', summary, remediation: [`Correct ${id} prerequisite.`, `Run ac doctor --backend ${id.startsWith('local.') ? 'local' : 'codespaces'} again.`] }; }
+function action(id: string, summary: string, phase: 'pre-provision' | 'provisioned-runtime' = 'pre-provision'): DoctorCheck { return { id, backend: id.startsWith('local.') ? 'local' : 'codespaces', phase, state: 'action-required', summary, remediation: [`Correct ${id} prerequisite.`, `Run ac doctor --backend ${id.startsWith('local.') ? 'local' : 'codespaces'} again.`] }; }
 function overall(checks: readonly DoctorCheck[]): SetupState { return checks.some((check) => check.state === 'unsupported') ? 'unsupported' : checks.some((check) => check.state === 'action-required') ? 'action-required' : 'ready'; }

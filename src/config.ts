@@ -253,6 +253,15 @@ export async function saveConfigAtomic(path: string, next: AgentContainersConfig
   // Reparse the serialized candidate at the publication boundary so callers
   // cannot bypass the strict schema by constructing an object directly.
   const source = canonicalConfigSource(next);
+  // An unconstrained equivalent update is observably a no-op: do not require
+  // write support or leave a lock artifact merely to report it.
+  if (expectedCurrentHash === undefined) {
+    try {
+      if (canonicalConfigSource(parseConfig(await readFile(path, 'utf8'))) === source) return 'no-change';
+    } catch (error: unknown) {
+      if (!isNodeError(error, 'ENOENT')) throw error;
+    }
+  }
   const adapter = options.durabilityAdapter ?? testDurabilityAdapter ?? getProductionStateDurabilityAdapter();
   await adapter.assertStateWriteSupport();
   const lock = `${path}.lock`;
@@ -382,13 +391,26 @@ async function readConfigLockOwner(lock: string): Promise<ConfigLockOwner | unde
   } catch { /* A malformed owner is never blindly removed. */ }
   return undefined;
 }
-function requiredString(value: unknown, label: string): string { if (!nonEmptyString(value)) throw new Error(`Invalid configuration: ${label} must be a non-empty string`); return value; }
+function requiredString(value: unknown, label: string): string {
+  if (!nonEmptyString(value)) throw new Error(`Invalid configuration: ${label} must be a non-empty string`);
+  if (secretShaped(value)) throw new Error(`Invalid configuration: ${label} contains a secret-shaped value`);
+  return value;
+}
 function optionalString(value: unknown, label: string): string | undefined { return value === undefined ? undefined : requiredString(value, label); }
 function optionalOid(value: unknown, label: string): string | undefined { if (value === undefined) return undefined; const oid = requiredString(value, label); if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(oid)) throw new Error(`Invalid configuration: ${label} must be a full Git object ID`); return oid; }
 function repository(value: unknown): string | undefined { if (value === undefined) return undefined; const result = requiredString(value, 'project.repository'); if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(result)) throw new Error('Invalid configuration: project.repository must be OWNER/REPOSITORY'); return result; }
 function requiredBoolean(value: unknown, label: string): boolean { if (typeof value !== 'boolean') throw new Error(`Invalid configuration: ${label} must be boolean`); return value; }
 function requiredInteger(value: unknown, label: string, minimum: number, maximum = Number.MAX_SAFE_INTEGER): number { if (typeof value !== 'number' || !Number.isInteger(value) || value < minimum || value > maximum) throw new Error(`Invalid configuration: ${label} must be an integer between ${minimum} and ${maximum}`); return value; }
-function requiredStrings(value: unknown, label: string): string[] { if (!Array.isArray(value) || value.some((entry) => typeof entry !== 'string' || !nonEmptyString(entry) || entry.includes('\0'))) throw new Error(`Invalid configuration: ${label} must be an array of non-empty safe strings`); return value as string[]; }
+function requiredStrings(value: unknown, label: string): string[] {
+  if (!Array.isArray(value) || value.some((entry) => typeof entry !== 'string' || !nonEmptyString(entry) || entry.includes('\0'))) throw new Error(`Invalid configuration: ${label} must be an array of non-empty safe strings`);
+  if (label !== 'secrets.allowedRemoteSecretNames' && value.some(secretShaped)) throw new Error(`Invalid configuration: ${label} contains a secret-shaped value`);
+  return value as string[];
+}
+
+/** Setup accepts policy, never credential values or fragments. */
+function secretShaped(value: string): boolean {
+  return /(?:-----BEGIN [A-Z ]*PRIVATE KEY-----|\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|glpat-[A-Za-z0-9_-]{20,}|sk-[A-Za-z0-9_-]{20,})\b|\bauthorization\s*:\s*bearer\s+\S+|\b(?:token|password|secret|api[_-]?key)\s*[:=]\s*\S+)/i.test(value);
+}
 
 function nonEmptyString(value: unknown): value is string {
   return typeof value === 'string' && value.trim().length > 0;

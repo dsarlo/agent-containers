@@ -403,13 +403,16 @@ export function isAgentContainersWorkspace(metadata: unknown): metadata is Works
     'createdAt' in metadata && typeof metadata.createdAt === 'string' &&
     (!('containerId' in metadata) || metadata.containerId === undefined || (typeof metadata.containerId === 'string' && metadata.containerId.length > 0)) &&
     (!('cleanup' in metadata) || metadata.cleanup === undefined || isCleanupState(metadata.cleanup)) &&
-    (metadata.version === 1 || ('backend' in metadata && metadata.backend === 'local' && 'handle' in metadata && isLocalHandle(metadata.handle)));
+    (metadata.version === 1 || (isKnownLocalV2Record(metadata) && 'backend' in metadata && metadata.backend === 'local' && 'handle' in metadata && isLocalHandle(metadata.handle)));
 }
 
 export function isLocalWorkspaceMetadata(metadata: WorkspaceMetadata): metadata is LocalMetadata {
   return metadata.version === 1 || metadata.backend === 'local';
 }
-function isLocalHandle(value: unknown): boolean { return typeof value === 'object' && value !== null && 'kind' in value && value.kind === 'local'; }
+function isKnownLocalV2Record(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && Object.keys(value).every((key) => ['version', 'backend', 'handle', 'name', 'repoRoot', 'worktree', 'branch', 'baseRef', 'devcontainerPath', 'createdAt', 'containerId', 'cleanup'].includes(key) && !/(token|secret|password|credential|key)/i.test(key));
+}
+function isLocalHandle(value: unknown): boolean { return isStrictRecord(value, ['kind']) && value.kind === 'local'; }
 function isCodespacesWorkspace(value: unknown): value is CodespacesWorkspaceMetadata {
   if (!isStrictRecord(value, ['version', 'backend', 'name', 'workspaceId', 'createdAt', 'control', 'repository', 'source', 'remote', 'lifecycle', 'recovery', 'cleanup']) || value.version !== 2 || value.backend !== 'codespaces' || typeof value.name !== 'string' || !isValidWorkspaceName(value.name) || !isUuid(value.workspaceId) || !isTimestamp(value.createdAt)) return false;
   const control = value.control, repository = value.repository, source = value.source, remote = value.remote, lifecycle = value.lifecycle, cleanup = value.cleanup;
