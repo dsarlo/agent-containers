@@ -296,6 +296,22 @@ async function ensureDurableDirectory(directory: string, adapter: StateDurabilit
   }
 }
 
+async function renameWithRetry(source: string, destination: string): Promise<void> {
+  let error: unknown;
+  for (let attempt = 1; attempt <= 4; attempt += 1) {
+    try {
+      await rename(source, destination);
+      return;
+    } catch (caught: unknown) {
+      const code = (caught as NodeJS.ErrnoException | undefined)?.code;
+      if (code !== 'EPERM' && code !== 'EBUSY' && code !== 'EACCES') throw caught;
+      error = caught;
+      await new Promise((resolve) => setTimeout(resolve, 25 * attempt));
+    }
+  }
+  throw error;
+}
+
 async function durableWrite(path: string, directory: string, content: string, adapter: StateDurabilityAdapter): Promise<void> {
   const temporary = join(directory, `.${basename(path)}.${randomUUID()}.tmp`);
   let file: FileHandle | undefined;
@@ -306,7 +322,7 @@ async function durableWrite(path: string, directory: string, content: string, ad
     file = undefined;
     await adapter.syncFile(temporary);
     if (await adapter.publicationMode() === 'recoverable') await adapter.moveFileWriteThrough(temporary, path);
-    else { await rename(temporary, path); await adapter.syncDirectory(directory); }
+    else { await renameWithRetry(temporary, path); await adapter.syncDirectory(directory); }
   } catch (error: unknown) {
     await file?.close();
     await rm(temporary, { force: true });

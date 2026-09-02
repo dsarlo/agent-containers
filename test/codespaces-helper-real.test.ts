@@ -4,7 +4,7 @@ import { createHash } from 'node:crypto';
 import { readFile, readdir, access } from 'node:fs/promises';
 import { readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
-import { COMMAND_ID, FIXTURE_X64, WORKSPACE_ID } from './transport-fixtures.js';
+import { COMMAND_ID, FIXTURE_ARM64, FIXTURE_X64, WORKSPACE_ID } from './transport-fixtures.js';
 import {
   RealHelperProcess, commandDir, createRealHelperSpawner, helperDataRoot, killSpawnedRelays, realBootstrapRunner,
   realHelperBinaryPath, reassembleOutput, runRealHandshake,
@@ -16,8 +16,12 @@ import type { CommandEvent } from '../src/types.js';
 
 const BIN = realHelperBinaryPath();
 
-function skipIfUnsupported(t: TestContext): void {
-  if (!BIN) t.skip('the real helper binary harness is only supported on linux-x64/arm64');
+function skipIfUnsupported(t: TestContext): boolean {
+  if (!BIN) {
+    t.skip('the real helper binary harness is only supported on linux-x64/arm64');
+    return true;
+  }
+  return false;
 }
 
 function groupKill(dataDir: string, workspaceId: string, commandId: string): void {
@@ -64,7 +68,7 @@ async function collectTerminal(client: RealHelperProcess, timeoutMs = 15000): Pr
 }
 
 test('real helper binary: hello announces the compile-time architecture (N1)', async (t: TestContext) => {
-  skipIfUnsupported(t);
+  if (skipIfUnsupported(t)) return;
   const bin = BIN as string;
   const data = await helperDataRoot();
   const client = new RealHelperProcess(bin, data);
@@ -78,7 +82,7 @@ test('real helper binary: hello announces the compile-time architecture (N1)', a
 });
 
 test('real helper binary: the handshake subcommand matches the package format (N1/N2)', async (t: TestContext) => {
-  skipIfUnsupported(t);
+  if (skipIfUnsupported(t)) return;
   const bin = BIN as string;
   const data = await helperDataRoot();
   const output = await runRealHandshake(bin);
@@ -89,7 +93,7 @@ test('real helper binary: the handshake subcommand matches the package format (N
 });
 
 test('real helper binary: execute → disconnect → attach from a nonzero offset resumes retained bytes and exact exit status (B2/N5)', async (t: TestContext) => {
-  skipIfUnsupported(t);
+  if (skipIfUnsupported(t)) return;
   const bin = BIN as string;
   const data = await helperDataRoot();
   const first = new RealHelperProcess(bin, data);
@@ -136,7 +140,7 @@ test('real helper binary: execute → disconnect → attach from a nonzero offse
 });
 
 test('real helper binary: PTY mode produces one merged terminal stream with \\r\\n translation and honors resize (B5)', async (t: TestContext) => {
-  skipIfUnsupported(t);
+  if (skipIfUnsupported(t)) return;
   const bin = BIN as string;
   const data = await helperDataRoot();
   const client = new RealHelperProcess(bin, data);
@@ -177,7 +181,7 @@ test('real helper binary: PTY mode produces one merged terminal stream with \\r\
 });
 
 test('real helper binary: explicit stdin half-close lets cat complete without killing the child (B4)', async (t: TestContext) => {
-  skipIfUnsupported(t);
+  if (skipIfUnsupported(t)) return;
   const bin = BIN as string;
   const data = await helperDataRoot();
   const client = new RealHelperProcess(bin, data);
@@ -202,7 +206,7 @@ test('real helper binary: explicit stdin half-close lets cat complete without ki
 });
 
 test('real helper binary: transport EOF leaves the child running and the durable record running; cancel verified only after the owning server reaps (B4/B3)', async (t: TestContext) => {
-  skipIfUnsupported(t);
+  if (skipIfUnsupported(t)) return;
   const bin = BIN as string;
   const data = await helperDataRoot();
   const exec = new RealHelperProcess(bin, data);
@@ -243,7 +247,7 @@ test('real helper binary: transport EOF leaves the child running and the durable
 });
 
 test('real helper binary: a signal-ignoring child yields cancel-unknown, never cancelled (B3)', async (t: TestContext) => {
-  skipIfUnsupported(t);
+  if (skipIfUnsupported(t)) return;
   const bin = BIN as string;
   const data = await helperDataRoot();
   const exec = new RealHelperProcess(bin, data);
@@ -276,7 +280,7 @@ test('real helper binary: a signal-ignoring child yields cancel-unknown, never c
 });
 
 test('real helper binary: a stdout-emitting child that reads stdin slowly does not deadlock (B6)', async (t: TestContext) => {
-  skipIfUnsupported(t);
+  if (skipIfUnsupported(t)) return;
   const bin = BIN as string;
   const data = await helperDataRoot();
   const client = new RealHelperProcess(bin, data);
@@ -302,7 +306,7 @@ test('real helper binary: a stdout-emitting child that reads stdin slowly does n
 });
 
 test('real helper binary: empty argv tokens flow end to end with no deadlock (N3)', async (t: TestContext) => {
-  skipIfUnsupported(t);
+  if (skipIfUnsupported(t)) return;
   const bin = BIN as string;
   const data = await helperDataRoot();
   const client = new RealHelperProcess(bin, data);
@@ -322,13 +326,13 @@ test('real helper binary: empty argv tokens flow end to end with no deadlock (N3
 });
 
 test('real helper binary: execute through the full backend transport yields the exact corpus output and exit (N2)', async (t: TestContext) => {
-  skipIfUnsupported(t);
+  if (skipIfUnsupported(t)) return;
   const bin = BIN as string;
   const data = await helperDataRoot();
   try {
     const fixture = await transportFixture({
       spawner: createRealHelperSpawner(bin, data),
-      runner: realBootstrapRunner(bin, digestOf(FIXTURE_X64)),
+      runner: realBootstrapRunner(bin, digestOf(process.arch === 'arm64' ? FIXTURE_ARM64 : FIXTURE_X64)),
     });
     const events: CommandEvent[] = [];
     const argv = ['sh', '-c', 'printf "hello-%s" "$1"; exit 5', 'x', 'world'] as unknown as [string, ...string[]];
