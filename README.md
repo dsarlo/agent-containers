@@ -52,7 +52,7 @@ ac remove search-page --yes
 
 ## Configuration
 
-`ac init` writes a commented `.agent-containers.yml`. `workspace.worktreeRoot` resolves from the source Git root. `environment.devcontainerPath` must be a safe repository-relative path because it is verified against, and resolved inside, each worktree.
+Plain `ac init` writes a safe schema-v2 local-only `.agent-containers.yml`; `init --force` remains the explicit legacy-v1 outline path. `workspace.worktreeRoot` resolves from the source Git root. `environment.devcontainerPath` must be a safe repository-relative path because it is verified against, and resolved inside, each worktree.
 
 ```yaml
 # Agent Containers workspace configuration, schema version 1
@@ -85,7 +85,7 @@ agent-containers init [--backends local]
 agent-containers configure --non-interactive --from <nonsecret-config-file>
 agent-containers doctor [--backend local|codespaces|all] [--json]
 agent-containers validate [--config path]
-agent-containers create <name> [--base branch]
+agent-containers create <name> [--base branch] [--backend local|codespaces]
 agent-containers exec <name> -- <command...>
 agent-containers run <name> -- <agent command...>
 agent-containers recover <name> --yes --remote-command-stopped

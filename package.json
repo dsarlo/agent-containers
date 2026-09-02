@@ -30,6 +30,7 @@
   },
   "files": [
     "dist/src",
+    "scripts/test-cli-setup-smoke.mjs",
     "prebuilds",
     "*.md",
     "docs",
@@ -48,6 +49,7 @@
     "lint": "eslint .",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "npm run build && node scripts/run-tests.mjs",
+    "test:cli-setup-smoke": "npm run build && node scripts/test-cli-setup-smoke.mjs",
     "test:integration": "AGENT_CONTAINERS_REQUIRE_LIVE_INTEGRATION=1 npm run build && AGENT_CONTAINERS_REQUIRE_LIVE_INTEGRATION=1 node --import ./dist/test/setup.js --test dist/test/integration.test.js",
     "prepack": "npm run build && npm run native:verify-prebuilds"
   },

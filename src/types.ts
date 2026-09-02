@@ -15,6 +15,21 @@ export type BackendSelection = BackendKind | 'both';
 export type SetupState = 'ready' | 'action-required' | 'unsupported';
 export type DoctorPhase = 'pre-provision' | 'provisioned-runtime';
 
+/** Backend-neutral identities intentionally never overload local Docker fields. */
+export type WorkspaceHandle =
+  | { kind: 'local' }
+  | { kind: 'codespaces'; id: string; name: string; environmentId: string };
+export type WorkspaceObservation = { backend: BackendKind; state: string; observedAt: string };
+export type CommandEvent =
+  | { type: 'accepted' | 'started'; commandId: string }
+  | { type: 'stdout' | 'stderr' | 'terminal'; commandId: string; offset: bigint; bytes: Uint8Array }
+  | { type: 'exit'; commandId: string; code: number | null };
+export interface ExecutionBackend {
+  readonly kind: BackendKind;
+  observe(handle: WorkspaceHandle, signal?: AbortSignal): Promise<WorkspaceObservation>;
+  execute(handle: WorkspaceHandle, request: { commandId: string; argv: readonly [string, ...string[]] }, signal?: AbortSignal): AsyncIterable<CommandEvent>;
+}
+
 export interface CodespacesConfig {
   enabled: boolean;
   machine: string | null;

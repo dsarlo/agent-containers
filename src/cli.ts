@@ -49,7 +49,7 @@ export async function runCli(args: string[], cwd = process.cwd(), write: (messag
           const validated = await withSetupEvidence(next, root);
           write(configurationDiff(null, validated));
           await initConfigV2(root, validated);
-        } else if (!selection) await initConfig(root, false);
+        } else if (!selection) await initConfigV2(root, setupConfig('local'));
         else await initConfigV2(root, setupConfig(selection, optionValue(rest, '--default-backend')));
         write(`Wrote ${join(root, '.agent-containers.yml')}`);
         return 0;
@@ -106,13 +106,15 @@ export async function runCli(args: string[], cwd = process.cwd(), write: (messag
       }
       case 'create': {
         const name = requiredPositional(rest, 'workspace name');
-        ensureOptions(rest.slice(1), ['--base']);
+        ensureOptions(rest.slice(1), ['--base', '--backend']);
         let recoveryWorktree = cwd;
         return withWorkspaceLock(stateDir, name, async (signal) => {
           const root = await findGitRoot(cwd, nodeProcessRunner, signal, 'lifecycle');
           const config = await loadConfig(join(root, '.agent-containers.yml'));
           recoveryWorktree = resolve(root, config.workspace.worktreeRoot, name);
-          assertLocalBackendEnabled(config);
+          const requestedBackend = optionValue(rest.slice(1), '--backend');
+          if (requestedBackend !== undefined && requestedBackend !== 'local' && requestedBackend !== 'codespaces') throw new UsageError('--backend must be local or codespaces.');
+          assertLocalBackendEnabled(config, requestedBackend);
           const baseBranch = optionValue(rest.slice(1), '--base');
           await assertDevcontainerPathCommittedOnBaseBranch(config, root, nodeProcessRunner, undefined, 'lifecycle', signal);
           if (baseBranch && baseBranch !== config.workspace.baseBranch) {
@@ -233,8 +235,10 @@ function requireCodespacesExperimental(): void {
   if (process.env.AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES !== '1') throw new Error('Codespaces setup is experimental; set AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES=1 to enable it.');
 }
 
-function assertLocalBackendEnabled(config: import('./types.js').AgentContainersConfig): void {
-  if (config.version === 2 && (!config.backends.enabled.includes('local') || config.backends.default !== 'local')) throw new Error('Local execution is unavailable because Codespaces is selected or local is disabled; Codespaces lifecycle is not implemented in this release.');
+function assertLocalBackendEnabled(config: import('./types.js').AgentContainersConfig, requestedBackend?: string): void {
+  const backend = requestedBackend ?? (config.version === 1 ? 'local' : config.backends.default);
+  if (config.version === 2 && !config.backends.enabled.includes('local')) throw new Error('Local execution is unavailable because local is disabled; Codespaces lifecycle is not implemented in this release.');
+  if (backend === 'codespaces') throw new Error('Codespaces is selected but lifecycle is not implemented in this release. Select --backend local when local is enabled.');
 }
 
 function setupConfig(selection: string, defaultBackend?: string): CodespacesAgentContainersConfig {

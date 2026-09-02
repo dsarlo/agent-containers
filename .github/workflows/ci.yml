@@ -169,6 +169,10 @@ jobs:
         env:
           PACKED_NATIVE_PACKAGE_DIR: ${{ github.workspace }}/.packed-native/node_modules/@dsarlo/agent-containers
           EXPECTED_NATIVE_PUBLICATION_MODE: ${{ matrix.publication_mode }}
+      - name: Exercise installed CLI setup interface
+        run: node .packed-native/node_modules/@dsarlo/agent-containers/scripts/test-cli-setup-smoke.mjs
+        env:
+          PACKED_NATIVE_PACKAGE_DIR: ${{ github.workspace }}/.packed-native/node_modules/@dsarlo/agent-containers
 
   live-devcontainer:
     name: Live Dev Containers lifecycle

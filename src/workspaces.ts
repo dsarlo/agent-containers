@@ -307,7 +307,9 @@ export async function createWorkspace(options: {
   }
   if (result.code !== 0) throw await worktreeAddRecoveryError(commandError('git worktree add', result), root, worktree, branch, options.runner);
   const metadata: WorkspaceMetadata = {
-    version: 1,
+    version: 2,
+    backend: 'local',
+    handle: { kind: 'local' },
     name,
     repoRoot: root,
     worktree: await canonicalPath(worktree),

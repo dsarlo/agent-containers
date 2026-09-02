@@ -52,8 +52,7 @@ async function localChecks(config: AgentContainersConfig, runner: ProcessRunner,
     result('local.docker', docker?.code === 0, 'Docker is available.', 'Docker is unavailable.'),
     result('local.devcontainers', devcontainer?.code === 0, 'Dev Containers CLI is available.', 'Dev Containers CLI is unavailable.'),
     result('local.config', configured, 'Local backend is enabled by configuration.', 'Local backend is disabled by configuration.'),
-    { id: 'local.state.durability', backend: 'local', phase: 'pre-provision', state: 'action-required', summary: 'State durability is checked before lifecycle dispatch.', remediation: ['Run a lifecycle command only with the packaged native durability addon.', 'Run ac doctor --backend local again.'] },
-    runtime('local.runtime.workspace', 'No exact recorded local workspace was supplied; provisioned runtime remains uninspected.'),
+    { id: 'local.state.durability', backend: 'local', phase: 'pre-provision', state: 'action-required', summary: 'Durability is not probed by read-only doctor; lifecycle dispatch verifies it before writing state.', remediation: ['Run a lifecycle command with the packaged native durability addon.', 'Run ac doctor --backend local again.'] },
   ];
 }
 async function codespacesChecks(config: AgentContainersConfig, runner: ProcessRunner, root: string): Promise<DoctorCheck[]> {
@@ -64,10 +63,11 @@ async function codespacesChecks(config: AgentContainersConfig, runner: ProcessRu
   const actor = ghReady ? await attemptValue(() => provider.actor()) : undefined;
   const source = ghReady && v2 ? await attemptValue(() => validateCodespacesSetup(config, root, runner)) : undefined;
   const machines = ghReady && v2?.project.repository && v2.project.ref ? await attemptValue(() => provider.machines(v2.project.repository!, v2.project.ref!)) : undefined;
+  const defaults = ghReady && v2?.project.repository && v2.project.ref ? await attemptValue(() => provider.defaults(v2.project.repository!, v2.project.ref!)) : undefined;
   const selected = v2?.backends.codespaces.machine;
   const selectedMachine = machines?.machines.find((machine) => machine.name === selected);
   const geoEligible = !v2 || v2.backends.codespaces.geo === 'auto'
-    ? Boolean(selectedMachine)
+    ? Boolean(selectedMachine && defaults?.location)
     : Boolean(selectedMachine && await attemptValue(async () => (await provider.machines(v2.project.repository!, v2.project.ref!, v2.backends.codespaces.geo)).machines.some((machine) => machine.name === selected)));
   return [
     result('codespaces.experimental', process.env.AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES === '1', 'Experimental Codespaces gate is enabled.', 'Set AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES=1.'),
@@ -76,13 +76,12 @@ async function codespacesChecks(config: AgentContainersConfig, runner: ProcessRu
     source ? { ...ready('codespaces.repository', `GitHub repository ${source.repository} was verified from origin.`), evidence: { repository: source.repository } } : action('codespaces.repository', 'GitHub repository identity is not verified from the configured origin.'),
     source ? { ...ready('codespaces.ref', `Remote ref resolves to immutable ${source.expectedOid}.`), evidence: { expectedOid: source.expectedOid } } : action('codespaces.ref', 'No remotely resolvable Git ref/OID evidence is available.'),
     source ? { ...ready('codespaces.devcontainer', 'Committed regular Dev Container blob was verified.'), evidence: { devcontainerBlobOid: source.devcontainerBlobOid } } : action('codespaces.devcontainer', 'Dev Container path is not verified as a committed regular file.'),
-    action('codespaces.owner-billing', 'The documented read-only machine endpoint does not prove owner or billing policy.'),
+    defaults ? { ...ready('codespaces.owner-billing', 'Documented default billable owner and location were read.'), evidence: { billableOwner: defaults.billableOwner.login, defaultLocation: defaults.location, defaultDevcontainerPath: defaults.devcontainerPath } } : action('codespaces.owner-billing', 'Documented default billable owner and location could not be read.'),
     result('codespaces.machine', Boolean(selectedMachine), 'Configured machine appears in provider inventory.', 'Configured machine is absent from provider inventory.'),
-    result('codespaces.geo', Boolean(geoEligible), 'Configured geo is eligible for selected machine.', 'Configured geo is not eligible for selected machine.'),
+    result('codespaces.geo', Boolean(geoEligible), v2?.backends.codespaces.geo === 'auto' ? 'geo:auto uses the documented default location.' : 'Configured geo is eligible for selected machine.', 'Configured geo is not eligible for selected machine.'),
     action('codespaces.ports', 'Port policy is unavailable because no documented read-only endpoint proves it.'),
     action('codespaces.secrets', 'Secret policy is unavailable because no documented read-only endpoint proves it.'),
     action('codespaces.ssh-key', 'A pre-existing SSH key/config is required later and was not inspected.'),
-    runtime('codespaces.runtime.workspace', 'No exact recorded running Codespace was supplied; provisioned runtime remains uninspected.'),
   ];
 }
 function boundedRunner(runner: ProcessRunner, options: DoctorOptions): ProcessRunner {
@@ -90,12 +89,16 @@ function boundedRunner(runner: ProcessRunner, options: DoctorOptions): ProcessRu
     if (options.abortSignal?.aborted) throw new Error('Doctor operation aborted.');
     const controller = new AbortController();
     const relay = () => controller.abort();
+    let timer: NodeJS.Timeout | undefined;
     options.abortSignal?.addEventListener('abort', relay, { once: true });
     try {
       const operation = runner.run(command, args, { ...runOptions, signal: controller.signal });
-      const timeout = new Promise<never>((_, reject) => setTimeout(() => { controller.abort(); reject(new Error('Doctor operation timed out.')); }, options.timeoutMs ?? 5_000));
-      return await Promise.race([operation, timeout]);
-    } finally { options.abortSignal?.removeEventListener('abort', relay); }
+      const timeout = new Promise<never>((_, reject) => { timer = setTimeout(() => { controller.abort(); reject(new Error('Doctor operation timed out.')); }, options.timeoutMs ?? 5_000); });
+       return await Promise.race([operation, timeout]);
+    } finally {
+      if (timer) clearTimeout(timer);
+      options.abortSignal?.removeEventListener('abort', relay);
+    }
   } };
 }
 async function attempt(runner: ProcessRunner, command: string, args: string[], cwd: string): Promise<ProcessResult | undefined> { try { return await runner.run(command, args, { cwd }); } catch { return undefined; } }
@@ -103,5 +106,4 @@ async function attemptValue<T>(operation: () => Promise<T>): Promise<T | undefin
 function result(id: string, ok: boolean, yes: string, no: string): DoctorCheck { return ok ? ready(id, yes) : action(id, no); }
 function ready(id: string, summary: string): DoctorCheck { return { id, backend: id.startsWith('local.') ? 'local' : 'codespaces', phase: 'pre-provision', state: 'ready', summary, remediation: [] }; }
 function action(id: string, summary: string): DoctorCheck { return { id, backend: id.startsWith('local.') ? 'local' : 'codespaces', phase: 'pre-provision', state: 'action-required', summary, remediation: [`Correct ${id} prerequisite.`, `Run ac doctor --backend ${id.startsWith('local.') ? 'local' : 'codespaces'} again.`] }; }
-function runtime(id: string, summary: string): DoctorCheck { return { ...action(id, summary), phase: 'provisioned-runtime' }; }
 function overall(checks: readonly DoctorCheck[]): SetupState { return checks.some((check) => check.state === 'unsupported') ? 'unsupported' : checks.some((check) => check.state === 'action-required') ? 'action-required' : 'ready'; }

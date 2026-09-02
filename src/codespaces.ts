@@ -6,7 +6,8 @@ export type CodespacesProviderProcess = Pick<ProcessRunner, 'run'>;
 export interface GithubActor { id: string; login: string }
 export interface CodespaceIdentity { id: string; name: string; environmentId: string; state: string }
 export interface RepositorySourceEvidence { repository: string; requestedRef: string; expectedOid: string; devcontainerPath: string; devcontainerBlobOid: string }
-export interface CodespacesMachineInventory { machines: readonly { name: string }[] }
+export interface CodespacesMachineInventory { machines: readonly { name: string; displayName: string; operatingSystem: string; storageInBytes: number; memoryInBytes: number; cpus: number; prebuildAvailability: 'none' | 'ready' | 'in_progress' | null }[] }
+export interface CodespacesDefaults { billableOwner: GithubActor; location: string; devcontainerPath: string | null }
 
 /** Thin, replaceable adapter. It intentionally exposes no token or auth operation. */
 export class GhCodespacesProvider {
@@ -26,6 +27,15 @@ export class GhCodespacesProvider {
     return { id: String(value.id), name: value.name, environmentId: value.environment_id, state: value.state };
   }
 
+  async defaults(repository: string, ref?: string): Promise<CodespacesDefaults> {
+    assertRepository(repository);
+    if (ref !== undefined && !safeRef(ref)) throw new Error('Codespaces defaults selector is unsafe.');
+    const query = ref === undefined ? '' : `?${new URLSearchParams({ ref })}`;
+    const value = await this.api(`/repos/${repository}/codespaces/new${query}`);
+    if (!isRecord(value) || !isRecord(value.billable_owner) || !losslessId(value.billable_owner.id) || typeof value.billable_owner.login !== 'string' || !value.billable_owner.login || !isRecord(value.defaults) || typeof value.defaults.location !== 'string' || !value.defaults.location || (value.defaults.devcontainer_path !== null && typeof value.defaults.devcontainer_path !== 'string')) throw new Error('Codespaces defaults response is incomplete.');
+    return { billableOwner: { id: String(value.billable_owner.id), login: value.billable_owner.login }, location: value.defaults.location, devcontainerPath: value.defaults.devcontainer_path };
+  }
+
   /** GitHub's documented repository machine inventory, optionally filtered by ref/location. */
   async machines(repository: string, ref: string, location?: string): Promise<CodespacesMachineInventory> {
     assertRepository(repository);
@@ -35,8 +45,8 @@ export class GhCodespacesProvider {
     const value = await this.api(`/repos/${repository}/codespaces/machines?${query}`);
     if (!isRecord(value) || typeof value.total_count !== 'number' || !Number.isSafeInteger(value.total_count) || value.total_count < 0 || !Array.isArray(value.machines) || value.total_count !== value.machines.length) throw new Error('Codespaces machine inventory response is incomplete.');
     const machines = value.machines.map((machine) => {
-      if (!isRecord(machine) || typeof machine.name !== 'string' || !machine.name) throw new Error('Codespaces machine inventory contains an invalid machine.');
-      return { name: machine.name };
+      if (!isRecord(machine) || typeof machine.name !== 'string' || !machine.name || typeof machine.display_name !== 'string' || !machine.display_name || typeof machine.operating_system !== 'string' || !machine.operating_system || !positiveInteger(machine.storage_in_bytes) || !positiveInteger(machine.memory_in_bytes) || !positiveInteger(machine.cpus) || (machine.prebuild_availability !== null && machine.prebuild_availability !== 'none' && machine.prebuild_availability !== 'ready' && machine.prebuild_availability !== 'in_progress')) throw new Error('Codespaces machine inventory contains an invalid machine.');
+      return { name: machine.name, displayName: machine.display_name, operatingSystem: machine.operating_system, storageInBytes: machine.storage_in_bytes, memoryInBytes: machine.memory_in_bytes, cpus: machine.cpus, prebuildAvailability: machine.prebuild_availability as 'none' | 'ready' | 'in_progress' | null };
     });
     return { machines };
   }
@@ -84,6 +94,7 @@ function redactDiagnostic(value: string): string {
 }
 function isRecord(value: unknown): value is Record<string, unknown> { return typeof value === 'object' && value !== null && !Array.isArray(value); }
 function losslessId(value: unknown): boolean { return (typeof value === 'number' && Number.isSafeInteger(value) && value > 0) || (typeof value === 'string' && /^[1-9][0-9]*$/.test(value)); }
+function positiveInteger(value: unknown): value is number { return typeof value === 'number' && Number.isSafeInteger(value) && value > 0; }
 function safeName(value: string): boolean { return /^[A-Za-z0-9-]+$/.test(value); }
 function oid(value: unknown): value is string { return typeof value === 'string' && /^[0-9a-f]{40,64}$/i.test(value); }
 function safeRef(value: string): boolean { return value.length > 0 && value.length <= 512 && !/[\0\r\n~^:?*\x5b\\]/.test(value) && !value.includes('..') && !value.endsWith('.') && !value.startsWith('/'); }

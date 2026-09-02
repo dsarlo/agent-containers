@@ -67,7 +67,10 @@ export async function initConfigV2(directory: string, config: CodespacesAgentCon
   const path = join(directory, '.agent-containers.yml');
   try { await lstat(path); throw new Error(`${path} already exists; use ac configure to review and update it.`); }
   catch (error: unknown) { if (!isNodeError(error, 'ENOENT')) throw error; }
-  await saveConfigAtomic(path, config, null);
+  // First publication uses O_EXCL, preserving expected-absence semantics without
+  // turning onboarding into a lifecycle durability probe.
+  try { await writeFile(path, canonicalConfigSource(config), { encoding: 'utf8', flag: 'wx', mode: 0o600 }); }
+  catch (error: unknown) { if (isNodeError(error, 'EEXIST')) throw new Error('Configuration changed concurrently; it was created while onboarding was in progress.', { cause: error }); throw error; }
 }
 
 export async function loadConfig(path: string): Promise<AgentContainersConfig> {

@@ -87,12 +87,12 @@ test('atomic configuration save preserves the prior file on compare-and-swap con
   assert.equal(await readFile(path, 'utf8'), 'version: 1\n');
 });
 
-test('doctor permits only read-only prerequisite commands and reports absent runtime explicitly', async () => {
+test('doctor permits only read-only prerequisite commands without claiming runtime coverage', async () => {
   const calls: string[][] = [];
   const runner: ProcessRunner = { async run(command, args) { calls.push([command, ...args]); return { code: 0, stdout: args.at(-1) === '/user' ? '{"id":1,"login":"octo"}' : args[0] === 'api' ? '{"billable_owner":{"id":"1"}}' : 'git version 2.0', stderr: '' }; } };
   const report = await doctor(codespaces, 'codespaces', runner);
   assert.equal(report.overall, 'action-required');
-  assert.ok(report.checks.some((check) => check.id === 'codespaces.runtime.workspace' && check.phase === 'provisioned-runtime'));
+  assert.ok(report.checks.every((check) => check.phase === 'pre-provision'));
   assert.ok(calls.every(([command, ...args]) => command === 'git' || (command === 'gh' && (args[0] === '--version' || (args[0] === 'api' && args.includes('GET'))))));
 });
 
@@ -269,7 +269,6 @@ test('doctor has a stable complete Codespaces inventory and uses only its positi
     'codespaces.experimental', 'codespaces.gh', 'codespaces.actor', 'codespaces.repository',
     'codespaces.ref', 'codespaces.devcontainer', 'codespaces.owner-billing', 'codespaces.machine',
     'codespaces.geo', 'codespaces.ports', 'codespaces.secrets', 'codespaces.ssh-key',
-    'codespaces.runtime.workspace',
   ]);
   assert.ok(calls.every(([command, ...args]) => (command === 'git' && args.join(' ') === 'remote get-url origin') || args[0] === '--version' || (args[0] === 'api' && args.includes('GET'))));
   assert.ok(calls.every((call) => !call.join(' ').match(/ auth | token|create|start|stop|delete|ssh|secret|port/i)));

@@ -4,8 +4,9 @@ import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { randomUUID, createHash } from 'node:crypto';
 import { isValidWorkspaceName, validateWorkspaceName } from './names.js';
 import { getProductionStateDurabilityAdapter, type StateDurabilityAdapter } from './durability.js';
+import type { WorkspaceHandle } from './types.js';
 
-export interface WorkspaceMetadata {
+export interface LocalWorkspaceMetadata {
   version: 1;
   name: string;
   repoRoot: string;
@@ -22,6 +23,20 @@ export interface WorkspaceMetadata {
     branch?: boolean;
   };
 }
+
+/** Schema v2 records the selected backend and a discriminated backend handle. */
+export interface V2LocalWorkspaceMetadata extends Omit<LocalWorkspaceMetadata, 'version'> {
+  version: 2;
+  backend: 'local';
+  handle: Extract<WorkspaceHandle, { kind: 'local' }>;
+}
+export interface CodespacesWorkspaceMetadata extends Omit<LocalWorkspaceMetadata, 'version'> {
+  version: 2;
+  backend: 'codespaces';
+  handle: Extract<WorkspaceHandle, { kind: 'codespaces' }>;
+}
+export type WorkspaceMetadata = LocalWorkspaceMetadata | V2LocalWorkspaceMetadata | CodespacesWorkspaceMetadata;
+export type LocalMetadata = LocalWorkspaceMetadata | V2LocalWorkspaceMetadata;
 
 export interface StaleLockRecoveryHooks {
   /** Test seam: runs after ownership is validated while normal acquisition remains blocked. */
@@ -366,8 +381,9 @@ export async function listMetadata(stateDir: string): Promise<WorkspaceMetadata[
 export const METADATA_LIST_CONCURRENCY = 8;
 
 export function isAgentContainersWorkspace(metadata: unknown): metadata is WorkspaceMetadata {
+  if (isCodespacesWorkspace(metadata)) return true;
   return typeof metadata === 'object' && metadata !== null &&
-    'version' in metadata && metadata.version === 1 &&
+    'version' in metadata && (metadata.version === 1 || metadata.version === 2) &&
     'name' in metadata && typeof metadata.name === 'string' && isValidWorkspaceName(metadata.name) &&
     'branch' in metadata && metadata.branch === `agent-containers/${metadata.name}` &&
     'worktree' in metadata && isCanonicalPath(metadata.worktree) &&
@@ -375,8 +391,24 @@ export function isAgentContainersWorkspace(metadata: unknown): metadata is Works
     'baseRef' in metadata && isLocalBranchRef(metadata.baseRef) &&
     'devcontainerPath' in metadata && typeof metadata.devcontainerPath === 'string' &&
     'createdAt' in metadata && typeof metadata.createdAt === 'string' &&
-    (!('containerId' in metadata) || metadata.containerId === undefined || typeof metadata.containerId === 'string') &&
-    (!('cleanup' in metadata) || metadata.cleanup === undefined || isCleanupState(metadata.cleanup));
+    (!('containerId' in metadata) || metadata.containerId === undefined || (typeof metadata.containerId === 'string' && metadata.containerId.length > 0)) &&
+    (!('cleanup' in metadata) || metadata.cleanup === undefined || isCleanupState(metadata.cleanup)) &&
+    (metadata.version === 1 || ('backend' in metadata && metadata.backend === 'local' && 'handle' in metadata && isLocalHandle(metadata.handle)));
+}
+
+export function isLocalWorkspaceMetadata(metadata: WorkspaceMetadata): metadata is LocalMetadata {
+  return metadata.version === 1 || metadata.backend === 'local';
+}
+function isLocalHandle(value: unknown): boolean { return typeof value === 'object' && value !== null && 'kind' in value && value.kind === 'local'; }
+function isCodespacesWorkspace(value: unknown): value is CodespacesWorkspaceMetadata {
+  return typeof value === 'object' && value !== null &&
+    'version' in value && value.version === 2 && 'backend' in value && value.backend === 'codespaces' &&
+    'name' in value && typeof value.name === 'string' && isValidWorkspaceName(value.name) &&
+    'createdAt' in value && typeof value.createdAt === 'string' && 'handle' in value &&
+    typeof value.handle === 'object' && value.handle !== null && 'kind' in value.handle && value.handle.kind === 'codespaces' &&
+    'id' in value.handle && typeof value.handle.id === 'string' && value.handle.id.length > 0 &&
+    'name' in value.handle && typeof value.handle.name === 'string' && value.handle.name.length > 0 &&
+    'environmentId' in value.handle && typeof value.handle.environmentId === 'string' && value.handle.environmentId.length > 0;
 }
 
 function isCanonicalPath(value: unknown): value is string {

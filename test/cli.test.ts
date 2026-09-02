@@ -310,8 +310,8 @@ test('init and implicit validation resolve the repository root from a subdirecto
   assert.equal(spawnSync('git', ['init', '-b', 'main'], { cwd: root }).status, 0);
   const messages: string[] = [];
   assert.equal(await runCli(['init'], nested, (message) => messages.push(message)), 0);
-  assert.match(messages[0], new RegExp(`Wrote ${join(root, '.agent-containers.yml').replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
-  assert.match(await readFile(join(root, '.agent-containers.yml'), 'utf8'), /version: 1/);
+  assert.match(messages[0], new RegExp(`Wrote ${root.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/\\.agent-containers\\.yml`));
+  assert.match(await readFile(join(root, '.agent-containers.yml'), 'utf8'), /"version": 2/);
   await writeFile(join(root, '.agent-containers.yml'), 'version: 1\n');
   await mkdir(join(root, '.devcontainer'), { recursive: true });
   await writeFile(join(root, '.devcontainer', 'devcontainer.json'), '{}\n');

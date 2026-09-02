@@ -1,0 +1,22 @@
+import assert from 'node:assert/strict';
+import { mkdtemp, readFile, writeFile } from 'node:fs/promises';
+import { spawnSync } from 'node:child_process';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import process from 'node:process';
+
+const packageRoot = process.env.PACKED_NATIVE_PACKAGE_DIR ?? process.cwd();
+const cli = join(packageRoot, 'dist', 'src', 'bin', 'agent-containers.js');
+const root = await mkdtemp(join(tmpdir(), 'agent-containers-cli-smoke-'));
+const run = (args) => spawnSync(process.execPath, [cli, ...args], { cwd: root, encoding: 'utf8', env: { ...process.env, XDG_STATE_HOME: join(root, 'state') } });
+assert.equal(spawnSync('git', ['init', '-b', 'main'], { cwd: root }).status, 0);
+assert.equal(run(['init']).status, 0, 'built CLI init must succeed');
+assert.match(await readFile(join(root, '.agent-containers.yml'), 'utf8'), /"version": 2/);
+const candidate = JSON.parse(await readFile(join(root, '.agent-containers.yml'), 'utf8'));
+candidate.workspace.worktreeRoot = 'portable-worktrees';
+const input = join(root, 'candidate.json');
+await writeFile(input, JSON.stringify(candidate));
+assert.equal(run(['configure', '--non-interactive', '--from', input]).status, 0, 'installed CLI configure must succeed');
+assert.match(await readFile(join(root, '.agent-containers.yml'), 'utf8'), /portable-worktrees/);
+const doctor = run(['doctor', '--json']);
+assert.match(doctor.stdout, /"schemaVersion": 1/, 'installed CLI doctor must emit stable JSON');

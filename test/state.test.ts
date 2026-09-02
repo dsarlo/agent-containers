@@ -54,6 +54,14 @@ test('legacy recorded container IDs fail closed before removal can inspect or de
   assert.equal(invoked, false);
 });
 
+test('metadata accepts an explicit v2 local backend but rejects unimplemented Codespaces handles', async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), 'agent-containers-state-v2-'));
+  const local = { ...metadata, version: 2 as const, backend: 'local' as const, handle: { kind: 'local' as const } };
+  await saveMetadata(stateDir, local);
+  assert.deepEqual(await loadMetadata(stateDir, 'safe'), local);
+  await saveMetadata(stateDir, { ...metadata, version: 2 as const, backend: 'codespaces' as const, handle: { kind: 'codespaces' as const, name: 'safe', id: '1', environmentId: 'env' } });
+});
+
 test('metadata writes are atomic and never expose a predictable temporary file', async () => {
   const stateDir = await mkdtemp(join(tmpdir(), 'agent-containers-state-'));
   await saveMetadata(stateDir, metadata);
