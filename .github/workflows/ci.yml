@@ -191,8 +191,11 @@ jobs:
       - run: npm ci
       - name: Install the arm64 cross compiler
         run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
-      - name: Build and pin the static Linux helper artifacts (reproducible make build)
-        run: CC=gcc CC_ARM64=aarch64-linux-gnu-gcc npm run build:helper
+      - name: Verify committed static Linux helper pins before any rebuild
+        run: npm run verify:native-helper-packaging-contract
+      - run: npm run test:native-helper-packaging-contract
+      - name: Rebuild static Linux helpers outside the repository and compare committed pins
+        run: CC=gcc CC_ARM64=aarch64-linux-gnu-gcc npm run verify:helper-reproducible
       - run: npm run verify:native-helper-packaging-contract
       - run: npm run test:native-helper-packaging-contract
       # actions/upload-artifact v5

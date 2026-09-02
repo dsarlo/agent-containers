@@ -78,6 +78,7 @@ export interface ManualRecoveryInput {
 
 let testDurabilityAdapter: StateDurabilityAdapter | undefined;
 let testDurableRename: ((source: string, destination: string) => Promise<void>) | undefined;
+let testPathExists: ((path: string) => Promise<boolean>) | undefined;
 let testJournalStagingWrite: ((file: FileHandle, content: string) => Promise<void>) | undefined;
 const journalSerializers = new Map<string, Promise<void>>();
 
@@ -106,6 +107,11 @@ export function setStateDurabilityAdapterForTesting(adapter: StateDurabilityAdap
 /** Test-only seam for a filesystem move that fails before changing either path. */
 export function setStateDurableRenameForTesting(renameForTest: ((source: string, destination: string) => Promise<void>) | undefined): void {
   testDurableRename = renameForTest;
+}
+
+/** Test-only seam for state observations around a failed Windows directory rename. */
+export function setStatePathExistsForTesting(existsForTest: ((path: string) => Promise<boolean>) | undefined): void {
+  testPathExists = existsForTest;
 }
 
 /** Test-only seam for a staging write failure before its file durability boundary. */
@@ -990,10 +996,11 @@ async function durableRename(source: string, destination: string, directory: str
         break;
       } catch (caught: unknown) {
         const transient = isNodeError(caught, 'EPERM') || isNodeError(caught, 'EBUSY') || isNodeError(caught, 'EACCES');
-        // A staging source still present and an absent destination distinguish
-        // a transient handle/share race from an ownership collision. Preserve
-        // every other failure for the caller's fail-closed lock logic.
-        if (!transient || attempt === 4 || !await pathExists(source) || await pathExists(destination)) throw caught;
+        // A live staging source is the ownership witness. Windows can release a
+        // competing destination between this failed rename and outer collision
+        // handling, so destination visibility is not a safe retry predicate.
+        // Persistent permission errors still fail closed at the bounded limit.
+        if (!transient || attempt === 4 || !await pathExists(source)) throw caught;
         error = caught;
         await delay();
       }
@@ -1071,6 +1078,7 @@ async function readLockOwner(path: string): Promise<LockOwner | undefined> {
 }
 
 async function pathExists(path: string): Promise<boolean> {
+  if (testPathExists) return await testPathExists(path);
   try {
     await lstat(path);
     return true;

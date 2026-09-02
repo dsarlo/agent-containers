@@ -1,9 +1,10 @@
 /* global process */
 import { createHash, randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { readFile, writeFile, stat, mkdir } from 'node:fs/promises';
+import { readFile, writeFile, stat, mkdir, mkdtemp, rm } from 'node:fs/promises';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { tmpdir } from 'node:os';
 
 const HELPER_PROTOCOL_VERSION = 1; // mirrors src/codespaces-protocol.ts; the packaging contract cross-checks both.
 
@@ -43,11 +44,11 @@ async function sourcePins() {
   return { 'helper.c': digest(helperC), Makefile: digest(makefile) };
 }
 
-export async function build() {
+export async function build(outputDir = binDir) {
   if (!process.env.CI && !(await stat('/usr/bin/make')).isFile()) {
     throw new Error('make is unavailable; the static helper artifact requires a C toolchain (run this inside the pinned helper-artifacts CI job or a toolchain host).');
   }
-  execFileSync('make', ['-C', helperDir], { stdio: 'inherit' });
+  execFileSync('make', ['-C', helperDir, `BIN_DIR=${outputDir}`], { stdio: 'inherit' });
 }
 
 async function statSize(path) {
@@ -117,6 +118,25 @@ export async function verify() {
   return manifest;
 }
 
+/** Build outside the repository and compare the output to the committed pins. */
+export async function verifyReproducible() {
+  const manifest = await verify();
+  const temporaryRoot = await mkdtemp(join(tmpdir(), 'agent-containers-helper-rebuild-'));
+  const outputDir = join(temporaryRoot, 'bin');
+  try {
+    await build(outputDir);
+    for (const [arch, file] of Object.entries(archArtifacts)) {
+      const bytes = await readFile(join(outputDir, file));
+      const entry = manifest.architectures[arch];
+      if (!entry || entry.sha256 !== digest(bytes) || entry.size !== bytes.length) {
+        throw new Error(`isolated helper rebuild for ${file} does not match the committed pinned digest; refusing to repin CI output.`);
+      }
+    }
+  } finally {
+    await rm(temporaryRoot, { recursive: true, force: true });
+  }
+}
+
 async function main() {
   const [subcommand] = process.argv.slice(2);
   const verifyOnly = process.argv.includes('--verify-only');
@@ -133,8 +153,12 @@ async function main() {
       result = `Helper artifacts and manifest verified against pinned digests.`;
       await verify();
       break;
+    case 'verify-reproducible':
+      await verifyReproducible();
+      result = 'Isolated helper rebuild matches committed pinned digests.';
+      break;
     default:
-      throw new Error('usage: node scripts/build-helper.mjs <build|pin|verify> [--verify-only]');
+      throw new Error('usage: node scripts/build-helper.mjs <build|pin|verify|verify-reproducible> [--verify-only]');
   }
   process.stdout.write(`${result}\n`);
 }

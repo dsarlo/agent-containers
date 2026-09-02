@@ -104,15 +104,19 @@ assert.match(buildHelper, /helperDir\s*=\s*join\(repository,\s*'native',\s*'help
 assert.match(buildHelper, /artifactsStaged:\s*true/, 'pin must record that the artifacts are staged');
 
 // Package wiring.
-for (const script of ['build:helper', 'verify:native-helper-packaging-contract', 'test:native-helper-packaging-contract']) {
+for (const script of ['build:helper', 'verify:helper-reproducible', 'verify:native-helper-packaging-contract', 'test:native-helper-packaging-contract']) {
   assert.ok(packageJson.scripts[script], `package.json must define ${script}`);
 }
 assert.match(packageJson.scripts['build:helper'], /build-helper\.mjs/, 'build:helper must run the reproducible builder');
+assert.match(packageJson.scripts['verify:helper-reproducible'], /verify-reproducible/, 'the reproducibility gate must compare an isolated build without repinning committed artifacts');
 assert.match(packageJson.scripts['verify:native-helper-packaging-contract'], /verify-native-helper-packaging-contract\.mjs/, 'verify:native-helper-packaging-contract must run the make-free verifier');
 
-// CI must build+pin+verify the helper artifacts and run both contract scripts.
-assert.match(workflow, /npm run build:helper/, 'ci must define a step that builds+pins the helper artifacts');
-assert.match(workflow, /verify:native-helper-packaging-contract/, 'ci quality must run the helper packaging verifier');
+// CI must validate committed pins before it compiles anything, then compare a
+// clean outside-tree rebuild. It must never repin the reviewed artifacts.
+assert.doesNotMatch(workflow, /npm run build:helper/, 'ci must not repin committed helper artifacts before validation');
+const committedPinCheck = workflow.indexOf('npm run verify:native-helper-packaging-contract');
+const reproducibleCheck = workflow.indexOf('npm run verify:helper-reproducible');
+assert.ok(committedPinCheck >= 0 && reproducibleCheck > committedPinCheck, 'ci must verify committed helper pins before the isolated reproducibility rebuild');
 assert.match(workflow, /test:native-helper-packaging-contract/, 'ci quality must run the helper packaging negative test');
 assert.match(workflow, /actions\/upload-artifact@[0-9a-f]{40}/, 'ci must upload the pinned helper artifacts with an immutable action SHA');
 

@@ -6,7 +6,7 @@ import { createHash } from 'node:crypto';
 import test from 'node:test';
 import { createNativeDurabilityAdapter } from '../src/durability.js';
 import * as state from '../src/state.js';
-import { acknowledgeUnconfirmedProcessReap, bootstrapManualRecoveryJournal, listMetadata, loadManualRecovery, loadMetadata, metadataGeneration, recordManualRecovery, releaseStaleWorkspaceLock, saveMetadata, setStateDurabilityAdapterForTesting, setStateDurableRenameForTesting, setStateJournalStagingWriteForTesting, withWorkspaceLock, type ManualRecovery, type WorkspaceLockOptions, type WorkspaceMetadata } from '../src/state.js';
+import { acknowledgeUnconfirmedProcessReap, bootstrapManualRecoveryJournal, listMetadata, loadManualRecovery, loadMetadata, metadataGeneration, recordManualRecovery, releaseStaleWorkspaceLock, saveMetadata, setStateDurabilityAdapterForTesting, setStateDurableRenameForTesting, setStateJournalStagingWriteForTesting, setStatePathExistsForTesting, withWorkspaceLock, type ManualRecovery, type WorkspaceLockOptions, type WorkspaceMetadata } from '../src/state.js';
 import type { ProcessRunner } from '../src/types.js';
 import type { StateDurabilityAdapter } from '../src/durability.js';
 
@@ -556,10 +556,48 @@ test('withWorkspaceLock retries a Windows-style EPERM only when a recovery lock 
   }
 });
 
-test('withWorkspaceLock does not retry an EPERM without a published recovery-lock collision', async () => {
-  const stateDir = await mkdtemp(join(tmpdir(), 'agent-containers-windows-recovery-permission-'));
+test('withWorkspaceLock retries a transient recovery-lock EPERM when the competing destination disappears after the failed rename', async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), 'agent-containers-windows-recovery-release-race-'));
+  let initialPublicationAttempts = 0;
+  let sourcePath = '';
+  let destinationPath = '';
+  let destinationChecks = 0;
   setStateDurableRenameForTesting(async (source, destination) => {
-    if (destination.endsWith('safe.recovery')) throw Object.assign(new Error('Windows permission denied'), { code: 'EPERM' });
+    if (!sourcePath) {
+      sourcePath = source;
+      destinationPath = destination;
+    }
+    if (source === sourcePath && destination === destinationPath) {
+      initialPublicationAttempts += 1;
+      if (initialPublicationAttempts === 1) throw Object.assign(new Error('Windows directory share race'), { code: 'EPERM' });
+    }
+    await rename(source, destination);
+  });
+  setStatePathExistsForTesting(async (path: string) => {
+    if (path === sourcePath) return true;
+    if (path === destinationPath) return destinationChecks++ === 0;
+    return await lstat(path).then(() => true, (error: NodeJS.ErrnoException) => {
+      if (error.code === 'ENOENT') return false;
+      throw error;
+    });
+  });
+  try {
+    await withWorkspaceLock(stateDir, 'safe', async () => undefined);
+    assert.equal(initialPublicationAttempts, 2, 'a held Windows directory share must retry while our staging source remains owned');
+  } finally {
+    setStatePathExistsForTesting(undefined);
+    setStateDurableRenameForTesting(undefined);
+  }
+});
+
+test('withWorkspaceLock bounds a persistent Windows EPERM while publishing a recovery lock', async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), 'agent-containers-windows-recovery-permission-'));
+  let attempts = 0;
+  setStateDurableRenameForTesting(async (source, destination) => {
+    if (destination.endsWith('safe.recovery')) {
+      attempts += 1;
+      throw Object.assign(new Error('Windows permission denied'), { code: 'EPERM' });
+    }
     await rename(source, destination);
   });
   try {
@@ -567,6 +605,7 @@ test('withWorkspaceLock does not retry an EPERM without a published recovery-loc
       () => withWorkspaceLock(stateDir, 'safe', async () => undefined),
       /Windows permission denied/,
     );
+    assert.equal(attempts, 4, 'persistent access denial must fail closed after the bounded share-race retry budget');
   } finally {
     setStateDurableRenameForTesting(undefined);
   }

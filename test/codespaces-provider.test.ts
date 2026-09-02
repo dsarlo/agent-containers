@@ -135,6 +135,19 @@ test('provider creation logs fail closed on nonzero exit and redact credential-s
   assert.deepEqual(calls, [['gh', 'codespace', 'logs', '-c', 'bookish-space-parakeet', '-l', '100']]);
 });
 
+test('provider marks helper writes as lifecycle work while preserving read-only SSH probes', async () => {
+  const kinds: Array<'lifecycle' | 'readonly-probe' | undefined> = [];
+  const provider = new GhCodespacesProvider({
+    async run(_command, _args, options) {
+      kinds.push(options?.kind);
+      return { code: 0, stdout: 'ok\n', stderr: '' };
+    },
+  });
+  await provider.remoteSshProbe('bookish-space-parakeet', ['uname', '-m']);
+  await provider.remoteCommand('bookish-space-parakeet', ['mkdir', '-p', '/workspaces/.agent-containers/test/bin']);
+  assert.deepEqual(kinds, ['readonly-probe', 'lifecycle']);
+});
+
 test('provider SSH probe dispatches a fixed package-owned command through gh codespace ssh', async () => {
   const calls: string[][] = [];
   const provider = new GhCodespacesProvider({

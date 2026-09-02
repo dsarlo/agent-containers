@@ -144,11 +144,19 @@ try {
       },
     },
     {
-      name: 'ci.yml drops the helper build and immutable upload',
+      name: 'a helper CI job that rebuilds and repins committed artifacts before verification',
+      mutate: async (root) => {
+        const path = join(root, '.github', 'workflows', 'ci.yml');
+        const workflow = await readFile(path, 'utf8');
+        await writeFile(path, workflow.replace(/npm run verify:helper-reproducible/, 'npm run build:helper'));
+      },
+    },
+    {
+      name: 'ci.yml drops the isolated helper reproducibility check and immutable upload',
       mutate: async (root) => {
         const path = join(root, '.github', 'workflows', 'ci.yml');
         const workflow = (await readFile(path, 'utf8'))
-          .replace(/npm run build:helper/, 'npm run build')
+          .replace(/npm run verify:helper-reproducible/, 'npm run build')
           .replace(/actions\/upload-artifact@[0-9a-f]{40}/, 'actions/upload-artifact@v4');
         await writeFile(path, workflow, 'utf8');
       },
