@@ -245,6 +245,7 @@ export async function saveConfigAtomic(path: string, next: AgentContainersConfig
   await adapter.assertStateWriteSupport();
   const lock = `${path}.lock`;
   const release = await acquireConfigLock(lock, adapter, options);
+  let publicationError: unknown;
   try {
     try {
       const current = await readFile(path, 'utf8');
@@ -275,8 +276,20 @@ export async function saveConfigAtomic(path: string, next: AgentContainersConfig
       } else await adapter.moveFileWriteThrough(temporary, path);
     } catch (error) { await rm(temporary, { force: true }); throw error; }
     return 'saved';
+  } catch (error: unknown) {
+    publicationError = error;
+    throw error;
   } finally {
-    await release();
+    try {
+      await release();
+    } catch (releaseError: unknown) {
+      // A rename has already made this generation visible. Retain that
+      // diagnostic rather than replacing it with a later lock-release sync.
+      if (publicationError === undefined) {
+        // eslint-disable-next-line no-unsafe-finally -- only thrown when publication itself succeeded.
+        throw releaseError;
+      }
+    }
   }
 }
 function canonicalConfigSource(config: AgentContainersConfig): string {
@@ -303,7 +316,19 @@ async function acquireConfigLock(lock: string, adapter: StateDurabilityAdapter, 
         await rename(pendingPath, lock);
         await adapter.syncDirectory(dirname(lock));
       } else await adapter.moveFileWriteThrough(pendingPath, lock);
-      return async () => { await rm(lock, { recursive: true, force: true }); if (await adapter.publicationMode() === 'strict') await adapter.syncDirectory(dirname(lock)); };
+      return async () => {
+        // Rename our exact owner generation away from the acquisition name.
+        // This prevents a delayed releaser from deleting a replacement lock.
+        const observed = await readConfigLockOwner(lock);
+        if (!observed || observed.token !== owner.token || observed.pid !== owner.pid) return;
+        const released = `${lock}.${randomUUID()}.released`;
+        if (await adapter.publicationMode() === 'strict') await rename(lock, released);
+        else await adapter.moveFileWriteThrough(lock, released);
+        const moved = await readConfigLockOwner(released);
+        if (!moved || moved.token !== owner.token || moved.pid !== owner.pid) throw new Error('Configuration lock ownership changed during release; refusing to remove another owner.');
+        await rm(released, { recursive: true, force: false });
+        if (await adapter.publicationMode() === 'strict') await adapter.syncDirectory(dirname(lock));
+      };
     }
     catch (error: unknown) {
       if (pending) await rm(pending, { recursive: true, force: true });

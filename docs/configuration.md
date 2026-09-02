@@ -15,7 +15,7 @@ commands:
 
 | Field | Required | Default | Description |
 | --- | --- | --- | --- |
-| `version` | No | `1` | Only version `1` is accepted. |
+| `version` | No | `1` | Schema version `1` is local-only; experimental schema version `2` is documented below. |
 | `workspace.worktreeRoot` | No | `../.agent-containers-worktrees` | Parent for named worktrees; relative paths resolve from the Git root. |
 | `workspace.baseBranch` | No | `main` | Base used by `agent-containers create` unless `--base` is supplied. |
 | `environment.devcontainerPath` | No | `.devcontainer/devcontainer.json` | Safe repository-relative Dev Container **regular file**; Git symlinks are rejected and runtime refuses a resolved path outside the worktree. Both `validate` and `create` require it on `workspace.baseBranch`; `create --base` requires it on that effective local base too, all before any worktree side effect. |
@@ -27,7 +27,7 @@ Defaults are merged before validation. Supplied empty values, wrong types, unkno
 
 Schema v1 remains local-only and unchanged. Schema v2 is experimental and requires `AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES=1`. Use `ac init --interactive` or `ac configure --interactive` for the field-oriented setup flow, or import a v2 onboarding draft with `--non-interactive --from FILE` / `--stdin`. Drafts omit only discovered OID/blob evidence; persisted v2 documents always contain it. It is a nonsecret policy document: unknown fields, public ports, invalid paths, and invalid limits are rejected before any side effect.
 
-Interactive setup prompts for backend/default backend, repository, remote ref, Dev Container path, machine, and cost-sensitive timeouts. It shows the preview and requires `yes`; `cancel` or any other confirmation leaves no file write. It does not accept pasted configuration. Each Codespaces save validates the canonical GitHub origin, remote ref, immutable commit OID, and committed regular Dev Container blob through read-only `git`/`gh api GET` calls, then persists `project.expectedOid` and `environment.devcontainerBlobOid` as immutable source evidence. No configuration command accepts, displays, stores, or reads tokens, API keys, SSH keys, or secret values. Codespaces lifecycle is intentionally unavailable in this release.
+Interactive setup offers local, Codespaces, or both; it collects worktree/base, backend/default, source, Dev Container path, machine/geo, capacity, readiness, transport, ports, and secret-name policy. It validates entered fields and, for Codespaces, obtains immutable source evidence before previewing the exact object that `yes` saves. `cancel` or any other confirmation leaves no file write. It does not accept pasted configuration. Each Codespaces save validates the canonical GitHub origin, remote ref, immutable commit OID, and committed regular Dev Container blob through read-only `git`/`gh api GET` calls, then persists `project.expectedOid` and `environment.devcontainerBlobOid` as immutable source evidence. No configuration command accepts, displays, stores, or reads tokens, API keys, SSH keys, or secret values. Codespaces lifecycle is intentionally unavailable in this release.
 
 ```yaml
 version: 2

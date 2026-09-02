@@ -1,11 +1,10 @@
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rename, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { configurationDiff, loadConfig, parseCodespacesDraft, parseConfig, saveConfigAtomic } from '../src/config.js';
 import { doctor, validateCodespacesSetup } from '../src/setup.js';
-import { parseCodespacesPreflight } from '../src/codespaces.js';
 import type { CodespacesAgentContainersConfig, ProcessRunner } from '../src/types.js';
 import type { StateDurabilityAdapter } from '../src/durability.js';
 
@@ -43,11 +42,6 @@ test('Codespaces setup validation rejects a local-only ref and non-regular Dev C
   await assert.rejects(() => validateCodespacesSetup(codespaces, '/repo', runner), /not available to Codespaces/);
 });
 
-test('Codespaces preflight parser rejects every missing policy field and accepts only typed inventory', () => {
-  for (const value of [null, {}, { billable_owner: { id: 1 } }, { billable_owner: { id: 1 }, machines: [] }, { billable_owner: { id: 1 }, machines: [{ name: 'basic', geos: [] }] }, { billable_owner: { id: 1 }, machines: [{ name: 'basic', geos: ['us-east'] }], ports_allowed: true }]) assert.throws(() => parseCodespacesPreflight(value));
-  assert.deepEqual(parseCodespacesPreflight({ billable_owner: { id: 1 }, machines: [{ name: 'basic', geos: ['us-east'] }], ports_allowed: true, secrets_allowed: false }), { billableOwner: '1', machines: [{ name: 'basic', geos: ['us-east'] }], portsAllowed: true, secretsAllowed: false });
-});
-
 test('doctor converts missing commands, rejected runners, aborts, and timeouts into stable action-required checks', async () => {
   const rejected: ProcessRunner = { async run() { throw new Error('ENOENT'); } };
   const report = await doctor(codespaces, 'codespaces', rejected, '/repo', { timeoutMs: 1 });
@@ -65,6 +59,24 @@ test('local doctor accepts Git worktree capability from bounded help output when
   } };
   const report = await doctor({ version: 1, workspace: { worktreeRoot: 'worktrees', baseBranch: 'main' }, environment: { devcontainerPath: '.devcontainer/devcontainer.json' }, commands: {} }, 'local', runner);
   assert.equal(report.checks.find((check) => check.id === 'local.worktree')?.state, 'ready');
+});
+
+test('local doctor accepts worktree help only for Git help exits 0 or 129', async () => {
+  const config = { version: 1 as const, workspace: { worktreeRoot: 'worktrees', baseBranch: 'main' }, environment: { devcontainerPath: '.devcontainer/devcontainer.json' }, commands: {} };
+  for (const code of [0, 129]) {
+    const report = await doctor(config, 'local', { async run(command, args) {
+      if (command === 'git' && args.join(' ') === 'worktree add -h') return { code, stdout: '--relative-paths', stderr: '' };
+      return { code: 0, stdout: args.join(' ') === 'rev-parse --is-inside-work-tree' ? 'true\n' : 'available', stderr: '' };
+    } });
+    assert.equal(report.checks.find((check) => check.id === 'local.worktree')?.state, 'ready');
+  }
+  for (const code of [1, 2]) {
+    const report = await doctor(config, 'local', { async run(command, args) {
+      if (command === 'git' && args.join(' ') === 'worktree add -h') return { code, stdout: '--relative-paths', stderr: '' };
+      return { code: 0, stdout: args.join(' ') === 'rev-parse --is-inside-work-tree' ? 'true\n' : 'available', stderr: '' };
+    } });
+    assert.equal(report.checks.find((check) => check.id === 'local.worktree')?.state, 'action-required');
+  }
 });
 
 test('atomic configuration save preserves the prior file on compare-and-swap conflict', async () => {
@@ -158,6 +170,22 @@ test('configuration publication reports the committed generation when final dire
   assert.deepEqual(parseConfig(await readFile(path, 'utf8')), replacement);
 });
 
+test('configuration publication preserves its committed-generation diagnostic when release durability also fails', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'agent-containers-config-release-sync-'));
+  const path = join(directory, '.agent-containers.yml');
+  await writeFile(path, JSON.stringify(codespaces));
+  const replacement = structuredClone(codespaces);
+  replacement.backends.codespaces.machine = 'basicLinux32gb';
+  let directorySyncs = 0;
+  const broken: StateDurabilityAdapter = { ...durability, syncDirectory: async () => {
+    directorySyncs += 1;
+    if (directorySyncs === 3) throw new Error('publication sync failed');
+    if (directorySyncs === 4) throw new Error('release sync failed');
+  } };
+  await assert.rejects(() => saveConfigAtomic(path, replacement, undefined, { durabilityAdapter: broken }), /committed configuration is present.*publication sync failed/);
+  assert.deepEqual(parseConfig(await readFile(path, 'utf8')), replacement);
+});
+
 test('configuration publication recognizes equivalent YAML and JSON configurations as unchanged', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'agent-containers-config-canonical-'));
   const path = join(directory, '.agent-containers.yml');
@@ -205,6 +233,27 @@ test('configuration lock waits for an active owner, aborts on deadline signal, a
   const abort = new AbortController(); abort.abort();
   await assert.rejects(() => saveConfigAtomic(path, codespaces, null, { durabilityAdapter: durability, abortSignal: abort.signal, ownerAlive: () => true }), /cancelled/);
   assert.equal(await saveConfigAtomic(path, codespaces, null, { durabilityAdapter: durability, ownerAlive: () => false }), 'saved');
+});
+
+test('configuration lock release preserves a replacement owner in recoverable Windows publication mode', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'agent-containers-config-lock-replacement-'));
+  const path = join(directory, '.agent-containers.yml');
+  const lock = `${path}.lock`;
+  let replacementPublished = false;
+  const recoverable: StateDurabilityAdapter = {
+    ...durability,
+    publicationMode: async () => 'recoverable',
+    moveFileWriteThrough: async (source, destination) => {
+      await rename(source, destination);
+      if (!replacementPublished && destination.endsWith('.released')) {
+        replacementPublished = true;
+        await mkdir(lock);
+        await writeFile(join(lock, 'owner.json'), JSON.stringify({ pid: 99, operation: 'configuration-publication', token: 'replacement', createdAt: '2026-01-01T00:00:00.000Z' }));
+      }
+    },
+  };
+  assert.equal(await saveConfigAtomic(path, codespaces, null, { durabilityAdapter: recoverable }), 'saved');
+  assert.match(await readFile(join(lock, 'owner.json'), 'utf8'), /replacement/);
 });
 
 test('doctor has a stable complete Codespaces inventory and uses only its positive read allowlist', async () => {

@@ -6,7 +6,6 @@ export type CodespacesProviderProcess = Pick<ProcessRunner, 'run'>;
 export interface GithubActor { id: string; login: string }
 export interface CodespaceIdentity { id: string; name: string; environmentId: string; state: string }
 export interface RepositorySourceEvidence { repository: string; requestedRef: string; expectedOid: string; devcontainerPath: string; devcontainerBlobOid: string }
-export interface CodespacesPreflight { billableOwner: string; machines: readonly { name: string; geos: readonly string[] }[]; portsAllowed: boolean; secretsAllowed: boolean }
 export interface CodespacesMachineInventory { machines: readonly { name: string }[] }
 
 /** Thin, replaceable adapter. It intentionally exposes no token or auth operation. */
@@ -66,18 +65,6 @@ export class GhCodespacesProvider {
     if (result.code !== 0) throw providerError('GET', path, result);
     try { return JSON.parse(result.stdout); } catch { throw new Error(`GitHub GET ${path} returned invalid JSON; refusing to infer remote state.`); }
   }
-}
-
-/** Reject incomplete provider data rather than treating a descriptive response as policy evidence. */
-export function parseCodespacesPreflight(value: unknown): CodespacesPreflight {
-  if (!isRecord(value) || !isRecord(value.billable_owner) || !losslessId(value.billable_owner.id)) throw new Error('Codespaces preflight lacks a non-null billable owner.');
-  if (!Array.isArray(value.machines) || value.machines.length === 0) throw new Error('Codespaces preflight lacks a non-empty machine inventory.');
-  const machines = value.machines.map((machine) => {
-    if (!isRecord(machine) || typeof machine.name !== 'string' || !machine.name || !Array.isArray(machine.geos) || machine.geos.length === 0 || machine.geos.some((geo) => typeof geo !== 'string' || !geo)) throw new Error('Codespaces preflight has an invalid machine or geo inventory.');
-    return { name: machine.name, geos: machine.geos as string[] };
-  });
-  if (typeof value.ports_allowed !== 'boolean' || typeof value.secrets_allowed !== 'boolean') throw new Error('Codespaces preflight lacks port and secret policy evidence.');
-  return { billableOwner: String(value.billable_owner.id), machines, portsAllowed: value.ports_allowed, secretsAllowed: value.secrets_allowed };
 }
 
 export interface SafeExecuteRequest { commandId: string; argv: readonly [string, ...string[]]; cwd?: string; mode: 'pipe' | 'pty'; stdin: 'closed' | 'stream' }

@@ -363,7 +363,20 @@ test('create and exec fail closed when schema v2 selects Codespaces as the defau
   const source = JSON.stringify({ version: 2, workspace: { worktreeRoot: 'worktrees', baseBranch: 'main' }, project: { repository: 'owner/repo', ref: 'refs/heads/main', expectedOid: '0123456789012345678901234567890123456789' }, environment: { devcontainerPath: '.devcontainer/devcontainer.json', devcontainerBlobOid: 'abcdefabcdefabcdefabcdefabcdefabcdefabcd' }, backends: { enabled: ['local', 'codespaces'], default: 'codespaces', local: {}, codespaces: { enabled: true, machine: null, geo: 'auto', idleTimeoutMinutes: 30, retentionPeriodMinutes: 1, maxTotal: 1, maxRunning: 1, maxCreating: 1, maxParallelCommandsPerWorkspace: 1, readiness: { providerTimeoutSeconds: 1, sshTimeoutSeconds: 1, command: [], commandTimeoutSeconds: 1 }, transport: { reconnectWindowSeconds: 1, cancelGraceSeconds: 1, remoteLogBytesPerStream: 1, remoteLogRetentionHours: 1 }, ports: { allowVisibilityChanges: false, allowPublic: false }, secrets: { allowedRemoteSecretNames: [], allowCodespaceGitCredential: false } } } });
   await writeFile(join(root, '.agent-containers.yml'), source);
   await assert.rejects(() => runCli(['create', 'blocked'], root, () => undefined), /Codespaces is selected/);
-  const messages: string[] = [];
-  assert.equal(await runCli(['exec', 'blocked', '--', 'true'], root, (message) => messages.push(message)), 1);
-  assert.match(messages.at(-1) ?? '', /Codespaces is selected/);
+});
+
+test('exec dispatches a recorded local workspace without reading mutable checkout configuration', async (t) => {
+  const stateHome = await mkdtemp(join(tmpdir(), 'agent-containers-cli-recorded-local-'));
+  const stateDir = join(stateHome, 'agent-containers');
+  const previousStateHome = process.env.XDG_STATE_HOME;
+  process.env.XDG_STATE_HOME = stateHome;
+  t.after(async () => { if (previousStateHome === undefined) delete process.env.XDG_STATE_HOME; else process.env.XDG_STATE_HOME = previousStateHome; await rm(stateHome, { recursive: true, force: true }); });
+  const { saveMetadata, setStateDurabilityAdapterForTesting } = await import('../src/state.js');
+  setStateDurabilityAdapterForTesting({ publicationMode: async () => 'strict', assertStateWriteSupport: async () => undefined, syncFile: async () => undefined, syncDirectory: async () => undefined, moveFileWriteThrough: async () => undefined });
+  try {
+    await saveMetadata(stateDir, { version: 1, name: 'recorded', repoRoot: '/repo', worktree: '/repo/worktrees/recorded', branch: 'agent-containers/recorded', baseRef: 'refs/heads/main', devcontainerPath: '.devcontainer/devcontainer.json', createdAt: '2026-01-01T00:00:00.000Z' });
+    const messages: string[] = [];
+    assert.equal(await runCli(['exec', 'recorded', '--', 'true'], tmpdir(), (message) => messages.push(message)), 1);
+    assert.doesNotMatch(messages.at(-1) ?? '', /Configuration not found|Codespaces is selected/);
+  } finally { setStateDurabilityAdapterForTesting(undefined); }
 });

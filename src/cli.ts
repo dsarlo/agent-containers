@@ -39,10 +39,9 @@ export async function runCli(args: string[], cwd = process.cwd(), write: (messag
         if (source && stdin) throw new UsageError('Use only one of --from FILE or --stdin.');
         if (rest.includes('--interactive')) {
           if (nonInteractive || source || stdin) throw new UsageError('Interactive init cannot be combined with noninteractive input.');
-          requireCodespacesExperimental();
           if (!io.isTTY) throw new UsageError('Interactive configuration requires a TTY; use --non-interactive --stdin for unattended setup.');
-          const next = await interactiveConfig(io);
-          await initConfigV2(root, await withSetupEvidence(next, root));
+          const next = await interactiveConfig(io, root);
+          await initConfigV2(root, next);
         } else if (source || stdin) {
           const next = await loadConfigFromSource(source ? resolve(cwd, source) : undefined, stdin);
           if (next.version !== 2) throw new Error('Noninteractive init accepts strict schema-v2 nonsecret configuration only.');
@@ -64,8 +63,7 @@ export async function runCli(args: string[], cwd = process.cwd(), write: (messag
         if (!interactive && !rest.includes('--non-interactive')) throw new UsageError('Noninteractive configuration requires --non-interactive.');
         const source = optionValue(rest, '--from');
         const root = await findGitRoot(cwd, nodeProcessRunner);
-        if (interactive) requireCodespacesExperimental();
-        const next = interactive ? await interactiveConfig(io) : await loadConfigFromSource(source ? resolve(cwd, source) : undefined, stdin);
+        const next = interactive ? await interactiveConfig(io, root) : await loadConfigFromSource(source ? resolve(cwd, source) : undefined, stdin);
         if (next.version !== 2) throw new Error('ac configure accepts strict schema-v2 nonsecret configuration only.');
         if (next.backends.enabled.includes('codespaces')) requireCodespacesExperimental();
         const path = join(root, '.agent-containers.yml');
@@ -78,7 +76,7 @@ export async function runCli(args: string[], cwd = process.cwd(), write: (messag
         } catch (error: unknown) {
           if (!(typeof error === 'object' && error !== null && 'code' in error && error.code === 'ENOENT')) throw error;
         }
-        const validated = await withSetupEvidence(next, root);
+        const validated = interactive ? next : await withSetupEvidence(next, root);
         write(configurationDiff(current, validated));
         write((await saveConfigAtomic(path, validated, expectedCurrentHash)) === 'saved' ? `Saved ${path}` : 'No configuration changes.');
         return 0;
@@ -130,8 +128,10 @@ export async function runCli(args: string[], cwd = process.cwd(), write: (messag
         const separator = rest.indexOf('--');
         if (separator !== 1) throw new UsageError(`Usage: agent-containers ${command} <name> -- <command...>`);
         const name = rest[0];
-        const root = await findGitRoot(cwd, nodeProcessRunner);
-        assertLocalBackendEnabled(await loadConfig(join(root, '.agent-containers.yml')));
+        // Workspace records created by this release are local-only. Dispatch
+        // from that durable identity so a later checkout/config change cannot
+        // strand an existing local workspace or select an unimplemented remote
+        // backend. Unknown future metadata is rejected by loadMetadata.
         await execNamedWorkspaceLifecycle(name, rest.slice(separator + 1), nodeProcessRunner, stateDir);
         return 0;
       }
@@ -259,24 +259,39 @@ async function loadConfigFromSource(source: string | undefined, stdin: boolean):
   return parseCodespacesDraft(await readStdin());
 }
 
-async function interactiveConfig(io: CliIo): Promise<CodespacesAgentContainersConfig> {
+async function interactiveConfig(io: CliIo, root: string): Promise<CodespacesAgentContainersConfig> {
   const prompt = createInterface({ input: io.input, output: io.output, terminal: io.isTTY });
   try {
     io.output.write('Agent Containers Codespaces setup. Enter cancel at any prompt to leave configuration unchanged. Do not enter tokens, keys, or secret values.\n');
-    const backend = await ask(prompt, 'Backend [codespaces|both] (codespaces): ', 'codespaces');
-    if (backend !== 'codespaces' && backend !== 'both') throw new Error('Backend must be codespaces or both.');
-    const defaultBackend = backend === 'both' ? await ask(prompt, 'Default backend [local|codespaces]: ') : 'codespaces';
+    const worktreeRoot = await ask(prompt, 'Worktree root [../.agent-containers-worktrees]: ', '../.agent-containers-worktrees');
+    const baseBranch = await ask(prompt, 'Base branch [main]: ', 'main');
+    const backend = await ask(prompt, 'Backend [local|codespaces|both] (local): ', 'local');
+    if (backend !== 'local' && backend !== 'codespaces' && backend !== 'both') throw new Error('Backend must be local, codespaces, or both.');
+    if (backend !== 'local') requireCodespacesExperimental();
+    const defaultBackend = backend === 'both' ? await ask(prompt, 'Default backend [local|codespaces]: ') : backend;
     if (defaultBackend !== 'local' && defaultBackend !== 'codespaces') throw new Error('Default backend must be local or codespaces.');
-    const repository = await ask(prompt, 'Repository [OWNER/REPOSITORY]: ');
-    const ref = await ask(prompt, 'Remote ref [refs/heads/main]: ', 'refs/heads/main');
     const devcontainerPath = await ask(prompt, 'Committed Dev Container path [.devcontainer/devcontainer.json]: ', '.devcontainer/devcontainer.json');
-    const machine = await ask(prompt, 'Machine (leave blank for action-required): ', '');
-    const idleTimeoutMinutes = numberPrompt(await ask(prompt, 'Idle timeout minutes [30]: ', '30'), 'Idle timeout minutes');
-    const retentionPeriodMinutes = numberPrompt(await ask(prompt, 'Retention minutes [10080]: ', '10080'), 'Retention minutes');
-    const candidate = setupConfigTemplate(backend, defaultBackend as 'local' | 'codespaces', repository, ref, devcontainerPath, machine || null, idleTimeoutMinutes, retentionPeriodMinutes);
-    io.output.write(configurationDiff(null, candidate) + '\nNo workspace, key, secret, or GitHub setting will be created or changed.\n');
+    const repository = backend === 'local' ? undefined : await ask(prompt, 'Repository [OWNER/REPOSITORY]: ');
+    const ref = backend === 'local' ? undefined : await ask(prompt, 'Remote ref [refs/heads/main]: ', 'refs/heads/main');
+    const candidate = setupConfigTemplate(backend, defaultBackend as 'local' | 'codespaces', repository, ref, devcontainerPath);
+    candidate.workspace = { worktreeRoot, baseBranch };
+    if (backend !== 'local') {
+      const settings = candidate.backends.codespaces;
+      settings.machine = (await ask(prompt, 'Machine (leave blank for action-required): ', '')) || null;
+      settings.geo = await ask(prompt, 'Geo [auto]: ', 'auto');
+      for (const [key, label, fallback] of [['idleTimeoutMinutes', 'Idle timeout minutes', '30'], ['retentionPeriodMinutes', 'Retention minutes', '10080'], ['maxTotal', 'Maximum total workspaces', '4'], ['maxRunning', 'Maximum running workspaces', '2'], ['maxCreating', 'Maximum creating workspaces', '1'], ['maxParallelCommandsPerWorkspace', 'Maximum parallel commands', '1']] as const) settings[key] = numberPrompt(await ask(prompt, `${label} [${fallback}]: `, fallback), label);
+      settings.readiness.command = listPrompt(await ask(prompt, 'Readiness argv (comma-separated, blank for none): ', ''));
+      for (const [section, key, label, fallback] of [['readiness', 'providerTimeoutSeconds', 'Provider readiness timeout seconds', '1200'], ['readiness', 'sshTimeoutSeconds', 'SSH readiness timeout seconds', '120'], ['readiness', 'commandTimeoutSeconds', 'Readiness command timeout seconds', '600'], ['transport', 'reconnectWindowSeconds', 'Transport reconnect window seconds', '60'], ['transport', 'cancelGraceSeconds', 'Transport cancel grace seconds', '10'], ['transport', 'remoteLogBytesPerStream', 'Remote log bytes per stream', '67108864'], ['transport', 'remoteLogRetentionHours', 'Remote log retention hours', '168']] as const) (settings[section] as Record<string, number>)[key] = numberPrompt(await ask(prompt, `${label} [${fallback}]: `, fallback), label);
+      settings.ports.allowVisibilityChanges = booleanPrompt(await ask(prompt, 'Allow port visibility changes [no]: ', 'no'), 'Allow port visibility changes');
+      settings.ports.allowPublic = booleanPrompt(await ask(prompt, 'Allow public ports [no]: ', 'no'), 'Allow public ports');
+      settings.secrets.allowedRemoteSecretNames = listPrompt(await ask(prompt, 'Allowed remote secret names (names only, comma-separated): ', ''));
+      settings.secrets.allowCodespaceGitCredential = booleanPrompt(await ask(prompt, 'Allow Codespaces Git credential [no]: ', 'no'), 'Allow Codespaces Git credential');
+    }
+    let validated = parseCodespacesDraft(JSON.stringify(candidate));
+    if (validated.backends.enabled.includes('codespaces')) validated = await withSetupEvidence(validated, root);
+    io.output.write(configurationDiff(null, validated) + '\nNo workspace, key, secret, or GitHub setting will be created or changed.\n');
     if ((await ask(prompt, 'Save this nonsecret configuration? [yes/no]: ', 'no')).toLowerCase() !== 'yes') throw new Error('Configuration cancelled; no changes were made.');
-    return candidate;
+    return validated;
   } finally { prompt.close(); }
 }
 
@@ -288,10 +303,12 @@ async function ask(prompt: ReturnType<typeof createInterface>, label: string, fa
   return value;
 }
 function numberPrompt(value: string, label: string): number { const parsed = Number(value); if (!Number.isInteger(parsed) || parsed < 1) throw new Error(`${label} must be a positive integer.`); return parsed; }
+function booleanPrompt(value: string, label: string): boolean { if (value === 'yes') return true; if (value === 'no') return false; throw new Error(`${label} must be yes or no.`); }
+function listPrompt(value: string): string[] { return value ? value.split(',').map((entry) => entry.trim()) : []; }
 
-function setupConfigTemplate(selection: string, defaultBackend: 'local' | 'codespaces', repository: string, ref: string, devcontainerPath: string, machine: string | null, idleTimeoutMinutes: number, retentionPeriodMinutes: number): CodespacesAgentContainersConfig {
-  const enabled: Array<'local' | 'codespaces'> = selection === 'both' ? ['local', 'codespaces'] : ['codespaces'];
-  return { version: 2, workspace: { worktreeRoot: '../.agent-containers-worktrees', baseBranch: 'main' }, project: { repository, ref }, environment: { devcontainerPath }, backends: { enabled, default: defaultBackend, local: {}, codespaces: { enabled: true, machine, geo: 'auto', idleTimeoutMinutes, retentionPeriodMinutes, maxTotal: 4, maxRunning: 2, maxCreating: 1, maxParallelCommandsPerWorkspace: 1, readiness: { providerTimeoutSeconds: 1200, sshTimeoutSeconds: 120, command: [], commandTimeoutSeconds: 600 }, transport: { reconnectWindowSeconds: 60, cancelGraceSeconds: 10, remoteLogBytesPerStream: 67108864, remoteLogRetentionHours: 168 }, ports: { allowVisibilityChanges: false, allowPublic: false }, secrets: { allowedRemoteSecretNames: [], allowCodespaceGitCredential: false } } } };
+function setupConfigTemplate(selection: string, defaultBackend: 'local' | 'codespaces', repository: string | undefined, ref: string | undefined, devcontainerPath: string): CodespacesAgentContainersConfig {
+  const enabled: Array<'local' | 'codespaces'> = selection === 'both' ? ['local', 'codespaces'] : [selection as 'local' | 'codespaces'];
+  return { version: 2, workspace: { worktreeRoot: '../.agent-containers-worktrees', baseBranch: 'main' }, project: repository && ref ? { repository, ref } : {}, environment: { devcontainerPath }, backends: { enabled, default: defaultBackend, local: {}, codespaces: { enabled: enabled.includes('codespaces'), machine: null, geo: 'auto', idleTimeoutMinutes: 30, retentionPeriodMinutes: 10080, maxTotal: 4, maxRunning: 2, maxCreating: 1, maxParallelCommandsPerWorkspace: 1, readiness: { providerTimeoutSeconds: 1200, sshTimeoutSeconds: 120, command: [], commandTimeoutSeconds: 600 }, transport: { reconnectWindowSeconds: 60, cancelGraceSeconds: 10, remoteLogBytesPerStream: 67108864, remoteLogRetentionHours: 168 }, ports: { allowVisibilityChanges: false, allowPublic: false }, secrets: { allowedRemoteSecretNames: [], allowCodespaceGitCredential: false } } } };
 }
 
 async function readStdin(): Promise<string> {
