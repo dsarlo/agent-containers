@@ -3,7 +3,7 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import { resolve, win32 } from 'node:path';
 import type { AgentContainersConfig, ProcessResult, ProcessRunner, ProcessRunOptions } from './types.js';
 import { validateWorkspaceName } from './names.js';
-import { bootstrapManualRecoveryJournal, deleteMetadata, isAgentContainersWorkspace, isCanonicalContainerId, loadMetadata, saveMetadata, type WorkspaceMetadata } from './state.js';
+import { bootstrapManualRecoveryJournal, deleteMetadata, isAgentContainersWorkspace, isCanonicalContainerId, isLocalWorkspaceMetadata, loadMetadata, saveMetadata, type LocalMetadata, type WorkspaceMetadata } from './state.js';
 import { getAuthoritativeWindowsDirectory } from './durability.js';
 
 export type { ProcessRunner } from './types.js';
@@ -275,7 +275,7 @@ export async function createWorkspace(options: {
   baseBranch?: string;
   signal?: AbortSignal;
   save?: (stateDir: string, metadata: WorkspaceMetadata) => Promise<void>;
-}): Promise<WorkspaceMetadata> {
+}): Promise<LocalMetadata> {
   const name = validateWorkspaceName(options.name);
   if (await loadMetadata(options.stateDir, name)) throw new Error(`Agent Containers workspace "${name}" already exists.`);
   // A new workspace may establish its recovery journal before any Git side effect.
@@ -306,7 +306,7 @@ export async function createWorkspace(options: {
     throw await worktreeAddRecoveryError(error, root, worktree, branch, options.runner);
   }
   if (result.code !== 0) throw await worktreeAddRecoveryError(commandError('git worktree add', result), root, worktree, branch, options.runner);
-  const metadata: WorkspaceMetadata = {
+  const metadata: LocalMetadata = {
     version: 2,
     backend: 'local',
     handle: { kind: 'local' },
@@ -339,7 +339,8 @@ export async function removeWorkspace(metadata: WorkspaceMetadata, options: Remo
   if (!options.confirmed) throw new Error('Refusing to remove a workspace without --yes.');
   if (!isAgentContainersWorkspace(metadata)) throw new Error('Refusing to remove metadata that is not an Agent Containers workspace.');
   if (metadata.containerId !== undefined && !isCanonicalContainerId(metadata.containerId)) throw new Error('Refusing to inspect or remove a legacy or non-canonical recorded Docker container ID. Verify it manually and repair the metadata first.');
-  let current = metadata;
+  if (!isLocalWorkspaceMetadata(metadata)) throw new Error(`Workspace "${metadata.name}" records the Codespaces backend, which is phase-gated and cannot be removed by local cleanup.`);
+  let current: LocalMetadata = metadata;
 
   let worktreePresent = false;
   if (!current.cleanup?.worktree) {
@@ -481,7 +482,7 @@ async function worktreeAddRecoveryError(cause: unknown, repoRoot: string, worktr
   return new Error(`${detail}. A failed or interrupted git worktree add may have created data; Agent Containers left it intact. Inspect with git worktree list: expected worktree ${worktree} is ${worktreeState}; expected local branch ${branchRef} is ${branchState}. Do not delete either until you have reviewed it.`, { cause });
 }
 
-function recordedWorktreeState(output: string, metadata: WorkspaceMetadata): 'present' | 'absent' | 'mismatch' {
+function recordedWorktreeState(output: string, metadata: LocalMetadata): 'present' | 'absent' | 'mismatch' {
   let path: string | undefined;
   let branch: string | undefined;
   let pathOrBranchMatched = false;
@@ -506,7 +507,7 @@ function containerIsAlreadyGone(result: ProcessResult): boolean {
   return /no such (object|container)/i.test(`${result.stdout}\n${result.stderr}`);
 }
 
-function withCleanup(metadata: WorkspaceMetadata, step: 'container' | 'worktree' | 'branch'): WorkspaceMetadata {
+function withCleanup(metadata: LocalMetadata, step: 'container' | 'worktree' | 'branch'): LocalMetadata {
   return { ...metadata, cleanup: { ...metadata.cleanup, [step]: true } };
 }
 

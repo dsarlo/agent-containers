@@ -7,6 +7,7 @@ import { configurationDiff, loadConfig, parseCodespacesDraft, parseConfig, saveC
 import { doctor, validateCodespacesSetup } from '../src/setup.js';
 import type { CodespacesAgentContainersConfig, ProcessRunner } from '../src/types.js';
 import type { StateDurabilityAdapter } from '../src/durability.js';
+import { resolveExecutionBackend } from '../src/backend.js';
 
 const codespaces: CodespacesAgentContainersConfig = { version: 2, workspace: { worktreeRoot: 'worktrees', baseBranch: 'main' }, project: { repository: 'owner/repo', ref: 'refs/heads/main', expectedOid: '0123456789012345678901234567890123456789' }, environment: { devcontainerPath: '.devcontainer/devcontainer.json', devcontainerBlobOid: 'abcdefabcdefabcdefabcdefabcdefabcdefabcd' }, backends: { enabled: ['codespaces'], default: 'codespaces', local: {}, codespaces: { enabled: true, machine: null, geo: 'auto', idleTimeoutMinutes: 30, retentionPeriodMinutes: 10080, maxTotal: 4, maxRunning: 2, maxCreating: 1, maxParallelCommandsPerWorkspace: 1, readiness: { providerTimeoutSeconds: 1200, sshTimeoutSeconds: 120, command: [], commandTimeoutSeconds: 600 }, transport: { reconnectWindowSeconds: 60, cancelGraceSeconds: 10, remoteLogBytesPerStream: 67108864, remoteLogRetentionHours: 168 }, ports: { allowVisibilityChanges: false, allowPublic: false }, secrets: { allowedRemoteSecretNames: [], allowCodespaceGitCredential: false } } } };
 const durability: StateDurabilityAdapter = { publicationMode: async () => 'strict', assertStateWriteSupport: async () => undefined, syncFile: async () => undefined, syncDirectory: async () => undefined, moveFileWriteThrough: async () => undefined };
@@ -14,6 +15,13 @@ const durability: StateDurabilityAdapter = { publicationMode: async () => 'stric
 test('v2 setup preserves safe no-machine defaults and emits a cost-sensitive diff', () => {
   assert.match(configurationDiff(null, codespaces), /machine: null/);
   assert.match(configurationDiff(null, codespaces), /cost-sensitive/);
+});
+
+test('backend resolver exposes local lifecycle semantics and phase-gates every Codespaces operation', async () => {
+  assert.equal(resolveExecutionBackend('local').kind, 'local');
+  const codespacesBackend = resolveExecutionBackend('codespaces');
+  await assert.rejects(() => codespacesBackend.create({ name: 'safe', backend: 'codespaces' }), /phase-gated/);
+  await assert.rejects(() => codespacesBackend.remove({ kind: 'codespaces', id: '1', name: 'safe', environmentId: 'env' }), /phase-gated/);
 });
 
 test('Codespaces setup validation requires remote ref, immutable commit, and a regular committed Dev Container blob', async () => {
@@ -105,6 +113,36 @@ test('strict v2 rejects secret-shaped fields and incomplete Codespaces repositor
   await assert.doesNotReject(() => loadConfig(path));
   assert.throws(() => parseConfig(JSON.stringify({ ...codespaces, project: { repository: 'owner/repo' } })), /project\.ref is required/);
   assert.throws(() => parseConfig(JSON.stringify({ ...codespaces, project: { ref: 'refs/heads/main' } })), /project\.repository is required/);
+});
+
+test('strict v2 only accepts full 40 or 64 character OIDs and rejects visibility changes', () => {
+  for (const length of [39, 41, 63, 65]) {
+    const invalid = structuredClone(codespaces);
+    invalid.project.expectedOid = 'a'.repeat(length);
+    assert.throws(() => parseConfig(JSON.stringify(invalid)), /full Git object ID/);
+  }
+  const sha256 = structuredClone(codespaces);
+  sha256.project.expectedOid = 'a'.repeat(64);
+  sha256.environment.devcontainerBlobOid = 'b'.repeat(64);
+  assert.doesNotThrow(() => parseConfig(JSON.stringify(sha256)));
+  const visibility = structuredClone(codespaces);
+  visibility.backends.codespaces.ports.allowVisibilityChanges = true;
+  assert.throws(() => parseConfig(JSON.stringify(visibility)), /visibility changes.*unsupported/);
+});
+
+test('doctor reports persisted immutable evidence drift as action-required', async () => {
+  const runner: ProcessRunner = { async run(command, args) {
+    if (command === 'git') return { code: 0, stdout: 'https://github.com/owner/repo.git\n', stderr: '' };
+    if (args[0] === '--version') return { code: 0, stdout: 'gh version 2', stderr: '' };
+    if (args.at(-1) === '/user') return { code: 0, stdout: '{"id":"1","login":"octo"}', stderr: '' };
+    if (args.at(-1)?.includes('/commits/')) return { code: 0, stdout: '{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}', stderr: '' };
+    if (args.at(-1)?.includes('/contents/')) return { code: 0, stdout: '{"type":"file","sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}', stderr: '' };
+    if (args.at(-1)?.includes('/machines')) return { code: 0, stdout: '{"total_count":1,"machines":[{"name":"basic","display_name":"Basic","operating_system":"linux","storage_in_bytes":1,"memory_in_bytes":1,"cpus":1,"prebuild_availability":null}]}', stderr: '' };
+    return { code: 0, stdout: '{"billable_owner":{"id":"1","login":"octo"},"defaults":{"location":"WestUs2","devcontainer_path":null}}', stderr: '' };
+  } };
+  const report = await doctor(codespaces, 'codespaces', runner, '/repo');
+  assert.equal(report.checks.find((check) => check.id === 'codespaces.ref')?.state, 'action-required');
+  assert.equal(report.checks.find((check) => check.id === 'codespaces.devcontainer')?.state, 'action-required');
 });
 
 test('v2 setup drafts may omit discovered evidence, while persisted v2 configurations may not', () => {

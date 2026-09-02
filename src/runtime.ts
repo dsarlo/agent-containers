@@ -27,7 +27,7 @@ const readDevcontainerConfig: ConfigReader = (path) => readFile(path, 'utf8');
 const resolveSyntheticPath: PathResolver = async (path) => path;
 
 /** Run the remote lifecycle under its durable workspace lock and recovery guard. */
-export async function execWorkspaceLifecycle(metadata: WorkspaceMetadata, command: string[], runner: ProcessRunner, save: (metadata: WorkspaceMetadata) => Promise<void>, stateDir: string, readConfig: ConfigReader = readDevcontainerConfig): Promise<ProcessResult> {
+export async function execWorkspaceLifecycle(metadata: WorkspaceMetadata, command: string[], runner: ProcessRunner, save: (metadata: LocalMetadata) => Promise<void>, stateDir: string, readConfig: ConfigReader = readDevcontainerConfig): Promise<ProcessResult> {
   assertLocalMetadata(metadata);
   return withWorkspaceLock(stateDir, metadata.name, async (signal) => {
     const recorded = await loadMetadata(stateDir, metadata.name);
@@ -66,7 +66,7 @@ export async function execNamedWorkspaceLifecycle(name: string, command: string[
   });
 }
 
-export async function execWorkspace(metadata: WorkspaceMetadata, command: string[], runner: ProcessRunner, save: (metadata: WorkspaceMetadata) => Promise<void>, readConfig: ConfigReader = readDevcontainerConfig, signal?: AbortSignal, recordRecovery: RecoveryRecorder = missingRecoveryRecorder, clearRecovery: RecoveryClearer = missingRecoveryClearer, resolvePath: PathResolver = readConfig === readDevcontainerConfig ? realpath : resolveSyntheticPath, devcontainer?: DevcontainerInvocation): Promise<ProcessResult> {
+export async function execWorkspace(metadata: WorkspaceMetadata, command: string[], runner: ProcessRunner, save: (metadata: LocalMetadata) => Promise<void>, readConfig: ConfigReader = readDevcontainerConfig, signal?: AbortSignal, recordRecovery: RecoveryRecorder = missingRecoveryRecorder, clearRecovery: RecoveryClearer = missingRecoveryClearer, resolvePath: PathResolver = readConfig === readDevcontainerConfig ? realpath : resolveSyntheticPath, devcontainer?: DevcontainerInvocation): Promise<ProcessResult> {
   assertLocalMetadata(metadata);
   if (command.length === 0) throw new Error('A command is required after --.');
   if (metadata.containerId !== undefined && !isCanonicalContainerId(metadata.containerId)) throw new Error(`Workspace ${metadata.name} has a legacy or non-canonical container ID. Verify the container manually, then clear or repair the recorded metadata before running lifecycle commands.`);
@@ -133,7 +133,7 @@ function assertLocalMetadata(metadata: WorkspaceMetadata): asserts metadata is L
  * An aborted local `up` has no trustworthy terminal container ID. Query Docker
  * by the exact Dev Containers local-folder label, but never remove a result.
  */
-async function ambiguousUpRecovery(metadata: WorkspaceMetadata, runner: ProcessRunner, _save: (metadata: WorkspaceMetadata) => Promise<void>, recordRecovery: RecoveryRecorder, outcome: string): Promise<never> {
+async function ambiguousUpRecovery(metadata: LocalMetadata, runner: ProcessRunner, _save: (metadata: LocalMetadata) => Promise<void>, recordRecovery: RecoveryRecorder, outcome: string): Promise<never> {
   const inspectionSignal = AbortSignal.timeout(5_000);
   const zeroCandidatePolls = 3;
   let matching: string[] = [];
@@ -169,7 +169,7 @@ async function ambiguousUpRecovery(metadata: WorkspaceMetadata, runner: ProcessR
     : `${outcome}. Found ${matching.length} containers with the exact worktree label; ownership is ambiguous`);
 }
 
-async function recordAmbiguousUp(recordRecovery: RecoveryRecorder, metadata: WorkspaceMetadata, containerIds: string[], detail: string): Promise<never> {
+async function recordAmbiguousUp(recordRecovery: RecoveryRecorder, metadata: LocalMetadata, containerIds: string[], detail: string): Promise<never> {
   await recordRecovery({ reason: 'devcontainer-up-ambiguous', containerIds: recoveryHints(metadata, containerIds), worktree: metadata.worktree });
   throw new Error(`${detail}. Agent Containers did not remove any container and recorded a manual recovery block; verify Docker state before clearing it.`);
 }

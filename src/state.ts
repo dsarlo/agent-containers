@@ -30,10 +30,20 @@ export interface V2LocalWorkspaceMetadata extends Omit<LocalWorkspaceMetadata, '
   backend: 'local';
   handle: Extract<WorkspaceHandle, { kind: 'local' }>;
 }
-export interface CodespacesWorkspaceMetadata extends Omit<LocalWorkspaceMetadata, 'version'> {
+/** Remote records intentionally have no local worktree, branch, or Docker fields. */
+export interface CodespacesWorkspaceMetadata {
   version: 2;
   backend: 'codespaces';
-  handle: Extract<WorkspaceHandle, { kind: 'codespaces' }>;
+  name: string;
+  workspaceId: string;
+  createdAt: string;
+  control: { githubHost: string; actorId: string; actorLogin: string; ghVersion: string };
+  repository: { id: string; owner: string; name: string };
+  source: { requestedRef: string; expectedOid: string; effectiveBranch: string; devcontainerPath: string; devcontainerBlobOid: string };
+  remote: { codespaceId: string; name: string; environmentId: string; ownerId: string; ownerLogin: string; billableOwnerId: string; machine: string; geo: string; createdAt: string };
+  lifecycle: { desired: 'ready' | 'stopped'; normalized: string; providerRawState: string; lastObservedAt: string; activeOperation: null | { id: string; kind: 'create' | 'stop' | 'remove'; startedAt: string; checkpoint: string } };
+  recovery: null | { reason: string; operationId: string; recordedAt: string };
+  cleanup: { remoteStopped: boolean; remoteDeleted: boolean; tombstoneWritten: boolean };
 }
 export type WorkspaceMetadata = LocalWorkspaceMetadata | V2LocalWorkspaceMetadata | CodespacesWorkspaceMetadata;
 export type LocalMetadata = LocalWorkspaceMetadata | V2LocalWorkspaceMetadata;
@@ -401,15 +411,27 @@ export function isLocalWorkspaceMetadata(metadata: WorkspaceMetadata): metadata 
 }
 function isLocalHandle(value: unknown): boolean { return typeof value === 'object' && value !== null && 'kind' in value && value.kind === 'local'; }
 function isCodespacesWorkspace(value: unknown): value is CodespacesWorkspaceMetadata {
-  return typeof value === 'object' && value !== null &&
-    'version' in value && value.version === 2 && 'backend' in value && value.backend === 'codespaces' &&
-    'name' in value && typeof value.name === 'string' && isValidWorkspaceName(value.name) &&
-    'createdAt' in value && typeof value.createdAt === 'string' && 'handle' in value &&
-    typeof value.handle === 'object' && value.handle !== null && 'kind' in value.handle && value.handle.kind === 'codespaces' &&
-    'id' in value.handle && typeof value.handle.id === 'string' && value.handle.id.length > 0 &&
-    'name' in value.handle && typeof value.handle.name === 'string' && value.handle.name.length > 0 &&
-    'environmentId' in value.handle && typeof value.handle.environmentId === 'string' && value.handle.environmentId.length > 0;
+  if (!isStrictRecord(value, ['version', 'backend', 'name', 'workspaceId', 'createdAt', 'control', 'repository', 'source', 'remote', 'lifecycle', 'recovery', 'cleanup']) || value.version !== 2 || value.backend !== 'codespaces' || typeof value.name !== 'string' || !isValidWorkspaceName(value.name) || !isUuid(value.workspaceId) || !isTimestamp(value.createdAt)) return false;
+  const control = value.control, repository = value.repository, source = value.source, remote = value.remote, lifecycle = value.lifecycle, cleanup = value.cleanup;
+  if (!isStrictRecord(control, ['githubHost', 'actorId', 'actorLogin', 'ghVersion']) || control.githubHost !== 'github.com' || !losslessId(control.actorId) || !safeDisplay(control.actorLogin) || !safeDisplay(control.ghVersion)) return false;
+  if (!isStrictRecord(repository, ['id', 'owner', 'name']) || !losslessId(repository.id) || !safeIdentifier(repository.owner) || !safeIdentifier(repository.name)) return false;
+  if (!isStrictRecord(source, ['requestedRef', 'expectedOid', 'effectiveBranch', 'devcontainerPath', 'devcontainerBlobOid']) || !safeRef(source.requestedRef) || source.effectiveBranch !== `agent-containers/${value.name}` || !isOid(source.expectedOid) || !safeRepositoryPath(source.devcontainerPath) || !isOid(source.devcontainerBlobOid)) return false;
+  if (!isStrictRecord(remote, ['codespaceId', 'name', 'environmentId', 'ownerId', 'ownerLogin', 'billableOwnerId', 'machine', 'geo', 'createdAt']) || !losslessId(remote.codespaceId) || !safeDisplay(remote.name) || !safeDisplay(remote.environmentId) || !losslessId(remote.ownerId) || !safeDisplay(remote.ownerLogin) || !losslessId(remote.billableOwnerId) || !safeDisplay(remote.machine) || !safeDisplay(remote.geo) || !isTimestamp(remote.createdAt)) return false;
+  if (!isStrictRecord(lifecycle, ['desired', 'normalized', 'providerRawState', 'lastObservedAt', 'activeOperation']) || (lifecycle.desired !== 'ready' && lifecycle.desired !== 'stopped') || !safeDisplay(lifecycle.normalized) || !safeDisplay(lifecycle.providerRawState) || !isTimestamp(lifecycle.lastObservedAt) || !validOperation(lifecycle.activeOperation)) return false;
+  if (value.recovery !== null && (!isStrictRecord(value.recovery, ['reason', 'operationId', 'recordedAt']) || !safeDisplay(value.recovery.reason) || !isUuid(value.recovery.operationId) || !isTimestamp(value.recovery.recordedAt))) return false;
+  return isStrictRecord(cleanup, ['remoteStopped', 'remoteDeleted', 'tombstoneWritten']) && typeof cleanup.remoteStopped === 'boolean' && typeof cleanup.remoteDeleted === 'boolean' && typeof cleanup.tombstoneWritten === 'boolean';
 }
+
+function isStrictRecord(value: unknown, keys: readonly string[]): value is Record<string, unknown> { return typeof value === 'object' && value !== null && !Array.isArray(value) && Object.keys(value).length === keys.length && Object.keys(value).every((key) => keys.includes(key) && !/(token|secret|password|credential|key)/i.test(key)); }
+function losslessId(value: unknown): value is string { return typeof value === 'string' && /^[1-9][0-9]*$/.test(value); }
+function isUuid(value: unknown): value is string { return typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value); }
+function isTimestamp(value: unknown): value is string { return typeof value === 'string' && !Number.isNaN(Date.parse(value)); }
+function isOid(value: unknown): value is string { return typeof value === 'string' && /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(value); }
+function safeIdentifier(value: unknown): value is string { return typeof value === 'string' && /^[A-Za-z0-9_.-]{1,128}$/.test(value); }
+function safeDisplay(value: unknown): value is string { return typeof value === 'string' && value.length > 0 && value.length <= 512 && !/[\0\r\n]/.test(value) && !/(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|-----BEGIN)/i.test(value); }
+function safeRef(value: unknown): value is string { return typeof value === 'string' && value.length <= 512 && /^refs\/(?:heads|tags)\/[A-Za-z0-9._/-]+$/.test(value) && !value.includes('..') && !value.endsWith('.'); }
+function safeRepositoryPath(value: unknown): value is string { return typeof value === 'string' && value.length > 0 && !/[\0\r\n\\]/.test(value) && !value.split('/').some((part) => !part || part === '.' || part === '..'); }
+function validOperation(value: unknown): boolean { return value === null || (isStrictRecord(value, ['id', 'kind', 'startedAt', 'checkpoint']) && isUuid(value.id) && (value.kind === 'create' || value.kind === 'stop' || value.kind === 'remove') && isTimestamp(value.startedAt) && safeDisplay(value.checkpoint)); }
 
 function isCanonicalPath(value: unknown): value is string {
   return typeof value === 'string' && isAbsolute(value) && resolve(value) === value;

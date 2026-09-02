@@ -96,7 +96,7 @@ function isRecord(value: unknown): value is Record<string, unknown> { return typ
 function losslessId(value: unknown): boolean { return (typeof value === 'number' && Number.isSafeInteger(value) && value > 0) || (typeof value === 'string' && /^[1-9][0-9]*$/.test(value)); }
 function positiveInteger(value: unknown): value is number { return typeof value === 'number' && Number.isSafeInteger(value) && value > 0; }
 function safeName(value: string): boolean { return /^[A-Za-z0-9-]+$/.test(value); }
-function oid(value: unknown): value is string { return typeof value === 'string' && /^[0-9a-f]{40,64}$/i.test(value); }
+function oid(value: unknown): value is string { return typeof value === 'string' && /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(value); }
 function safeRef(value: string): boolean { return value.length > 0 && value.length <= 512 && !/[\0\r\n~^:?*\x5b\\]/.test(value) && !value.includes('..') && !value.endsWith('.') && !value.startsWith('/'); }
 function safeRepositoryPath(value: string): boolean { return value.length > 0 && !/[\0\r\n]/.test(value) && !value.startsWith('/') && !value.split('/').some((part) => !part || part === '.' || part === '..'); }
 function assertRepository(value: string): void { if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(value)) throw new Error('Invalid GitHub repository selector.'); }

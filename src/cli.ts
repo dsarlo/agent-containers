@@ -7,6 +7,7 @@ import type { CodespacesAgentContainersConfig } from './types.js';
 import { acknowledgeUnconfirmedProcessReap, clearManualRecoveryIfCurrent, defaultStateDir, deleteMetadata, listMetadata, loadManualRecovery, loadMetadata, recordManualRecovery, releaseStaleWorkspaceLock, saveMetadata, withWorkspaceLock } from './state.js';
 import { execNamedWorkspaceLifecycle } from './runtime.js';
 import { createWorkspace, findGitRoot, nodeProcessRunner, removeWorkspace } from './workspaces.js';
+import { assertBackendAvailable } from './backend.js';
 
 export interface CliIo { input: NodeJS.ReadableStream; output: NodeJS.WritableStream; isTTY: boolean }
 const processIo: CliIo = { input: process.stdin, output: process.stdout, isTTY: Boolean(process.stdin.isTTY) };
@@ -28,7 +29,7 @@ export async function runCli(args: string[], cwd = process.cwd(), write: (messag
           write(`Wrote ${join(root, '.agent-containers.yml')}`);
           return 0;
         }
-        ensureOptions(rest, ['--backends', '--default-backend', '--interactive', '--non-interactive', '--from', '--stdin'], ['--interactive', '--non-interactive', '--stdin']);
+        ensureOptions(rest, ['--backends', '--default-backend', '--interactive', '--non-interactive', '--from', '--stdin', '--yes'], ['--interactive', '--non-interactive', '--stdin', '--yes']);
         const root = await findGitRoot(cwd, nodeProcessRunner);
         const selection = optionValue(rest, '--backends');
         if (selection === 'codespaces' || selection === 'both') requireCodespacesExperimental();
@@ -43,6 +44,7 @@ export async function runCli(args: string[], cwd = process.cwd(), write: (messag
           const next = await interactiveConfig(io, root);
           await initConfigV2(root, next);
         } else if (source || stdin) {
+          if (!rest.includes('--yes')) throw new UsageError('Noninteractive init previews configuration and requires --yes to publish it.');
           const next = await loadConfigFromSource(source ? resolve(cwd, source) : undefined, stdin);
           if (next.version !== 2) throw new Error('Noninteractive init accepts strict schema-v2 nonsecret configuration only.');
           if (next.backends.enabled.includes('codespaces')) requireCodespacesExperimental();
@@ -55,26 +57,32 @@ export async function runCli(args: string[], cwd = process.cwd(), write: (messag
         return 0;
       }
       case 'configure': {
-        ensureOptions(rest, ['--non-interactive', '--interactive', '--from', '--stdin'], ['--non-interactive', '--interactive', '--stdin']);
+        ensureOptions(rest, ['--non-interactive', '--interactive', '--from', '--stdin', '--yes'], ['--non-interactive', '--interactive', '--stdin', '--yes']);
         const interactive = rest.includes('--interactive');
         const stdin = rest.includes('--stdin');
         if (interactive === stdin && !optionValue(rest, '--from')) throw new UsageError('Use exactly one of --interactive, --from FILE, or --stdin.');
+        if (optionValue(rest, '--from') && stdin) throw new UsageError('Use only one of --from FILE or --stdin.');
         if (interactive && !io.isTTY) throw new UsageError('Interactive configuration requires a TTY; use --non-interactive --stdin for unattended setup.');
         if (!interactive && !rest.includes('--non-interactive')) throw new UsageError('Noninteractive configuration requires --non-interactive.');
         const source = optionValue(rest, '--from');
         const root = await findGitRoot(cwd, nodeProcessRunner);
-        const next = interactive ? await interactiveConfig(io, root) : await loadConfigFromSource(source ? resolve(cwd, source) : undefined, stdin);
-        if (next.version !== 2) throw new Error('ac configure accepts strict schema-v2 nonsecret configuration only.');
-        if (next.backends.enabled.includes('codespaces')) requireCodespacesExperimental();
         const path = join(root, '.agent-containers.yml');
         let current = null;
-        let expectedCurrentHash: string | undefined;
+        let expectedCurrentHash: string | null = null;
         try {
           const currentSource = await readFile(path, 'utf8');
           current = parseConfig(currentSource);
           expectedCurrentHash = hashConfig(currentSource);
         } catch (error: unknown) {
           if (!(typeof error === 'object' && error !== null && 'code' in error && error.code === 'ENOENT')) throw error;
+        }
+        const next = interactive ? await interactiveConfig(io, root, current) : await loadConfigFromSource(source ? resolve(cwd, source) : undefined, stdin);
+        if (next.version !== 2) throw new Error('ac configure accepts strict schema-v2 nonsecret configuration only.');
+        if (next.backends.enabled.includes('codespaces')) requireCodespacesExperimental();
+        if (!interactive && !rest.includes('--yes')) {
+          const preview = await withSetupEvidence(next, root);
+          write(configurationDiff(current, preview));
+          throw new UsageError('Noninteractive configure requires --yes after reviewing the preview; no changes were made.');
         }
         const validated = interactive ? next : await withSetupEvidence(next, root);
         write(configurationDiff(current, validated));
@@ -176,6 +184,10 @@ export async function runCli(args: string[], cwd = process.cwd(), write: (messag
         if (!rest.includes('--yes')) throw new UsageError('Usage: agent-containers remove <name> --yes [--skip-container-cleanup] [--force-worktree]');
         let recoveryWorktree = cwd;
         let recoveryContainerIds: string[] = [];
+        // Inspect durable identity before acquiring local lifecycle state or issuing Git/Docker commands.
+        const recorded = await loadMetadata(stateDir, name);
+        if (!recorded) throw new Error(`No Agent Containers workspace named "${name}".`);
+        if (!('repoRoot' in recorded)) throw new Error(`Workspace "${name}" records the Codespaces backend, which is phase-gated and cannot be removed by local cleanup.`);
         await withWorkspaceLock(stateDir, name, async (signal) => {
           const metadata = await loadMetadata(stateDir, name);
           if (!metadata) throw new Error(`No Agent Containers workspace named "${name}".`);
@@ -238,7 +250,9 @@ function requireCodespacesExperimental(): void {
 function assertLocalBackendEnabled(config: import('./types.js').AgentContainersConfig, requestedBackend?: string): void {
   const backend = requestedBackend ?? (config.version === 1 ? 'local' : config.backends.default);
   if (config.version === 2 && !config.backends.enabled.includes('local')) throw new Error('Local execution is unavailable because local is disabled; Codespaces lifecycle is not implemented in this release.');
-  if (backend === 'codespaces') throw new Error('Codespaces is selected but lifecycle is not implemented in this release. Select --backend local when local is enabled.');
+  if (backend === 'codespaces') {
+    try { assertBackendAvailable('codespaces'); } catch { throw new Error('Codespaces is selected but lifecycle is phase-gated. Select --backend local when local is enabled.'); }
+  }
 }
 
 function setupConfig(selection: string, defaultBackend?: string): CodespacesAgentContainersConfig {
@@ -263,7 +277,7 @@ async function loadConfigFromSource(source: string | undefined, stdin: boolean):
   return parseCodespacesDraft(await readStdin());
 }
 
-async function interactiveConfig(io: CliIo, root: string): Promise<CodespacesAgentContainersConfig> {
+async function interactiveConfig(io: CliIo, root: string, current: import('./types.js').AgentContainersConfig | null = null): Promise<CodespacesAgentContainersConfig> {
   const prompt = createInterface({ input: io.input, output: io.output, terminal: io.isTTY });
   try {
     io.output.write('Agent Containers Codespaces setup. Enter cancel at any prompt to leave configuration unchanged. Do not enter tokens, keys, or secret values.\n');
@@ -293,7 +307,7 @@ async function interactiveConfig(io: CliIo, root: string): Promise<CodespacesAge
     }
     let validated = parseCodespacesDraft(JSON.stringify(candidate));
     if (validated.backends.enabled.includes('codespaces')) validated = await withSetupEvidence(validated, root);
-    io.output.write(configurationDiff(null, validated) + '\nNo workspace, key, secret, or GitHub setting will be created or changed.\n');
+    io.output.write(configurationDiff(current, validated) + '\nNo workspace, key, secret, or GitHub setting will be created or changed.\n');
     if ((await ask(prompt, 'Save this nonsecret configuration? [yes/no]: ', 'no')).toLowerCase() !== 'yes') throw new Error('Configuration cancelled; no changes were made.');
     return validated;
   } finally { prompt.close(); }

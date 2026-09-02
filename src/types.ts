@@ -26,8 +26,14 @@ export type CommandEvent =
   | { type: 'exit'; commandId: string; code: number | null };
 export interface ExecutionBackend {
   readonly kind: BackendKind;
+  create(request: { name: string; backend: BackendKind }, signal?: AbortSignal): Promise<WorkspaceHandle>;
   observe(handle: WorkspaceHandle, signal?: AbortSignal): Promise<WorkspaceObservation>;
+  waitReady(handle: WorkspaceHandle, signal?: AbortSignal): AsyncIterable<WorkspaceObservation>;
   execute(handle: WorkspaceHandle, request: { commandId: string; argv: readonly [string, ...string[]] }, signal?: AbortSignal): AsyncIterable<CommandEvent>;
+  attach(handle: WorkspaceHandle, commandId: string, signal?: AbortSignal): AsyncIterable<CommandEvent>;
+  cancel(handle: WorkspaceHandle, commandId: string, signal?: AbortSignal): Promise<void>;
+  recover(handle: WorkspaceHandle, signal?: AbortSignal): Promise<void>;
+  remove(handle: WorkspaceHandle, signal?: AbortSignal): Promise<void>;
 }
 
 export interface CodespacesConfig {

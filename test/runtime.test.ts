@@ -5,7 +5,7 @@ import { join, resolve } from 'node:path';
 import test from 'node:test';
 import { createDevcontainerProgressReporter, devcontainerUpFailureDetail, execNamedWorkspaceLifecycle, execWorkspace, execWorkspaceLifecycle, formatDevcontainerProgressLine, type ProcessRunner } from '../src/runtime.js';
 import type { ProcessRunOptions } from '../src/types.js';
-import { bootstrapManualRecoveryJournal, clearManualRecovery, deleteMetadata, loadManualRecovery, loadMetadata, recordManualRecovery, saveMetadata, withWorkspaceLock, type WorkspaceMetadata } from '../src/state.js';
+import { bootstrapManualRecoveryJournal, clearManualRecovery, deleteMetadata, loadManualRecovery, loadMetadata, recordManualRecovery, saveMetadata, withWorkspaceLock, type LocalMetadata, type WorkspaceMetadata } from '../src/state.js';
 import { UnconfirmedProcessReapError } from '../src/workspaces.js';
 
 const noOpRecovery = async (): Promise<void> => undefined;
@@ -30,7 +30,7 @@ const ownedInspection = (id: string): string => `${id}\n${metadata.worktree}\n`;
 
 test('execWorkspace uses the linked-worktree mount, requires a current container ID, and inherits the terminal for agents', async () => {
   const calls: Array<{ command: string; args: string[]; options?: ProcessRunOptions }> = [];
-  let saved: WorkspaceMetadata | undefined;
+  let saved: LocalMetadata | undefined;
   const runner: ProcessRunner = {
     async run(command, args, options) {
       calls.push({ command, args, options });

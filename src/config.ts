@@ -5,6 +5,9 @@ import { parse } from 'yaml';
 import type { AgentContainersConfig, CodespacesAgentContainersConfig, LocalAgentContainersConfig, ProcessResult, ProcessRunner, ProcessRunOptions } from './types.js';
 import { getProductionStateDurabilityAdapter, type StateDurabilityAdapter } from './durability.js';
 
+let testDurabilityAdapter: StateDurabilityAdapter | undefined;
+export function setConfigDurabilityAdapterForTesting(adapter: StateDurabilityAdapter | undefined): void { testDurabilityAdapter = adapter; }
+
 export const CONFIG_OUTLINE = `# Agent Containers workspace configuration (schema version 1).
 # workspace.worktreeRoot is relative to the source repository unless absolute.
 # environment.devcontainerPath must be a safe repository-relative regular file.
@@ -65,12 +68,11 @@ export async function initConfig(directory: string, force = false): Promise<void
 /** Save a fully validated v2 candidate without silently replacing an existing configuration. */
 export async function initConfigV2(directory: string, config: CodespacesAgentContainersConfig): Promise<void> {
   const path = join(directory, '.agent-containers.yml');
-  try { await lstat(path); throw new Error(`${path} already exists; use ac configure to review and update it.`); }
-  catch (error: unknown) { if (!isNodeError(error, 'ENOENT')) throw error; }
-  // First publication uses O_EXCL, preserving expected-absence semantics without
-  // turning onboarding into a lifecycle durability probe.
-  try { await writeFile(path, canonicalConfigSource(config), { encoding: 'utf8', flag: 'wx', mode: 0o600 }); }
-  catch (error: unknown) { if (isNodeError(error, 'EEXIST')) throw new Error('Configuration changed concurrently; it was created while onboarding was in progress.', { cause: error }); throw error; }
+  try { await saveConfigAtomic(path, config, null); }
+  catch (error: unknown) {
+    if (error instanceof Error && /changed concurrently/.test(error.message)) throw new Error('Configuration changed concurrently; it was created while onboarding was in progress.', { cause: error });
+    throw error;
+  }
 }
 
 export async function loadConfig(path: string): Promise<AgentContainersConfig> {
@@ -214,7 +216,7 @@ function parseCodespaces(input: Record<string, unknown>): CodespacesAgentContain
   rejectUnknownKeys(ports, ['allowVisibilityChanges', 'allowPublic'], 'backends.codespaces.ports');
   rejectUnknownKeys(secrets, ['allowedRemoteSecretNames', 'allowCodespaceGitCredential'], 'backends.codespaces.secrets');
   const result = { enabled: requiredBoolean(input.enabled, 'codespaces.enabled'), machine: input.machine === null ? null : requiredString(input.machine, 'codespaces.machine'), geo: requiredString(input.geo, 'codespaces.geo'), idleTimeoutMinutes: requiredInteger(input.idleTimeoutMinutes, 'idleTimeoutMinutes', 5, 240), retentionPeriodMinutes: requiredInteger(input.retentionPeriodMinutes, 'retentionPeriodMinutes', 1, 43200), maxTotal: requiredInteger(input.maxTotal, 'maxTotal', 1), maxRunning: requiredInteger(input.maxRunning, 'maxRunning', 1), maxCreating: requiredInteger(input.maxCreating, 'maxCreating', 1), maxParallelCommandsPerWorkspace: requiredInteger(input.maxParallelCommandsPerWorkspace, 'maxParallelCommandsPerWorkspace', 1), readiness: { providerTimeoutSeconds: requiredInteger(readiness.providerTimeoutSeconds, 'providerTimeoutSeconds', 1), sshTimeoutSeconds: requiredInteger(readiness.sshTimeoutSeconds, 'sshTimeoutSeconds', 1), command: requiredStrings(readiness.command, 'readiness.command'), commandTimeoutSeconds: requiredInteger(readiness.commandTimeoutSeconds, 'commandTimeoutSeconds', 1) }, transport: { reconnectWindowSeconds: requiredInteger(transport.reconnectWindowSeconds, 'reconnectWindowSeconds', 1), cancelGraceSeconds: requiredInteger(transport.cancelGraceSeconds, 'cancelGraceSeconds', 1), remoteLogBytesPerStream: requiredInteger(transport.remoteLogBytesPerStream, 'remoteLogBytesPerStream', 1), remoteLogRetentionHours: requiredInteger(transport.remoteLogRetentionHours, 'remoteLogRetentionHours', 1) }, ports: { allowVisibilityChanges: requiredBoolean(ports.allowVisibilityChanges, 'ports.allowVisibilityChanges'), allowPublic: requiredBoolean(ports.allowPublic, 'ports.allowPublic') }, secrets: { allowedRemoteSecretNames: requiredStrings(secrets.allowedRemoteSecretNames, 'secrets.allowedRemoteSecretNames'), allowCodespaceGitCredential: requiredBoolean(secrets.allowCodespaceGitCredential, 'secrets.allowCodespaceGitCredential') } };
-  if (result.maxRunning > result.maxTotal || result.maxCreating > result.maxTotal || result.ports.allowPublic) throw new Error('Invalid configuration: capacity limits must not exceed maxTotal and public ports are unsupported');
+  if (result.maxRunning > result.maxTotal || result.maxCreating > result.maxTotal || result.ports.allowPublic || result.ports.allowVisibilityChanges) throw new Error('Invalid configuration: capacity limits must not exceed maxTotal and public ports or visibility changes are unsupported');
   if (new Set(result.secrets.allowedRemoteSecretNames).size !== result.secrets.allowedRemoteSecretNames.length || result.secrets.allowedRemoteSecretNames.some((name) => !/^[A-Za-z_][A-Za-z0-9_]*$/.test(name))) throw new Error('Invalid configuration: remote secret capabilities must be unique environment names');
   return result;
 }
@@ -244,7 +246,7 @@ export async function saveConfigAtomic(path: string, next: AgentContainersConfig
   // Reparse the serialized candidate at the publication boundary so callers
   // cannot bypass the strict schema by constructing an object directly.
   const source = canonicalConfigSource(next);
-  const adapter = options.durabilityAdapter ?? getProductionStateDurabilityAdapter();
+  const adapter = options.durabilityAdapter ?? testDurabilityAdapter ?? getProductionStateDurabilityAdapter();
   await adapter.assertStateWriteSupport();
   const lock = `${path}.lock`;
   const release = await acquireConfigLock(lock, adapter, options);
@@ -375,7 +377,7 @@ async function readConfigLockOwner(lock: string): Promise<ConfigLockOwner | unde
 }
 function requiredString(value: unknown, label: string): string { if (!nonEmptyString(value)) throw new Error(`Invalid configuration: ${label} must be a non-empty string`); return value; }
 function optionalString(value: unknown, label: string): string | undefined { return value === undefined ? undefined : requiredString(value, label); }
-function optionalOid(value: unknown, label: string): string | undefined { if (value === undefined) return undefined; const oid = requiredString(value, label); if (!/^[0-9a-f]{40,64}$/i.test(oid)) throw new Error(`Invalid configuration: ${label} must be a full Git object ID`); return oid; }
+function optionalOid(value: unknown, label: string): string | undefined { if (value === undefined) return undefined; const oid = requiredString(value, label); if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(oid)) throw new Error(`Invalid configuration: ${label} must be a full Git object ID`); return oid; }
 function repository(value: unknown): string | undefined { if (value === undefined) return undefined; const result = requiredString(value, 'project.repository'); if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(result)) throw new Error('Invalid configuration: project.repository must be OWNER/REPOSITORY'); return result; }
 function requiredBoolean(value: unknown, label: string): boolean { if (typeof value !== 'boolean') throw new Error(`Invalid configuration: ${label} must be boolean`); return value; }
 function requiredInteger(value: unknown, label: string, minimum: number, maximum = Number.MAX_SAFE_INTEGER): number { if (typeof value !== 'number' || !Number.isInteger(value) || value < minimum || value > maximum) throw new Error(`Invalid configuration: ${label} must be an integer between ${minimum} and ${maximum}`); return value; }
