@@ -32,6 +32,8 @@ jobs:
       - run: npm run test:cli-setup-smoke
       - run: npm run test:native-packaging-contract
       - run: npm run verify:native-packaging-contract
+      - run: npm run verify:native-helper-packaging-contract
+      - run: npm run test:native-helper-packaging-contract
 
   windows-lifecycle:
     name: Windows Node lifecycle
@@ -174,6 +176,33 @@ jobs:
         run: node .packed-native/node_modules/@dsarlo/agent-containers/scripts/test-cli-setup-smoke.mjs
         env:
           PACKED_NATIVE_PACKAGE_DIR: ${{ github.workspace }}/.packed-native/node_modules/@dsarlo/agent-containers
+
+  helper-artifacts:
+    name: Package-owned remote helper artifacts
+    runs-on: ubuntu-latest
+    steps:
+      # actions/checkout v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+      # actions/setup-node v5
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444
+        with:
+          node-version: 20.19.0
+          cache: npm
+      - run: npm ci
+      - name: Install the arm64 cross compiler
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+      - name: Build and pin the static Linux helper artifacts (reproducible make build)
+        run: CC=gcc CC_ARM64=aarch64-linux-gnu-gcc npm run build:helper
+      - run: npm run verify:native-helper-packaging-contract
+      - run: npm run test:native-helper-packaging-contract
+      # actions/upload-artifact v5
+      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4
+        with:
+          name: helper-artifacts
+          path: |
+            native/helper/bin
+            native/helper/manifest.json
+          if-no-files-found: error
 
   live-devcontainer:
     name: Live Dev Containers lifecycle

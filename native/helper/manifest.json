@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 1,
+  "protocol": 1,
+  "helperVersion": "0.1.0",
+  "architectures": {
+    "linux-x64": {
+      "file": "agent-containers-helper-linux-x64",
+      "sha256": "67402c5925079c01cc94e3e059d44f2ff423cc41461a622feaa4bfc1dc73a113",
+      "size": 46816,
+      "mode": "0755"
+    },
+    "linux-arm64": {
+      "file": "agent-containers-helper-linux-arm64",
+      "sha256": "3eb0a1e7b1b7329fa46a52a6d522cccde4ffa01990772e141db9288fe2975b59",
+      "size": 600104,
+      "mode": "0755"
+    }
+  },
+  "sourcePins": {
+    "helper.c": "8deb533df3f06c5ad795a504f7399f94d8902f7ceb99129366d866f6a72cf219",
+    "Makefile": "4eb1dc173337580a86c50e7ab9495d463c688df66f990c1f2ac4c35b426f643d"
+  },
+  "artifactsStaged": true,
+  "selfChecksum": "cc1202d348de979dc76bbfe580c42f69632e0b0bb17a1bdefe94217db8d91db7",
+  "generatedAt": "2026-09-02T18:51:22.804Z"
+}
