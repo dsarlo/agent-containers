@@ -36,8 +36,7 @@ export async function runCli(args: string[], cwd = process.cwd(), write: (messag
           if (nonInteractive || source || stdin || rest.includes('--yes') || selection || optionValue(rest, '--default-backend')) throw new UsageError('Interactive init cannot be combined with setup mode, selection, or confirmation options.');
           if (!io.isTTY) throw new UsageError('Interactive configuration requires a TTY; use --non-interactive --stdin for unattended setup.');
           const snapshot = await snapshotInitConfig(root, force);
-          const draft = await interactiveConfig(io, root, snapshot.current);
-          const next = await withSetupEvidence(draft, root);
+          const next = await interactiveConfig(io, root, snapshot.current);
           await assertEvidenceUnchanged(next, root);
           await initConfigV2(root, next, force, snapshot.expectedHash);
         } else if (source || stdin) {
@@ -84,7 +83,7 @@ export async function runCli(args: string[], cwd = process.cwd(), write: (messag
           write(configurationDiff(current, preview));
           throw new UsageError('Noninteractive configure requires --yes after reviewing the preview; no changes were made.');
         }
-        const validated = await withSetupEvidence(next, root);
+        const validated = interactive ? next : await withSetupEvidence(next, root);
         write(configurationDiff(current, validated));
         await assertEvidenceUnchanged(validated, root);
         write((await saveConfigAtomic(path, validated, expectedCurrentHash)) === 'saved' ? `Saved ${path}` : 'No configuration changes.');
@@ -352,9 +351,15 @@ async function interactiveConfig(io: CliIo, root: string, current: import('./typ
       settings.secrets.allowedRemoteSecretNames = listPrompt(await ask(prompt, `Allowed remote secret names (names only, comma-separated) [${settings.secrets.allowedRemoteSecretNames.join(',')}]: `, settings.secrets.allowedRemoteSecretNames.join(',')));
       settings.secrets.allowCodespaceGitCredential = booleanPrompt(await ask(prompt, `Allow Codespaces Git credential [${settings.secrets.allowCodespaceGitCredential ? 'yes' : 'no'}]: `, settings.secrets.allowCodespaceGitCredential ? 'yes' : 'no'), 'Allow Codespaces Git credential');
     }
-    const validated = parseCodespacesDraft(JSON.stringify(candidate));
+    const drafted = parseCodespacesDraft(JSON.stringify(candidate));
+    // Resolve the immutable source facts before rendering. The preview is the
+    // exact candidate that may be persisted, never an evidence-free draft.
+    const validated = await withSetupEvidence(drafted, root);
     io.output.write(configurationDiff(current, validated) + '\nNo workspace, key, secret, or GitHub setting will be created or changed.\n');
     if ((await ask(prompt, 'Save this nonsecret configuration? [yes/no]: ', 'no')).toLowerCase() !== 'yes') throw new Error('Configuration cancelled; no changes were made.');
+    // Confirmation does not authorize a changed remote source. Revalidate at
+    // the confirmation boundary before returning the exact previewed candidate.
+    await assertEvidenceUnchanged(validated, root);
     return validated;
   } finally { prompt.close(); }
 }

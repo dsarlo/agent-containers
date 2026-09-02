@@ -4,6 +4,7 @@ import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { randomUUID, createHash } from 'node:crypto';
 import { isValidWorkspaceName, validateWorkspaceName } from './names.js';
 import { getProductionStateDurabilityAdapter, type StateDurabilityAdapter } from './durability.js';
+import { secretShaped } from './secrets.js';
 import type { WorkspaceHandle } from './types.js';
 
 export interface LocalWorkspaceMetadata {
@@ -459,7 +460,7 @@ export function isAgentContainersWorkspace(metadata: unknown): metadata is Works
   if (isCodespacesWorkspace(metadata)) return true;
   return typeof metadata === 'object' && metadata !== null &&
     'version' in metadata && (metadata.version === 1 || metadata.version === 2) &&
-    'name' in metadata && typeof metadata.name === 'string' && isValidWorkspaceName(metadata.name) &&
+    'name' in metadata && typeof metadata.name === 'string' && isValidWorkspaceName(metadata.name) && !secretShaped(metadata.name) &&
     'branch' in metadata && metadata.branch === `agent-containers/${metadata.name}` &&
     'worktree' in metadata && isCanonicalPath(metadata.worktree) &&
     'repoRoot' in metadata && isCanonicalPath(metadata.repoRoot) &&
@@ -479,7 +480,7 @@ function isKnownLocalV2Record(value: unknown): value is Record<string, unknown> 
 }
 function isLocalHandle(value: unknown): boolean { return isStrictRecord(value, ['kind']) && value.kind === 'local'; }
 function isCodespacesWorkspace(value: unknown): value is CodespacesWorkspaceMetadata {
-  if (!isStrictRecord(value, ['version', 'backend', 'name', 'workspaceId', 'createdAt', 'control', 'repository', 'source', 'remote', 'lifecycle', 'recovery', 'cleanup']) || value.version !== 2 || value.backend !== 'codespaces' || typeof value.name !== 'string' || !isValidWorkspaceName(value.name) || !isUuid(value.workspaceId) || !isTimestamp(value.createdAt)) return false;
+  if (!isStrictRecord(value, ['version', 'backend', 'name', 'workspaceId', 'createdAt', 'control', 'repository', 'source', 'remote', 'lifecycle', 'recovery', 'cleanup']) || value.version !== 2 || value.backend !== 'codespaces' || typeof value.name !== 'string' || !isValidWorkspaceName(value.name) || secretShaped(value.name) || !isUuid(value.workspaceId) || !isTimestamp(value.createdAt)) return false;
   const control = value.control, repository = value.repository, source = value.source, remote = value.remote, lifecycle = value.lifecycle, cleanup = value.cleanup;
   if (!isStrictRecord(control, ['githubHost', 'actorId', 'actorLogin', 'ghVersion']) || control.githubHost !== 'github.com' || !losslessId(control.actorId) || !safeDisplay(control.actorLogin) || !safeDisplay(control.ghVersion)) return false;
   if (!isStrictRecord(repository, ['id', 'owner', 'name']) || !losslessId(repository.id) || !safeIdentifier(repository.owner) || !safeIdentifier(repository.name)) return false;
@@ -495,10 +496,10 @@ function losslessId(value: unknown): value is string { return typeof value === '
 function isUuid(value: unknown): value is string { return typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value); }
 function isTimestamp(value: unknown): value is string { return typeof value === 'string' && !Number.isNaN(Date.parse(value)); }
 function isOid(value: unknown): value is string { return typeof value === 'string' && /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(value); }
-function safeIdentifier(value: unknown): value is string { return typeof value === 'string' && /^[A-Za-z0-9_.-]{1,128}$/.test(value); }
-function safeDisplay(value: unknown): value is string { return typeof value === 'string' && value.length > 0 && value.length <= 512 && !/[\0\r\n]/.test(value) && !/(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|-----BEGIN)/i.test(value); }
-function safeRef(value: unknown): value is string { return typeof value === 'string' && value.length <= 512 && /^refs\/(?:heads|tags)\/[A-Za-z0-9._/-]+$/.test(value) && !value.includes('..') && !value.endsWith('.'); }
-function safeRepositoryPath(value: unknown): value is string { return typeof value === 'string' && value.length > 0 && !/[\0\r\n\\]/.test(value) && !value.split('/').some((part) => !part || part === '.' || part === '..'); }
+function safeIdentifier(value: unknown): value is string { return typeof value === 'string' && !secretShaped(value) && /^[A-Za-z0-9_.-]{1,128}$/.test(value); }
+function safeDisplay(value: unknown): value is string { return typeof value === 'string' && !secretShaped(value) && value.length > 0 && value.length <= 512 && !/[\0\r\n]/.test(value); }
+function safeRef(value: unknown): value is string { return typeof value === 'string' && !secretShaped(value) && value.length <= 512 && /^refs\/(?:heads|tags)\/[A-Za-z0-9._/-]+$/.test(value) && !value.includes('..') && !value.endsWith('.'); }
+function safeRepositoryPath(value: unknown): value is string { return typeof value === 'string' && !secretShaped(value) && value.length > 0 && !/[\0\r\n\\]/.test(value) && !value.split('/').some((part) => !part || part === '.' || part === '..'); }
 function validOperation(value: unknown): boolean { return value === null || (isStrictRecord(value, ['id', 'kind', 'startedAt', 'checkpoint']) && isUuid(value.id) && (value.kind === 'create' || value.kind === 'stop' || value.kind === 'remove') && isTimestamp(value.startedAt) && safeDisplay(value.checkpoint)); }
 
 function isCanonicalPath(value: unknown): value is string {

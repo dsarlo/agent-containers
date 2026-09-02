@@ -4,6 +4,7 @@ import { basename, dirname, isAbsolute, join, posix, win32 } from 'node:path';
 import { parse } from 'yaml';
 import type { AgentContainersConfig, CodespacesAgentContainersConfig, LocalAgentContainersConfig, ProcessResult, ProcessRunner, ProcessRunOptions } from './types.js';
 import { getProductionStateDurabilityAdapter, type StateDurabilityAdapter } from './durability.js';
+import { redactSecretDiagnostic, secretShaped } from './secrets.js';
 
 let testDurabilityAdapter: StateDurabilityAdapter | undefined;
 export function setConfigDurabilityAdapterForTesting(adapter: StateDurabilityAdapter | undefined): void { testDurabilityAdapter = adapter; }
@@ -318,8 +319,8 @@ export async function saveConfigAtomic(path: string, next: AgentContainersConfig
     try {
       await adapter.syncFile(temporary);
       await options.beforePublish?.();
-      // The lock only coordinates Agent Containers writers. Recheck immediately
-      // before visibility so an independent writer cannot be silently replaced.
+      // The lock coordinates Agent Containers writers; this detects independent
+      // changes observed before the platform's final replacement boundary.
       const final = await readFile(path, 'utf8').catch((error: unknown) => {
         if (isNodeError(error, 'ENOENT')) return undefined;
         throw error;
@@ -330,8 +331,7 @@ export async function saveConfigAtomic(path: string, next: AgentContainersConfig
       await options.afterCheckBeforePublish?.();
       if (expectedCurrentHash !== undefined) {
         // The durable lock serializes cooperating Agent Containers writers.
-        // Independent writers are checked above, but POSIX has no external
-        // content-CAS after that final observation.
+        // No portable external content-CAS exists after the final observation.
         if (expectedCurrentHash === null && await adapter.publicationMode() === 'recoverable') {
           if (!adapter.moveFileNoReplaceWriteThrough) throw new Error('Native write-through no-replace publication is unavailable; refusing first configuration publication.');
           await adapter.moveFileNoReplaceWriteThrough(temporary, path);
@@ -470,7 +470,7 @@ function requiredBoolean(value: unknown, label: string): boolean { if (typeof va
 function requiredInteger(value: unknown, label: string, minimum: number, maximum = Number.MAX_SAFE_INTEGER): number { if (typeof value !== 'number' || !Number.isInteger(value) || value < minimum || value > maximum) throw new Error(`Invalid configuration: ${label} must be an integer between ${minimum} and ${maximum}`); return value; }
 function requiredStrings(value: unknown, label: string): string[] {
   if (!Array.isArray(value) || value.some((entry) => typeof entry !== 'string' || !nonEmptyString(entry) || entry.includes('\0'))) throw new Error(`Invalid configuration: ${label} must be an array of non-empty safe strings`);
-  if (label !== 'secrets.allowedRemoteSecretNames' && value.some(secretShaped)) throw new Error(`Invalid configuration: ${label} contains a secret-shaped value`);
+  if (label !== 'secrets.allowedRemoteSecretNames' && label !== 'readiness.command' && value.some(secretShaped)) throw new Error(`Invalid configuration: ${label} contains a secret-shaped value`);
   return value as string[];
 }
 
@@ -490,15 +490,12 @@ function rejectCredentialArgv(argv: string[], label: string): void {
     if ((value === '-H' || value === '--header') && /^authorization\s*:/i.test(argv[index + 1] ?? '')) {
       throw new Error(`Invalid configuration: ${label} contains a credential header`);
     }
+    if (secretShaped(value) && /^authorization\s*:/i.test(value)) throw new Error(`Invalid configuration: ${label} contains a secret-shaped value`);
     if (/^authorization\s*:/i.test(value) || (/^bearer$/i.test(value) && /^authorization\s*:/i.test(argv[index - 1] ?? ''))) {
       throw new Error(`Invalid configuration: ${label} contains a credential header`);
     }
+    if (secretShaped(value)) throw new Error(`Invalid configuration: ${label} contains a secret-shaped value`);
   }
-}
-
-/** Setup accepts policy, never credential values or fragments. */
-function secretShaped(value: string): boolean {
-  return /(?:-----BEGIN [A-Z ]*PRIVATE KEY-----|\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|glpat-[A-Za-z0-9_-]{20,}|sk-[A-Za-z0-9_-]{20,})\b|\bauthorization\s*:\s*bearer(?:\s+\S+)?|\b(?:access[-_]?token|client[-_]?secret|token|password|secret|api[_-]?key)\s*[:=]\s*\S+)/i.test(value);
 }
 
 function safeField(value: string): string { return secretShaped(value) || /(?:token|password|secret|credential|key)/i.test(value) ? '[redacted]' : value; }
@@ -519,12 +516,7 @@ function syntaxError(prefix: string, error: unknown): Error {
 
 /** Never render input-derived diagnostics verbatim at a command boundary. */
 export function redactDiagnostic(value: string): string {
-  return value
-    .replace(/https?:\/\/[^\s]+/gi, '[url redacted]')
-    .replace(/\b(?:authorization|token|access[-_]?token|password|secret|client[-_]?secret|api[_-]?key)\s*[:=]\s*(?:Bearer\s+)?[^\s,'"\]]+/gi, '[credential redacted]')
-    .replace(/(?:--(?:token|access-token|password|secret|client-secret|api[-_]key))\s+[^\s,'"\]]+/gi, '$1 [redacted]')
-    .replace(/\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|glpat-[A-Za-z0-9_-]{20,}|sk-[A-Za-z0-9_-]{20,})\b/g, '[credential redacted]')
-    .slice(0, 1024);
+  return redactSecretDiagnostic(value);
 }
 
 function nonEmptyString(value: unknown): value is string {

@@ -161,6 +161,16 @@ test('configuration rejects compound credential argv and never exposes malformed
   assert.doesNotMatch(preview, /sentinel-secret-value/);
 });
 
+test('configuration rejects authorization and bearer assignment keys before validating commands or unknown keys', () => {
+  for (const key of ['Authorization=SETUP_KEY_SENTINEL', 'authorization=Bearer SETUP_KEY_SENTINEL', 'AUTH=SETUP_KEY_SENTINEL', 'bearer=SETUP_KEY_SENTINEL']) {
+    const legacy = { version: 1, workspace: { worktreeRoot: 'worktrees', baseBranch: 'main' }, environment: { devcontainerPath: '.devcontainer/devcontainer.json' }, commands: { [key]: '' } };
+    assert.throws(() => parseConfig(JSON.stringify(legacy)), (error: Error) => !error.message.includes('SETUP_KEY_SENTINEL'));
+    const unknown = { ...codespaces, [key]: 'value' };
+    assert.throws(() => parseConfig(JSON.stringify(unknown)), (error: Error) => !error.message.includes('SETUP_KEY_SENTINEL'));
+  }
+  assert.doesNotThrow(() => parseConfig(JSON.stringify({ version: 1, workspace: { worktreeRoot: 'worktrees', baseBranch: 'main' }, environment: { devcontainerPath: '.devcontainer/devcontainer.json' }, commands: { test: 'npm test' } })));
+});
+
 test('YAML syntax diagnostics reveal only sanitized locations for direct, file, and CLI input', async () => {
   const sentinel = 'UNKNOWN_SOURCE_SENTINEL';
   const malformed = `commands:\n  ${sentinel}: [\n`;
@@ -229,6 +239,25 @@ test('local doctor reports a no-container workspace with every manual recovery r
   } finally { setStateDurabilityAdapterForTesting(undefined); }
 });
 
+test('doctor treats malformed, checksum-invalid, and unreadable recovery journals as action-required instead of stopped', async () => {
+  const stateDir = join(await mkdtemp(join(tmpdir(), 'agent-containers-doctor-corrupt-recovery-')), 'state');
+  const root = '/repo';
+  setStateDurabilityAdapterForTesting(durability);
+  try {
+    for (const [name, journal] of [['malformed', '{not json}\n'], ['checksum', `${JSON.stringify({ event: 'clear', checksum: 'wrong' })}\n`], ['unreadable', undefined]] as const) {
+      await saveMetadata(stateDir, { version: 1, name, repoRoot: root, worktree: `${root}/worktrees/${name}`, branch: `agent-containers/${name}`, baseRef: 'refs/heads/main', devcontainerPath: '.devcontainer/devcontainer.json', createdAt: '2026-01-01T00:00:00.000Z' });
+      const journalPath = join(stateDir, 'locks', `${name}.manual-recovery.journal`);
+      if (journal === undefined) await mkdir(journalPath);
+      else await writeFile(journalPath, journal);
+      const report = await doctor({ version: 1, workspace: { worktreeRoot: 'worktrees', baseBranch: 'main' }, environment: { devcontainerPath: '.devcontainer/devcontainer.json' }, commands: {} }, 'local', { async run(_command, args) { return { code: 0, stdout: args[0] === 'rev-parse' ? `${root}\n` : '--relative-paths\n', stderr: '' }; } }, root, { stateDir, workspaceName: name });
+      const recovery = report.checks.find((check) => check.id === 'local.workspace.recovery');
+      assert.equal(recovery?.state, 'action-required');
+      assert.match(recovery?.summary ?? '', /manual recovery journal is unreadable or corrupt/i);
+      assert.equal(report.checks.find((check) => check.id === 'local.workspace.runtime'), undefined);
+    }
+  } finally { setStateDurabilityAdapterForTesting(undefined); }
+});
+
 test('v2 setup drafts may omit discovered evidence, while persisted v2 configurations may not', () => {
   const draft = structuredClone(codespaces);
   delete draft.project.expectedOid;
@@ -288,6 +317,24 @@ test('expected-absence publication preserves an external writer arriving after t
     afterCheckBeforePublish: async () => { await writeFile(path, 'external post-check edit'); },
   }), /changed concurrently/);
   assert.equal(await readFile(path, 'utf8'), 'external post-check edit');
+});
+
+test('recoverable replacement documents the unavoidable post-check external writer race while first publication remains no-replace', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'agent-containers-config-windows-race-'));
+  const path = join(directory, '.agent-containers.yml');
+  await writeFile(path, JSON.stringify(codespaces));
+  const expected = (await import('../src/config.js')).hashConfig(await readFile(path, 'utf8'));
+  const replacement = structuredClone(codespaces);
+  replacement.backends.codespaces.machine = 'basicLinux32gb';
+  const recoverable: StateDurabilityAdapter = { ...durability, publicationMode: async () => 'recoverable', moveFileWriteThrough: async (source, destination) => { await rename(source, destination); }, moveFileNoReplaceWriteThrough: async (source, destination) => { await rename(source, destination); } };
+  assert.equal(await saveConfigAtomic(path, replacement, expected, {
+    durabilityAdapter: recoverable,
+    afterCheckBeforePublish: async () => { await writeFile(path, 'independent external replacement'); },
+  }), 'saved');
+  assert.deepEqual(parseConfig(await readFile(path, 'utf8')), replacement);
+  const first = join(directory, 'first.yml');
+  assert.equal(await saveConfigAtomic(first, codespaces, null, { durabilityAdapter: recoverable }), 'saved');
+  assert.deepEqual(parseConfig(await readFile(first, 'utf8')), codespaces);
 });
 
 test('discovery scans the resolved immutable OID rather than a moving tracking ref', async () => {

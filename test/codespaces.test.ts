@@ -51,6 +51,18 @@ test('provider diagnostics redact URLs, query strings, and credential-shaped val
   await assert.rejects(() => provider.actor(), (error: Error) => !error.message.includes('https://') && !error.message.includes('secret-value') && !error.message.includes('ghp_'));
 });
 
+test('provider rejects credential-shaped selectors and response metadata before disclosure', async () => {
+  const sentinel = 'glpat-THIS_IS_A_PROVIDER_SENTINEL_12345';
+  const calls: string[][] = [];
+  const provider = new GhCodespacesProvider({ async run(command, args) { calls.push([command, ...args]); return { code: 0, stdout: '{}', stderr: '' }; } });
+  await assert.rejects(() => provider.get(`sk-${'x'.repeat(24)}`), (error: Error) => !error.message.includes('x'.repeat(24)));
+  await assert.rejects(() => provider.resolveRef(`owner/${sentinel}`, 'refs/heads/main'), (error: Error) => !error.message.includes(sentinel));
+  await assert.rejects(() => provider.machines('owner/repo', `Authorization=${sentinel}`), (error: Error) => !error.message.includes(sentinel));
+  assert.deepEqual(calls, []);
+  const hostile = new GhCodespacesProvider({ async run() { return { code: 0, stdout: JSON.stringify({ id: '1', login: sentinel }), stderr: '' }; } });
+  await assert.rejects(() => hostile.actor(), (error: Error) => !error.message.includes(sentinel));
+});
+
 test('provider proves a regular Git-tree blob rather than trusting API-followed contents', async () => {
   const provider = new GhCodespacesProvider({ async run() {
     return { code: 0, stdout: JSON.stringify({ tree: [{ path: '.devcontainer/devcontainer.json', mode: '120000', type: 'blob', sha: 'abcdefabcdefabcdefabcdefabcdefabcdefabcd' }] }), stderr: '' };
