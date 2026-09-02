@@ -24,6 +24,7 @@ for (const operation of ['saveMetadata', 'withWorkspaceLock', 'recordManualRecov
 }
 assert.match(nativeSmoke, /appendFile\(/, 'native smoke must append a truncated journal tail after a production recovery record');
 assert.match(nativeSmoke, /truncated journal tail/i, 'native smoke must prove that production reads preserve the earlier recovery record after a truncated tail');
+assert.match(nativeSmoke, /containerIds: \['a'\.repeat\(64\)\]/, 'native smoke must persist and reload a canonical Docker container ID rather than a filtered hint');
 
 assert.match(packageJson.scripts['test:native'], /node scripts\/test-native\.mjs/, 'source-native CI must execute the lifecycle smoke script');
 assert.match(workflow, /- run: npm run test:native/, 'each native build matrix runner must execute the lifecycle smoke script');

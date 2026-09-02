@@ -14,6 +14,8 @@ export interface ProcessResult {
   code: number;
   stdout: string;
   stderr: string;
+  /** Set only by runners that observed child close before resolving the result. */
+  terminal?: true;
 }
 
 export interface ProcessOutputEvent {
@@ -31,6 +33,8 @@ export interface ProcessRunOptions {
   onOutput?: (event: ProcessOutputEvent) => void;
   /** Aborts the active process, which is reaped before run() settles. */
   signal?: AbortSignal;
+  /** Lifecycle transports require a durable recovery boundary if local reaping is unconfirmed. */
+  kind?: 'lifecycle' | 'readonly-probe';
 }
 
 export interface ProcessRunner {

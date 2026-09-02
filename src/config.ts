@@ -2,7 +2,7 @@ import { lstat, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { basename, dirname, isAbsolute, join, posix, win32 } from 'node:path';
 import { parse } from 'yaml';
-import type { AgentContainersConfig, ProcessResult, ProcessRunner } from './types.js';
+import type { AgentContainersConfig, ProcessResult, ProcessRunner, ProcessRunOptions } from './types.js';
 
 export const CONFIG_OUTLINE = `# Agent Containers workspace configuration (schema version 1).
 # workspace.worktreeRoot is relative to the source repository unless absolute.
@@ -99,14 +99,15 @@ export async function loadConfig(path: string): Promise<AgentContainersConfig> {
 }
 
 /** Verify that every newly-created linked worktree receives the configured file. */
-export async function assertDevcontainerPathCommittedOnBaseBranch(config: AgentContainersConfig, repoRoot: string, runner: ProcessRunner, baseBranch = config.workspace.baseBranch): Promise<void> {
+export async function assertDevcontainerPathCommittedOnBaseBranch(config: AgentContainersConfig, repoRoot: string, runner: ProcessRunner, baseBranch = config.workspace.baseBranch, kind: ProcessRunOptions['kind'] = 'readonly-probe', signal?: AbortSignal): Promise<void> {
   const path = safeRepositoryPath(config.environment.devcontainerPath);
   if (!path) throw new Error('environment.devcontainerPath must be a safe repository-relative path.');
   const baseRef = `refs/heads/${baseBranch}`;
-  const branch = await runner.run('git', ['show-ref', '--verify', '--quiet', baseRef], { cwd: repoRoot });
+  const options = signal ? { cwd: repoRoot, kind, signal } : { cwd: repoRoot, kind };
+  const branch = await runner.run('git', ['show-ref', '--verify', '--quiet', baseRef], options);
   if (branch.code === 1) throw new Error(`Configured local base branch "${baseBranch}" does not exist.`);
   if (branch.code !== 0) throw gitCommandError('git show-ref', branch);
-  const committed = await runner.run('git', ['ls-tree', '-z', baseRef, '--', path], { cwd: repoRoot });
+  const committed = await runner.run('git', ['ls-tree', '-z', baseRef, '--', path], options);
   if (committed.code !== 0) throw gitCommandError('git ls-tree', committed);
   const entry = gitTreeEntry(committed.stdout, path);
   if (!entry) {

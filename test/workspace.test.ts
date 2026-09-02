@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, realpath, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { validateWorkspaceName } from '../src/names.js';
-import { createWorkspace, type ProcessRunner } from '../src/workspaces.js';
+import { createWorkspace, type ProcessRunner, UnconfirmedProcessReapError } from '../src/workspaces.js';
+import { loadManualRecovery, recordManualRecovery, withWorkspaceLock } from '../src/state.js';
 import type { AgentContainersConfig } from '../src/types.js';
 
 test('CI captures git worktree help even though Git exits 129', async () => {
@@ -21,7 +22,7 @@ test('validateWorkspaceName rejects unsafe names', () => {
 });
 
 test('createWorkspace only accepts and records a verified canonical local base ref', async () => {
-  const directory = await mkdtemp(join(tmpdir(), 'agent-containers-base-ref-'));
+  const directory = await realpath(await mkdtemp(join(tmpdir(), 'agent-containers-base-ref-')));
   const config: AgentContainersConfig = { version: 1, workspace: { worktreeRoot: 'worktrees', baseBranch: 'main' }, environment: { devcontainerPath: '.devcontainer/devcontainer.json' }, commands: {} };
   for (const base of ['origin/main', 'refs/tags/v1', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa']) {
     const calls: string[][] = [];
@@ -53,7 +54,7 @@ test('createWorkspace only accepts and records a verified canonical local base r
 
 
 test('createWorkspace uses relative Git directory pointers when Git supports them', async () => {
-  const directory = await mkdtemp(join(tmpdir(), 'agent-containers-workspace-'));
+  const directory = await realpath(await mkdtemp(join(tmpdir(), 'agent-containers-workspace-')));
   const calls: Array<{ command: string; args: string[]; cwd?: string; stdio?: string }> = [];
   const runner: ProcessRunner = {
     async run(command, args, options) {
@@ -65,7 +66,7 @@ test('createWorkspace uses relative Git directory pointers when Git supports the
     },
   };
   await createWorkspace({ cwd: directory, name: 'relative', config: { version: 1, workspace: { worktreeRoot: 'worktrees', baseBranch: 'main' }, environment: { devcontainerPath: '.devcontainer/devcontainer.json' }, commands: {} }, stateDir: join(directory, 'state'), runner });
-  assert.deepEqual(calls.at(-1), { command: 'git', args: ['worktree', 'add', '--relative-paths', '-b', 'agent-containers/relative', join(directory, 'worktrees', 'relative'), 'refs/heads/main'], cwd: directory });
+  assert.deepEqual(calls.at(-1), { command: 'git', args: ['worktree', 'add', '--relative-paths', '-b', 'agent-containers/relative', join(directory, 'worktrees', 'relative'), 'refs/heads/main'], cwd: directory, kind: 'lifecycle' });
 });
 
 test('createWorkspace refuses to create a linked worktree when Git lacks relative Git directory pointers', async () => {
@@ -116,6 +117,60 @@ test('createWorkspace reports exact branch and worktree recovery details after a
   assert.equal(calls.some((args) => args[0] === 'branch' && args[1] === '-D'), false);
 });
 
+test('create lifecycle preserves unconfirmed worktree-add reaping without probes and records durable recovery', async () => {
+  const directory = await realpath(await mkdtemp(join(tmpdir(), 'agent-containers-add-unconfirmed-')));
+  const stateDir = join(directory, 'state');
+  const calls: string[][] = [];
+  const controller = new AbortController();
+  const runner: ProcessRunner = {
+    async run(_command, args, options) {
+      calls.push(args);
+      assert.equal(options?.kind, 'lifecycle');
+      assert.ok(options?.signal, 'the create lifecycle passes its lock signal to every Git command');
+      if (args[0] === 'rev-parse') return { code: 0, stdout: `${directory}\n`, stderr: '' };
+      if (args[0] === 'show-ref') return { code: args.at(-1) === 'refs/heads/main' ? 0 : 1, stdout: '', stderr: '' };
+      if (args.at(-1) === '-h') return { code: 129, stdout: '', stderr: '--[no-]relative-paths\n' };
+      if (args[0] === 'worktree' && args[1] === 'add') throw new UnconfirmedProcessReapError();
+      throw new Error(`unexpected probe after uncertain reaping: ${args.join(' ')}`);
+    },
+  };
+
+  await assert.rejects(
+    () => withWorkspaceLock(
+      stateDir,
+      'partial',
+      (signal) => createWorkspace({ cwd: directory, name: 'partial', config: { version: 1, workspace: { worktreeRoot: 'worktrees', baseBranch: 'main' }, environment: { devcontainerPath: '.devcontainer/devcontainer.json' }, commands: {} }, stateDir, runner, signal }),
+      { abortSignal: controller.signal, onUnconfirmedProcessReap: () => recordManualRecovery(stateDir, 'partial', { reason: 'local-process-reap-unconfirmed', containerIds: [], worktree: directory }) },
+    ),
+    UnconfirmedProcessReapError,
+  );
+  assert.deepEqual(calls.at(-1), ['worktree', 'add', '--relative-paths', '-b', 'agent-containers/partial', join(directory, 'worktrees', 'partial'), 'refs/heads/main']);
+  assert.equal((await loadManualRecovery(stateDir, 'partial'))?.reason, 'local-process-reap-unconfirmed');
+});
+
+test('create preserves an unconfirmed reap from the branch recovery probe without launching the worktree probe', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'agent-containers-add-probe-unconfirmed-'));
+  const calls: string[][] = [];
+  let addAttempted = false;
+  const runner: ProcessRunner = {
+    async run(_command, args) {
+      calls.push(args);
+      if (args[0] === 'rev-parse') return { code: 0, stdout: `${directory}\n`, stderr: '' };
+      if (args[0] === 'show-ref' && args.at(-1) === 'refs/heads/main') return { code: 0, stdout: '', stderr: '' };
+      if (args[0] === 'show-ref' && !addAttempted) return { code: 1, stdout: '', stderr: '' };
+      if (args.at(-1) === '-h') return { code: 129, stdout: '', stderr: '--[no-]relative-paths\n' };
+      if (args[0] === 'worktree' && args[1] === 'add') { addAttempted = true; return { code: 1, stdout: '', stderr: 'add failed' }; }
+      if (args[0] === 'show-ref') throw new UnconfirmedProcessReapError();
+      throw new Error(`worktree probe must not run after uncertain branch probe: ${args.join(' ')}`);
+    },
+  };
+  await assert.rejects(
+    () => createWorkspace({ cwd: directory, name: 'partial', config: { version: 1, workspace: { worktreeRoot: 'worktrees', baseBranch: 'main' }, environment: { devcontainerPath: '.devcontainer/devcontainer.json' }, commands: {} }, stateDir: join(directory, 'state'), runner }),
+    UnconfirmedProcessReapError,
+  );
+  assert.equal(calls.some((args) => args[0] === 'worktree' && args[1] === 'list'), false);
+});
+
 
 test('createWorkspace preserves its worktree and branch if metadata persistence fails rather than force-deleting user data', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'agent-containers-workspace-'));
@@ -127,7 +182,7 @@ test('createWorkspace preserves its worktree and branch if metadata persistence 
 });
 
 test('createWorkspace constructs git commands through the injected runner and writes metadata', async () => {
-  const directory = await mkdtemp(join(tmpdir(), 'agent-containers-workspace-'));
+  const directory = await realpath(await mkdtemp(join(tmpdir(), 'agent-containers-workspace-')));
   const stateDir = join(directory, 'state');
   const calls: Array<{ command: string; args: string[] }> = [];
   const runner: ProcessRunner = {

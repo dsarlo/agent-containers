@@ -63,7 +63,7 @@ napi_value PathResult(napi_env env, bool ok, const std::string& path, const char
   return result;
 }
 
-napi_value MoveResult(napi_env env, bool ok, const std::string& source, const std::string& destination, const char* method, const std::string& error = {}) {
+napi_value MoveResult(napi_env env, bool ok, const std::string& source, const std::string& destination, const char* method, const std::string& error = {}, const char* code = nullptr) {
   napi_value result;
   napi_create_object(env, &result);
   SetBool(env, result, "ok", ok);
@@ -71,6 +71,7 @@ napi_value MoveResult(napi_env env, bool ok, const std::string& source, const st
   Set(env, result, "destination", String(env, destination));
   Set(env, result, "method", String(env, method));
   if (!error.empty()) Set(env, result, "error", String(env, error));
+  if (code != nullptr) Set(env, result, "code", String(env, code));
   return result;
 }
 
@@ -87,6 +88,15 @@ std::string WinError(DWORD error) {
   char buffer[256] = {};
   const DWORD count = FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, nullptr, error, 0, buffer, sizeof(buffer), nullptr);
   return count == 0 ? "Windows error " + std::to_string(error) : std::string(buffer, count);
+}
+
+std::string ToUtf8(const std::wstring& value) {
+  if (value.empty()) return {};
+  const int required = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, value.c_str(), static_cast<int>(value.size()), nullptr, 0, nullptr, nullptr);
+  if (required == 0) return {};
+  std::string result(required, '\0');
+  if (WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, value.c_str(), static_cast<int>(value.size()), result.data(), required, nullptr, nullptr) == 0) return {};
+  return result;
 }
 #endif
 
@@ -152,9 +162,31 @@ napi_value MoveFileWriteThrough(napi_env env, napi_callback_info info) {
   const std::wstring wideDestination = ToWide(destination);
   if (wideSource.empty() || wideDestination.empty()) return MoveResult(env, false, source, destination, "move-file-write-through", "Paths are not valid UTF-8.");
   const bool ok = MoveFileExW(wideSource.c_str(), wideDestination.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
-  return MoveResult(env, ok, source, destination, "move-file-write-through", ok ? "" : WinError(GetLastError()));
+  const DWORD error = ok ? ERROR_SUCCESS : GetLastError();
+  const char* code = error == ERROR_ALREADY_EXISTS || error == ERROR_FILE_EXISTS ? "EEXIST" : nullptr;
+  return MoveResult(env, ok, source, destination, "move-file-write-through", ok ? "" : WinError(error), code);
 #else
   return MoveResult(env, false, source, destination, "unsupported", "Write-through rename is only available through MoveFileExW on Windows.");
+#endif
+}
+
+napi_value WindowsDirectory(napi_env env, napi_callback_info) {
+#ifdef _WIN32
+  std::vector<wchar_t> buffer(MAX_PATH);
+  while (true) {
+    const UINT length = GetWindowsDirectoryW(buffer.data(), static_cast<UINT>(buffer.size()));
+    if (length == 0) {
+      napi_value undefined;
+      napi_get_undefined(env, &undefined);
+      return undefined;
+    }
+    if (length < buffer.size()) return String(env, ToUtf8(std::wstring(buffer.data(), length)));
+    buffer.resize(static_cast<size_t>(length) + 1);
+  }
+#else
+  napi_value undefined;
+  napi_get_undefined(env, &undefined);
+  return undefined;
 #endif
 }
 
@@ -163,6 +195,7 @@ napi_value Init(napi_env env, napi_value exports) {
       {"capabilities", nullptr, Capabilities, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"syncPath", nullptr, SyncPath, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"moveFileWriteThrough", nullptr, MoveFileWriteThrough, nullptr, nullptr, nullptr, napi_default, nullptr},
+      {"windowsDirectory", nullptr, WindowsDirectory, nullptr, nullptr, nullptr, napi_default, nullptr},
   };
   napi_define_properties(env, exports, sizeof(properties) / sizeof(properties[0]), properties);
   return exports;

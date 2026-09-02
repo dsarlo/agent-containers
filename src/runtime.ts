@@ -2,7 +2,9 @@ import { readFile, realpath } from 'node:fs/promises';
 import { parse, type ParseError } from 'jsonc-parser';
 import { isAbsolute, relative, resolve } from 'node:path';
 import type { ProcessOutputEvent, ProcessResult, ProcessRunner, ProcessRunOptions } from './types.js';
-import { bootstrapManualRecoveryJournal, clearManualRecovery, loadMetadata, recordManualRecovery, saveMetadata, withWorkspaceLock, type WorkspaceMetadata } from './state.js';
+import { bootstrapManualRecoveryJournal, clearManualRecovery, isCanonicalContainerId, loadMetadata, recordManualRecovery, saveMetadata, withWorkspaceLock, type WorkspaceMetadata } from './state.js';
+import { resolveDevcontainerInvocation, type DevcontainerInvocation } from './devcontainer.js';
+import { UnconfirmedProcessReapError } from './workspaces.js';
 
 export type { ProcessRunner } from './types.js';
 
@@ -10,7 +12,7 @@ type DevcontainerConfig = Record<string, unknown>;
 
 /** Durable state required before releasing a lifecycle after remote completion is unknown. */
 export interface ManualRecovery {
-  reason: 'operation-may-be-active' | 'remote-exec-interrupted' | 'devcontainer-up-ambiguous';
+  reason: 'operation-may-be-active' | 'remote-exec-interrupted' | 'devcontainer-up-ambiguous' | 'local-process-reap-unconfirmed';
   containerIds: string[];
   worktree: string;
 }
@@ -25,18 +27,20 @@ const readDevcontainerConfig: ConfigReader = (path) => readFile(path, 'utf8');
 const resolveSyntheticPath: PathResolver = async (path) => path;
 
 /** Run the remote lifecycle under its durable workspace lock and recovery guard. */
-export async function execWorkspaceLifecycle(metadata: WorkspaceMetadata, command: string[], runner: ProcessRunner, save: (metadata: WorkspaceMetadata) => Promise<void>, stateDir: string, readConfig: ConfigReader = readDevcontainerConfig): Promise<ProcessResult> {
+export async function execWorkspaceLifecycle(metadata: WorkspaceMetadata, command: string[], runner: ProcessRunner, _save: (metadata: WorkspaceMetadata) => Promise<void>, stateDir: string, readConfig: ConfigReader = readDevcontainerConfig): Promise<ProcessResult> {
   return withWorkspaceLock(stateDir, metadata.name, async (signal) => {
+    const recorded = await loadMetadata(stateDir, metadata.name);
+    if (!recorded) throw new Error(`No Agent Containers workspace named "${metadata.name}".`);
     await requireInitializedRecoveryJournal(stateDir, metadata.name);
     return execWorkspace(
-    metadata,
-    command,
-    runner,
-    save,
-    readConfig,
-    signal,
-    (recovery) => recordManualRecovery(stateDir, metadata.name, recovery),
-    () => clearManualRecovery(stateDir, metadata.name),
+      recorded,
+      command,
+      runner,
+      (next) => saveMetadata(stateDir, next),
+      readConfig,
+      signal,
+      (recovery) => recordManualRecovery(stateDir, recorded.name, recovery),
+      () => clearManualRecovery(stateDir, recorded.name),
     );
   });
 }
@@ -60,53 +64,56 @@ export async function execNamedWorkspaceLifecycle(name: string, command: string[
   });
 }
 
-export async function execWorkspace(metadata: WorkspaceMetadata, command: string[], runner: ProcessRunner, save: (metadata: WorkspaceMetadata) => Promise<void>, readConfig: ConfigReader = readDevcontainerConfig, signal?: AbortSignal, recordRecovery: RecoveryRecorder = missingRecoveryRecorder, clearRecovery: RecoveryClearer = missingRecoveryClearer, resolvePath: PathResolver = readConfig === readDevcontainerConfig ? realpath : resolveSyntheticPath): Promise<ProcessResult> {
+export async function execWorkspace(metadata: WorkspaceMetadata, command: string[], runner: ProcessRunner, save: (metadata: WorkspaceMetadata) => Promise<void>, readConfig: ConfigReader = readDevcontainerConfig, signal?: AbortSignal, recordRecovery: RecoveryRecorder = missingRecoveryRecorder, clearRecovery: RecoveryClearer = missingRecoveryClearer, resolvePath: PathResolver = readConfig === readDevcontainerConfig ? realpath : resolveSyntheticPath, devcontainer?: DevcontainerInvocation): Promise<ProcessResult> {
   if (command.length === 0) throw new Error('A command is required after --.');
+  if (metadata.containerId !== undefined && !isCanonicalContainerId(metadata.containerId)) throw new Error(`Workspace ${metadata.name} has a legacy or non-canonical container ID. Verify the container manually, then clear or repair the recorded metadata before running lifecycle commands.`);
   const configPath = await resolveDevcontainerConfigPath(metadata.worktree, metadata.devcontainerPath, resolvePath);
   await assertSupportedDevcontainerConfig(configPath, readConfig);
+  const invocation = devcontainer ?? (readConfig === readDevcontainerConfig ? resolveDevcontainerInvocation() : { command: 'devcontainer', prefixArgs: [] });
   await recordRecovery({ reason: 'operation-may-be-active', containerIds: [], worktree: metadata.worktree });
   let up: ProcessResult;
   try {
-    up = await runner.run('devcontainer', ['up', '--workspace-folder', metadata.worktree, '--config', configPath, '--log-format', 'json', '--mount-git-worktree-common-dir'], withSignal({ stdio: 'pipe', onOutput: createDevcontainerProgressReporter((message) => process.stderr.write(`${message}\n`)) }, signal));
+    up = await runner.run(invocation.command, [...invocation.prefixArgs, 'up', '--workspace-folder', metadata.worktree, '--config', configPath, '--log-format', 'json', '--mount-git-worktree-common-dir'], withSignal({ kind: 'lifecycle', stdio: 'pipe', onOutput: createDevcontainerProgressReporter((message) => process.stderr.write(`${message}\n`)) }, signal));
   } catch (error: unknown) {
+    if (error instanceof UnconfirmedProcessReapError) return unconfirmedReapRecovery(metadata, recordRecovery, error.message);
     return ambiguousUpRecovery(metadata, runner, save, recordRecovery, `devcontainer up did not return a trustworthy terminal outcome: ${error instanceof Error ? error.message : String(error)}`);
   }
   if (up.code !== 0) return ambiguousUpRecovery(metadata, runner, save, recordRecovery, devcontainerUpFailureDetail(up));
   const containerId = containerIdFromOutput(up.stdout);
   if (!containerId) return ambiguousUpRecovery(metadata, runner, save, recordRecovery, 'devcontainer up completed without a trustworthy terminal containerId');
-  if (metadata.containerId !== containerId) try {
+  let ownership: boolean;
+  try {
+    ownership = await inspectOwnedContainer(metadata, containerId, runner, signal);
+  } catch (error: unknown) {
+    const detail = error instanceof Error ? error.message : String(error);
+    return recordAmbiguousUp(recordRecovery, metadata, metadata.containerId === undefined ? [containerId] : [metadata.containerId, containerId], `Docker could not verify Dev Containers returned container ${containerId}: ${detail}`);
+  }
+  if (!ownership) return recordAmbiguousUp(recordRecovery, metadata, [containerId], `Docker could not prove that Dev Containers returned container ${containerId} with the exact recorded worktree label`);
+  if (metadata.containerId !== undefined && metadata.containerId !== containerId) {
+    return recordAmbiguousUp(recordRecovery, metadata, [metadata.containerId, containerId], `Recorded container ${metadata.containerId} does not match Dev Containers returned container ${containerId}; an exact worktree label does not authorize replacing a recorded workspace resource`);
+  }
+  if (metadata.containerId === undefined) try {
     await save({ ...metadata, containerId });
   } catch (error: unknown) {
     const detail = error instanceof Error ? error.message : String(error);
-    const cleanupSignal = AbortSignal.timeout(5_000);
-    let inspection: ProcessResult;
-    try {
-      inspection = await runner.run('docker', ['inspect', '--format', '{{ index .Config.Labels "devcontainer.local_folder" }}', containerId], withSignal(undefined, cleanupSignal));
-    } catch (inspectionError: unknown) {
-      const inspectionDetail = inspectionError instanceof Error ? inspectionError.message : String(inspectionError);
-      throw new Error(`Could not persist container metadata (${detail}); did not remove unverified container ${containerId} because Docker inspection failed: ${inspectionDetail}. The manual recovery block remains in place.`, { cause: inspectionError });
-    }
-    if (inspection.code !== 0 || inspection.stdout.trim() !== metadata.worktree) {
-      const inspectionDetail = inspection.code !== 0 ? commandDetail(inspection) : 'its devcontainer.local_folder label does not exactly match the recorded worktree';
-      throw new Error(`Could not persist container metadata (${detail}); did not remove unverified container ${containerId} because ${inspectionDetail}. The manual recovery block remains in place.`, { cause: error });
-    }
-    let cleanup: ProcessResult;
-    try {
-      cleanup = await runner.run('docker', ['rm', '-f', containerId], withSignal(undefined, cleanupSignal));
-    } catch (cleanupError: unknown) {
-      const cleanupDetail = cleanupError instanceof Error ? cleanupError.message : String(cleanupError);
-      throw new Error(`Could not persist container metadata (${detail}) and could not remove untracked container ${containerId}: ${cleanupDetail}.`, { cause: cleanupError });
-    }
-    if (cleanup.code !== 0) {
-      const cleanupDetail = cleanup.stderr.trim() || cleanup.stdout.trim() || `exit code ${cleanup.code}`;
-      throw new Error(`Could not persist container metadata (${detail}) and could not remove untracked container ${containerId}: ${cleanupDetail}.`, { cause: error });
-    }
-    throw new Error(`Could not persist container metadata (${detail}); removed untracked container ${containerId}. Retry the command after fixing state storage.`, { cause: error });
+    // A matching local-folder label associates a container with this worktree,
+    // but does not prove this invocation created it. Preserve it as a hint only.
+    return recordAmbiguousUp(recordRecovery, metadata, [containerId], `Could not persist container metadata (${detail}); preserved container ${containerId} without adopting or removing it`);
   }
+  // `up` supplied an exact, inspected terminal ID. Promote that observation
+  // before dispatching `exec`, so a transport failure cannot leave an empty hint.
+  await recordRecovery({ reason: 'operation-may-be-active', containerIds: recoveryHints(metadata, [containerId]), worktree: metadata.worktree });
   // The CLI can only terminate its local transport. If it was interrupted, it
   // cannot truthfully assert that the command inside the container stopped.
-  const result = await runner.run('devcontainer', ['exec', '--workspace-folder', metadata.worktree, '--config', configPath, '--container-id', containerId, '--mount-git-worktree-common-dir', ...command], withSignal({ stdio: 'inherit' }, signal));
-  if (signal?.aborted) {
+  let result: ProcessResult;
+  try {
+    result = await runner.run(invocation.command, [...invocation.prefixArgs, 'exec', '--workspace-folder', metadata.worktree, '--config', configPath, '--container-id', containerId, '--mount-git-worktree-common-dir', ...command], withSignal({ kind: 'lifecycle', stdio: 'inherit' }, signal));
+  } catch (error: unknown) {
+    if (error instanceof UnconfirmedProcessReapError) return unconfirmedReapRecovery(metadata, recordRecovery, error.message, [containerId]);
+    throw error;
+  }
+  // Only a runner that observed child close can override a late ambient abort.
+  if (signal?.aborted && result.terminal !== true) {
     await recordRecovery({ reason: 'remote-exec-interrupted', containerIds: [containerId], worktree: metadata.worktree });
     throw new Error(`The local Dev Containers CLI was interrupted; the remote command may still be active in container ${containerId}. Agent Containers recorded a manual-recovery block and will not run lifecycle commands for ${metadata.name} until an operator verifies the remote command is stopped and clears it.`);
   }
@@ -119,14 +126,14 @@ export async function execWorkspace(metadata: WorkspaceMetadata, command: string
  * An aborted local `up` has no trustworthy terminal container ID. Query Docker
  * by the exact Dev Containers local-folder label, but never remove a result.
  */
-async function ambiguousUpRecovery(metadata: WorkspaceMetadata, runner: ProcessRunner, save: (metadata: WorkspaceMetadata) => Promise<void>, recordRecovery: RecoveryRecorder, outcome: string): Promise<never> {
+async function ambiguousUpRecovery(metadata: WorkspaceMetadata, runner: ProcessRunner, _save: (metadata: WorkspaceMetadata) => Promise<void>, recordRecovery: RecoveryRecorder, outcome: string): Promise<never> {
   const inspectionSignal = AbortSignal.timeout(5_000);
   const zeroCandidatePolls = 3;
   let matching: string[] = [];
   for (let attempt = 0; attempt < zeroCandidatePolls; attempt += 1) {
     let candidates: string[];
     try {
-      const listed = await runner.run('docker', ['ps', '--all', '--quiet', '--filter', `label=devcontainer.local_folder=${metadata.worktree}`], withSignal(undefined, inspectionSignal));
+        const listed = await runner.run('docker', ['ps', '--all', '--quiet', '--no-trunc', '--filter', `label=devcontainer.local_folder=${metadata.worktree}`], withSignal({ kind: 'readonly-probe' }, inspectionSignal));
       if (listed.code !== 0) return recordAmbiguousUp(recordRecovery, metadata, [], `Docker could not list candidate containers: ${commandDetail(listed)}`);
       candidates = listed.stdout.split(/\r?\n/).map((id) => id.trim()).filter(isDockerContainerId);
     } catch (error: unknown) {
@@ -136,9 +143,9 @@ async function ambiguousUpRecovery(metadata: WorkspaceMetadata, runner: ProcessR
     matching = [];
     for (const candidate of candidates) {
       try {
-        const inspected = await runner.run('docker', ['inspect', '--format', '{{ index .Config.Labels "devcontainer.local_folder" }}', candidate], withSignal(undefined, inspectionSignal));
+        const inspected = await runner.run('docker', ['inspect', '--format', '{{.Id}}\n{{ index .Config.Labels "devcontainer.local_folder" }}', candidate], withSignal({ kind: 'readonly-probe' }, inspectionSignal));
         if (inspected.code !== 0) return recordAmbiguousUp(recordRecovery, metadata, candidates, `Docker could not verify candidate ${candidate}: ${commandDetail(inspected)}`);
-        if (inspected.stdout.trim() === metadata.worktree) matching.push(candidate);
+        if (isOwnedContainerInspection(inspected.stdout, candidate, metadata.worktree)) matching.push(candidate);
       } catch (error: unknown) {
         return recordAmbiguousUp(recordRecovery, metadata, candidates, `Docker could not verify candidate ${candidate}: ${error instanceof Error ? error.message : String(error)}`);
       }
@@ -150,25 +157,35 @@ async function ambiguousUpRecovery(metadata: WorkspaceMetadata, runner: ProcessR
   if (matching.length === 0) {
     return recordAmbiguousUp(recordRecovery, metadata, [], `${outcome} and Docker found no container whose devcontainer.local_folder label exactly matches ${metadata.worktree}; provisioning may still be starting`);
   }
-  if (matching.length === 1) {
-    try {
-      if (metadata.containerId !== matching[0]) await save({ ...metadata, containerId: matching[0] });
-    } catch (error: unknown) {
-      return recordAmbiguousUp(recordRecovery, metadata, matching, `Found and preserved container ${matching[0]}, but could not persist its ID: ${error instanceof Error ? error.message : String(error)}`);
-    }
-  }
   return recordAmbiguousUp(recordRecovery, metadata, matching, matching.length === 1
-    ? `${outcome}. Found and recorded container ${matching[0]} with the exact worktree label, but the terminal outcome is ambiguous`
+    ? `${outcome}. Found container ${matching[0]} with the exact worktree label, but the terminal outcome is ambiguous and it was not adopted`
     : `${outcome}. Found ${matching.length} containers with the exact worktree label; ownership is ambiguous`);
 }
 
 async function recordAmbiguousUp(recordRecovery: RecoveryRecorder, metadata: WorkspaceMetadata, containerIds: string[], detail: string): Promise<never> {
-  await recordRecovery({ reason: 'devcontainer-up-ambiguous', containerIds, worktree: metadata.worktree });
+  await recordRecovery({ reason: 'devcontainer-up-ambiguous', containerIds: recoveryHints(metadata, containerIds), worktree: metadata.worktree });
   throw new Error(`${detail}. Agent Containers did not remove any container and recorded a manual recovery block; verify Docker state before clearing it.`);
 }
 
-function isDockerContainerId(value: string): boolean {
-  return /^[a-f0-9]{12,64}$/.test(value);
+function isDockerContainerId(value: string): boolean { return isCanonicalContainerId(value); }
+
+async function inspectOwnedContainer(metadata: WorkspaceMetadata, containerId: string, runner: ProcessRunner, signal?: AbortSignal): Promise<boolean> {
+  const inspection = await runner.run('docker', ['inspect', '--format', '{{.Id}}\n{{ index .Config.Labels "devcontainer.local_folder" }}', containerId], withSignal({ kind: 'readonly-probe' }, signal));
+  return inspection.code === 0 && isOwnedContainerInspection(inspection.stdout, containerId, metadata.worktree);
+}
+
+function isOwnedContainerInspection(output: string, containerId: string, worktree: string): boolean {
+  const [id, label, ...extra] = output.replace(/\r/g, '').trimEnd().split('\n');
+  return extra.length === 0 && id === containerId && label === worktree;
+}
+
+async function unconfirmedReapRecovery(metadata: WorkspaceMetadata, recordRecovery: RecoveryRecorder, detail: string, containerIds: string[] = []): Promise<never> {
+  await recordRecovery({ reason: 'local-process-reap-unconfirmed', containerIds: recoveryHints(metadata, containerIds), worktree: metadata.worktree });
+  throw new Error(`Local Dev Containers process reaping could not be confirmed: ${detail} Agent Containers recorded a manual-recovery block; verify the local process tree and remote container state, then explicitly acknowledge recovery before running another lifecycle operation.`);
+}
+
+function recoveryHints(metadata: WorkspaceMetadata, observed: string[]): string[] {
+  return [...new Set([metadata.containerId, ...observed].filter(isCanonicalContainerId))];
 }
 
 function commandDetail(result: ProcessResult): string {

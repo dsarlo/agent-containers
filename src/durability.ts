@@ -1,4 +1,4 @@
-import { resolve } from 'node:path';
+import { resolve, win32 } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 
@@ -26,6 +26,8 @@ export interface NativeMoveDurabilityResult {
   source: string;
   destination: string;
   method: 'move-file-write-through' | 'unsupported';
+  /** Stable filesystem error code when the native move did not publish. */
+  code?: 'EEXIST' | 'ENOTEMPTY';
   error?: string;
 }
 
@@ -33,6 +35,10 @@ export interface NativeDurabilityBinding {
   capabilities(): NativeDurabilityCapabilities | Promise<NativeDurabilityCapabilities>;
   syncPath(path: string): NativePathDurabilityResult | Promise<NativePathDurabilityResult>;
   moveFileWriteThrough(source: string, destination: string): NativeMoveDurabilityResult | Promise<NativeMoveDurabilityResult>;
+}
+
+interface NativeWindowsDirectoryBinding {
+  windowsDirectory(): string | undefined;
 }
 
 /** Boundary used by state writers; production resolves it from the packaged N-API addon. */
@@ -73,7 +79,11 @@ export function createNativeDurabilityAdapter(binding: NativeDurabilityBinding):
     },
     async moveFileWriteThrough(source: string, destination: string): Promise<void> {
       const result = await binding.moveFileWriteThrough(source, destination);
-      if (!result.ok) throw new Error(result.error ?? `Native write-through move failed for ${source} -> ${destination}.`);
+      if (!result.ok) {
+        const error = new Error(result.error ?? `Native write-through move failed for ${source} -> ${destination}.`);
+        if (result.code) Object.assign(error, { code: result.code });
+        throw error;
+      }
     },
   };
 }
@@ -101,6 +111,21 @@ export function nativeAddonPackageRoot(moduleUrl: string = import.meta.url): str
 export function getProductionStateDurabilityAdapter(): StateDurabilityAdapter {
   productionAdapter ??= loadProductionAdapter();
   return productionAdapter;
+}
+
+/** Return the Windows directory only when the packaged native bridge obtained it from the OS. */
+export function getAuthoritativeWindowsDirectory(): string | undefined {
+  if (process.platform !== 'win32') return undefined;
+  try {
+    const require = createRequire(import.meta.url);
+    const load = require('node-gyp-build') as (directory: string) => unknown;
+    const candidate = load(nativeAddonPackageRoot());
+    if (!isNativeWindowsDirectoryBinding(candidate)) return undefined;
+    const directory = candidate.windowsDirectory();
+    return typeof directory === 'string' && win32.isAbsolute(directory) ? directory : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function loadProductionAdapter(): StateDurabilityAdapter {
@@ -132,4 +157,9 @@ function isNativeDurabilityBinding(value: unknown): value is NativeDurabilityBin
     'capabilities' in value && typeof value.capabilities === 'function' &&
     'syncPath' in value && typeof value.syncPath === 'function' &&
     'moveFileWriteThrough' in value && typeof value.moveFileWriteThrough === 'function';
+}
+
+function isNativeWindowsDirectoryBinding(value: unknown): value is NativeWindowsDirectoryBinding {
+  return typeof value === 'object' && value !== null &&
+    'windowsDirectory' in value && typeof value.windowsDirectory === 'function';
 }
