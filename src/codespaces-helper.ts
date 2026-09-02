@@ -242,9 +242,17 @@ export interface RemoteHelperBootstrapResult {
 export async function bootstrapRemoteHelper(deps: RemoteHelperBootstrapDependencies): Promise<RemoteHelperBootstrapResult> {
   const now = deps.now ?? (() => new Date().toISOString());
   const known = await loadLocalHelperBootstrap(deps.stateDir, deps.workspaceName);
-  if (deps.verifyKnown && known && known.sha256 && known.protocolVersion === HELPER_PROTOCOL_VERSION && known.arch) {
-    await inspectRemoteHelper(deps, known.arch, known.file);
-    return knownResult(known, now());
+  if (deps.verifyKnown && known) {
+    const artifact = await loadHelperArtifact(deps.root, known.arch);
+    const expectedPath = helperRemotePath(deps.workspaceId, artifact.entry.file);
+    if (known.workspaceName !== deps.workspaceName || known.workspaceId !== deps.workspaceId
+      || known.file !== artifact.entry.file || known.binPath !== expectedPath
+      || known.sha256 !== artifact.entry.sha256 || known.protocolVersion !== HELPER_PROTOCOL_VERSION) {
+      throw helperBootstrapError('The persisted helper record does not match the current workspace identity and pinned package artifact; refusing execution.');
+    }
+    // Return only the canonical, freshly inspected execution result. Persisted
+    // fields are an untrusted cache and must never select a remote executable.
+    return inspectRemoteHelper(deps, known.arch, artifact.entry.file);
   }
   const uname = await probeUname(deps);
   const arch = helperArchForUname(uname);
@@ -344,13 +352,6 @@ async function handshakeRemoteHelper(deps: RemoteHelperBootstrapDependencies, pa
   const expectedArch = arch === 'linux-x64' ? 'x86_64' : 'aarch64';
   if (match[3] !== expectedArch) throw helperBootstrapError(`Remote helper architecture ${match[3]} does not match the probed ${expectedArch}; execution is blocked.`);
   return { protocol, helperVersion: match[1], remoteBootId: match[4], arch: match[3] };
-}
-
-function knownResult(known: LocalHelperBootstrapRecord, recordedAt: string): RemoteHelperBootstrapResult {
-  return {
-    arch: known.arch, file: known.file, binPath: known.binPath, sha256: known.sha256,
-    protocolVersion: known.protocolVersion, helperVersion: known.helperVersion, remoteBootId: known.remoteBootId, recordedAt,
-  };
 }
 
 function helperBootstrapError(detail: string): Error {

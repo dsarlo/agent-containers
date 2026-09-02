@@ -11,6 +11,7 @@ import {
   inspectRemoteHelper,
   loadHelperManifest,
   loadLocalHelperBootstrap,
+  localHelperBootstrapPath,
   type HelperManifest,
   type RemoteHelperBootstrapDependencies,
 } from '../src/codespaces-helper.js';
@@ -187,6 +188,24 @@ test('bootstrap performs the owner-only mode check AFTER chmod so a tee-staged 0
   assert.equal(known.arch, 'linux-x64', 'a recorded, matching helper must take the verifyKnown fast path after one success');
   const fastArgv = fastTrack.map((args) => args.slice(args.indexOf('--') + 1).join(' '));
   assert.ok(!fastArgv.some((line) => line.startsWith('tee ')), 'the verifyKnown fast path must not re-copy the helper artifact');
+  await rm(root, { recursive: true, force: true });
+});
+
+test('verifyKnown rejects a tampered cached helper path before any remote execution', async () => {
+  const root = await fixtureRoot();
+  const seededDeps = await bootstrapDeps(bootstrapProcess(), root, false);
+  await bootstrapRemoteHelper(seededDeps);
+  const record = await loadLocalHelperBootstrap(seededDeps.stateDir, WORKSPACE_NAME);
+  assert.ok(record);
+  await writeFile(localHelperBootstrapPath(seededDeps.stateDir, WORKSPACE_NAME), `${JSON.stringify({ ...record, binPath: `/workspaces/.agent-containers/${WORKSPACE_ID}/bin/other-helper` })}\n`, 'utf8');
+  const dispatched: string[][] = [];
+  const verifyDeps: RemoteHelperBootstrapDependencies = {
+    ...seededDeps,
+    provider: new GhCodespacesProvider(bootstrapProcess({ onArgs: (args) => dispatched.push(args) })),
+    verifyKnown: true,
+  };
+  await assert.rejects(() => bootstrapRemoteHelper(verifyDeps), /persisted helper record.*current workspace identity/i);
+  assert.deepEqual(dispatched, [], 'a tampered cache must fail before any remote helper check or serve invocation');
   await rm(root, { recursive: true, force: true });
 });
 
