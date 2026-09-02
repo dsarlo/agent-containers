@@ -14,9 +14,27 @@ function pipeInput(overrides: Partial<import('../src/codespaces-transport.js').E
 }
 
 async function executeToEnd(fixture: TransportFixture, input: import('../src/codespaces-transport.js').ExecuteTransportInput): Promise<CommandEvent[]> {
-  const events: CommandEvent[] = [];
-  for await (const event of executeRemoteCommand(fixture.deps, input)) events.push(event);
-  return events;
+  const events: unknown[] = [];
+  await withSettleGuard((async () => {
+    for await (const event of executeRemoteCommand(fixture.deps, input)) events.push(event);
+  })(), 'executeToEnd did not settle');
+  return events as CommandEvent[];
+}
+
+/** Bounded settle guard: a transport promise that cannot settle (pending
+ * microtasks, emptied event loop) must fail the test with a clear message
+ * instead of leaving the suite to cancel the subtest at the file boundary. */
+async function withSettleGuard<T>(promise: Promise<T>, message: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const guard = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${message} (bounded settle guard)`)), 15000);
+    if (typeof timer.unref === 'function') timer.unref();
+  });
+  try {
+    return await Promise.race([promise, guard]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 function outputsFrom(events: readonly CommandEvent[], stream: 'stdout' | 'stderr' | 'terminal'): { offset: bigint; bytes: Uint8Array }[] {
@@ -219,7 +237,7 @@ test('cancel success is reported only after the remote helper proves the process
     for await (const event of generator) events.push(event);
   })();
   setTimeout(() => signal.abort(), 30);
-  await consumption;
+  await withSettleGuard(consumption, 'cancel-unknown generation did not settle');
   const terminal = events.at(-1);
   assert.equal(terminal?.type, 'cancelled', `expected verified cancel, got ${JSON.stringify(events.map((event) => event.type))}`);
   const status = await loadCommandStatus(fixture.stateDir, COMMAND_ID);
@@ -241,7 +259,7 @@ test('cancel-unknown is recorded durably when the helper cannot prove the proces
   })();
   setTimeout(() => signal.abort(), 10);
   const started = Date.now();
-  await consumption;
+  await withSettleGuard(consumption, 'cancel-unknown generation did not settle');
   assert.ok(Date.now() - started < 3000, 'cancel-unknown must be bounded by the cancel deadline');
   assert.equal(events.at(-1)?.type, 'cancel-unknown');
   const status = await loadCommandStatus(fixture.stateDir, COMMAND_ID);
@@ -269,7 +287,7 @@ test('a second interrupt detaches while the first cancel proof is pending and re
   await new Promise((resolve) => setTimeout(resolve, 20));
   second.abort();
   const started = Date.now();
-  await consumption;
+  await withSettleGuard(consumption, 'cancel-unknown generation did not settle');
   assert.ok(Date.now() - started < 3000, 'the second interrupt must detach immediately without waiting for the proof timer');
   assert.equal(events.at(-1)?.type, 'cancel-unknown');
   const status = await loadCommandStatus(fixture.stateDir, COMMAND_ID);
