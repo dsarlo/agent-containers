@@ -126,9 +126,20 @@ export class GhCodespacesProvider {
    * remote argv is always package-owned; no user input is ever interpolated.
    */
   async remoteSshProbe(name: string, command: readonly [string, ...string[]], options: { timeoutMs?: number; signal?: AbortSignal } = {}): Promise<string> {
+    return this.remoteCommand(name, command as readonly string[], options);
+  }
+
+  /**
+   * Bounded, argv-framed `gh codespace ssh` transport for a package-owned
+   * remote command. An optional binary stdin payload (for example the helper
+   * copy stream) is written before the child closes; stdout is returned as the
+   * bounded result. No user argv is ever concatenated into a remote shell.
+   */
+  async remoteCommand(name: string, command: readonly string[], options: { timeoutMs?: number; signal?: AbortSignal; input?: Uint8Array } = {}): Promise<string> {
     if (!safeName(name)) throw new Error('Invalid Codespaces name.');
-    if (!command.length || command.some((value) => !value || value.includes('\0'))) throw new Error('SSH probe argv is invalid.');
+    if (!command.length || command.some((value) => !value || value.includes('\0'))) throw new Error('SSH argv is invalid.');
     const runOptions: ProcessRunOptions = { kind: 'readonly-probe' };
+    if (options.input !== undefined) runOptions.binaryInput = options.input;
     const controller = new AbortController();
     const timer = options.timeoutMs ? setTimeout(() => controller.abort(), options.timeoutMs) : undefined;
     options.signal?.addEventListener('abort', () => controller.abort(), { once: true });
