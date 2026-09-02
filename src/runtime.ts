@@ -116,8 +116,8 @@ export async function execWorkspace(metadata: WorkspaceMetadata, command: string
     await recordRecovery({ reason: 'remote-exec-interrupted', containerIds: [containerId], worktree: metadata.worktree });
     throw new Error(`The local Dev Containers CLI was interrupted; the remote command may still be active in container ${containerId}. Agent Containers recorded a manual-recovery block and will not run lifecycle commands for ${metadata.name} until an operator verifies the remote command is stopped and clears it.`);
   }
-  await clearRecovery();
   if (result.code !== 0) throw commandError('devcontainer exec', result);
+  await clearRecovery();
   return result;
 }
 

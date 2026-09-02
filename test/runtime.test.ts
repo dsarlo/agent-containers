@@ -452,6 +452,8 @@ test('execWorkspace rejects untrusted terminal container records without rollbac
 });
 
 test('execWorkspace preserves a remote command exit code', async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), 'agent-containers-failed-operation-'));
+  let clears = 0;
   const runner: ProcessRunner = {
     async run(_command, args) {
       return args[0] === 'up'
@@ -460,10 +462,27 @@ test('execWorkspace preserves a remote command exit code', async () => {
         : { code: 42, stdout: '', stderr: 'remote command failed' };
     },
   };
-  await assert.rejects(() => execWorkspace(metadata, ['false'], runner, async () => undefined, async () => '{}', undefined, noOpRecovery, noOpRecovery), (error: unknown) => {
+  await assert.rejects(() => execWorkspace(
+    metadata,
+    ['false'],
+    runner,
+    async () => undefined,
+    async () => '{}',
+    undefined,
+    (recovery) => recordManualRecovery(stateDir, metadata.name, recovery),
+    async () => {
+      clears += 1;
+      await clearManualRecovery(stateDir, metadata.name);
+    },
+  ), (error: unknown) => {
     assert.equal((error as { exitCode?: number }).exitCode, 42);
     return true;
   });
+  assert.equal(clears, 0, 'a failed terminal remote command must not clear the recovery guard');
+  const recovery = await loadManualRecovery(stateDir, metadata.name);
+  assert.equal(recovery?.reason, 'operation-may-be-active');
+  assert.deepEqual(recovery?.containerIds, [containerId]);
+  assert.equal(recovery?.worktree, metadata.worktree);
 });
 
 test('execWorkspace rejects unsupported Dev Container fields while parsing JSONC comments and strings safely', async () => {
