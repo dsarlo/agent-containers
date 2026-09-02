@@ -764,10 +764,10 @@ async function acquireOwnedDirectory(path: string, locksDir: string, temporarySt
     const collision = isNodeError(error, 'EEXIST') || isNodeError(error, 'ENOTEMPTY') ||
       (isNodeError(error, 'EPERM') && await pathExists(path));
     if (!collision) throw error;
-    // Atomic publication makes a concurrent owner visible as a complete
-    // directory. An incomplete or foreign destination must never be adopted,
-    // retried through, or replaced by a lifecycle acquisition.
-    if (!await readLockOwner(path)) throw malformedLockError(name, path, error);
+    // A colliding owner can retire between the failed publication and this
+    // observation. Retry only when the destination is now confirmed absent;
+    // a present malformed or foreign directory remains fail-closed.
+    if (!await readLockOwner(path) && await pathExists(path)) throw malformedLockError(name, path, error);
     if (Date.now() >= deadline) throw lockTimeout(name, error);
     await delay();
     return undefined;
