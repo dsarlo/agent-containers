@@ -63,7 +63,7 @@ napi_value PathResult(napi_env env, bool ok, const std::string& path, const char
   return result;
 }
 
-napi_value MoveResult(napi_env env, bool ok, const std::string& source, const std::string& destination, const char* method, const std::string& error = {}, const char* code = nullptr) {
+napi_value MoveResult(napi_env env, bool ok, const std::string& source, const std::string& destination, const char* method, const std::string& error = {}, const char* code = nullptr, const char* windows_error = nullptr) {
   napi_value result;
   napi_create_object(env, &result);
   SetBool(env, result, "ok", ok);
@@ -72,6 +72,7 @@ napi_value MoveResult(napi_env env, bool ok, const std::string& source, const st
   Set(env, result, "method", String(env, method));
   if (!error.empty()) Set(env, result, "error", String(env, error));
   if (code != nullptr) Set(env, result, "code", String(env, code));
+  if (windows_error != nullptr) Set(env, result, "windowsError", String(env, windows_error));
   return result;
 }
 
@@ -164,7 +165,8 @@ napi_value MoveFileWriteThrough(napi_env env, napi_callback_info info) {
   const bool ok = MoveFileExW(wideSource.c_str(), wideDestination.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
   const DWORD error = ok ? ERROR_SUCCESS : GetLastError();
   const char* code = error == ERROR_ALREADY_EXISTS || error == ERROR_FILE_EXISTS ? "EEXIST" : nullptr;
-  return MoveResult(env, ok, source, destination, "move-file-write-through", ok ? "" : WinError(error), code);
+  const char* windows_error = error == ERROR_ACCESS_DENIED ? "ERROR_ACCESS_DENIED" : nullptr;
+  return MoveResult(env, ok, source, destination, "move-file-write-through", ok ? "" : WinError(error), code, windows_error);
 #else
   return MoveResult(env, false, source, destination, "unsupported", "Write-through rename is only available through MoveFileExW on Windows.");
 #endif
