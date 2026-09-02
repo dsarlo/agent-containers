@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { join, resolve } from 'node:path';
 import { readFile } from 'node:fs/promises';
 import { createInterface } from 'node:readline/promises';
@@ -202,8 +203,11 @@ export async function runCli(args: string[], cwd = process.cwd(), write: (messag
         const recorded = await loadMetadata(stateDir, name);
         if (!recorded) throw new Error(`No Agent Containers workspace named "${name}".`);
         if (!('repoRoot' in recorded)) {
-          const backend = resolveExecutionBackend('codespaces');
-          const request: RemoteCommandRequest = { commandId: 'phase-gated', argv: [rest[separator + 1] ?? 'true', ...rest.slice(separator + 2)] };
+          const root = await findGitRoot(cwd, nodeProcessRunner);
+          const config = await loadConfig(join(root, '.agent-containers.yml'));
+          if (config.version !== 2 || !config.backends.enabled.includes('codespaces')) throw new Error('The recorded workspace requires an enabled Codespaces backend configuration.');
+          const backend = createCodespacesExecutionBackend({ stateDir, config, runner: nodeProcessRunner, root });
+          const request: RemoteCommandRequest = { commandId: `cli-${randomUUID()}`, argv: [rest[separator + 1] ?? 'true', ...rest.slice(separator + 2)] };
           for await (const event of executeWithInterruptRelay(backend, { kind: 'codespaces', id: recorded.workspaceId, name: recorded.name, environmentId: recorded.remote.environmentId }, request)) { void event; }
           return 0;
         }

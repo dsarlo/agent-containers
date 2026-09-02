@@ -322,8 +322,16 @@ export async function* executeRemoteCommand(deps: RemoteTransportDependencies, i
    * interrupt that raced the generator start must still cancel deterministically. */
   if (deps.signal?.aborted) cancelRequested = true;
 
-  const helper = await bootstrapRemoteHelper(helperDeps(deps));
-  await inspectRemoteHelper(helperDeps(deps), helper.arch, helper.file);
+  let helper: RemoteHelperBootstrapResult;
+  try {
+    // bootstrapRemoteHelper itself verifies both fresh and known helpers. Keeping
+    // this await inside the listener lifetime prevents a failed bootstrap from
+    // leaking the first-interrupt listener.
+    helper = await bootstrapRemoteHelper(helperDeps(deps));
+  } catch (error: unknown) {
+    deps.signal?.removeEventListener('abort', onAbort);
+    throw error;
+  }
 
   let offsets = (await loadCommandOffsets(deps.stateDir, commandId)) ?? await zeroOffsets(deps, commandId, now);
   const transportBudget = deps.reconnectBudgetMs ?? deps.config.backends.codespaces.transport.reconnectWindowSeconds * 1000;
@@ -556,8 +564,8 @@ async function acknowledgeStarted(deps: RemoteTransportDependencies, session: He
   return { kind: 'session', session };
 }
 
-async function openSession(deps: RemoteTransportDependencies, binPath: string): Promise<HelperSession> {
-  const child = deps.spawner(['gh', 'codespace', 'ssh', '-c', deps.metadata.remote.name, '--', binPath, 'serve'], { signal: deps.signal });
+async function openSession(deps: RemoteTransportDependencies, binPath: string, signal = deps.signal): Promise<HelperSession> {
+  const child = deps.spawner(['gh', 'codespace', 'ssh', '-c', deps.metadata.remote.name, '--', binPath, 'serve'], { signal });
   drainStderr(child);
   return new HelperSession(child);
 }
@@ -687,7 +695,7 @@ async function requestRemoteCancelProof(deps: RemoteTransportDependencies, comma
     if (detached) return 'unknown';
     await inspectRemoteHelper(helperDeps(deps), helper.arch, helper.file);
     if (detached) return 'unknown';
-    session = await openSession(deps, helper.binPath);
+    session = await openSession(deps, helper.binPath, deps.detachSignal);
     if (detached) return 'unknown';
     await helloHandshake(deps, session, helper.arch);
     if (detached) return 'unknown';
