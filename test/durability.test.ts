@@ -120,18 +120,20 @@ test('a native recovery-lock collision retries only after its valid owner retire
     capabilities: () => ({ regularFileSync: true, directorySync: false, writeThroughMove: true }),
     moveFileWriteThrough: async (source, destination) => {
       try {
-        await rename(source, destination);
-        return { ok: true, source, destination, method: 'move-file-write-through' };
+        await lstat(destination);
       } catch (error: unknown) {
-        if (destination.endsWith('safe.recovery') && recoveryPublications++ === 1) {
-          collisionObserved();
-          await ownerWasRetired;
-        }
-        if (typeof error === 'object' && error !== null && 'code' in error && (error.code === 'EEXIST' || error.code === 'ENOTEMPTY')) {
-          return { ok: false, source, destination, method: 'move-file-write-through', code: error.code, error: error instanceof Error ? error.message : String(error) };
+        if (typeof error === 'object' && error !== null && 'code' in error && error.code === 'ENOENT') {
+          await rename(source, destination);
+          if (destination.endsWith('safe.recovery')) recoveryPublications += 1;
+          return { ok: true, source, destination, method: 'move-file-write-through' };
         }
         throw error;
       }
+      if (destination.endsWith('safe.recovery') && recoveryPublications === 1) {
+        collisionObserved();
+        await ownerWasRetired;
+      }
+      return { ok: false, source, destination, method: 'move-file-write-through', code: 'EEXIST', error: 'Windows directory collision' };
     },
   }));
   const events: string[] = [];
@@ -155,6 +157,28 @@ test('a native recovery-lock collision retries only after its valid owner retire
   await second;
 
   assert.deepEqual(events, ['first-start', 'first-end', 'second']);
+});
+
+test('a raw rename EPERM after an absent destination remains surfaced', async () => {
+  const destination = join(await mkdtemp(join(tmpdir(), 'agent-containers-windows-raw-rename-error-')), 'destination');
+  const rawRenameError = Object.assign(new Error('simulated raw rename permission denied'), { code: 'EPERM' });
+  const adapter = createNativeDurabilityAdapter(binding({
+    capabilities: () => ({ regularFileSync: true, directorySync: false, writeThroughMove: true }),
+    moveFileWriteThrough: async (source, observedDestination) => {
+      try {
+        await lstat(observedDestination);
+      } catch (error: unknown) {
+        if (typeof error === 'object' && error !== null && 'code' in error && error.code === 'ENOENT') throw rawRenameError;
+        throw error;
+      }
+      return { ok: false, source, destination: observedDestination, method: 'move-file-write-through', code: 'EEXIST', error: 'Windows directory collision' };
+    },
+  }));
+
+  await assert.rejects(
+    () => adapter.moveFileWriteThrough('source', destination),
+    (error: unknown) => error === rawRenameError,
+  );
 });
 
 test('a native collision with a malformed published recovery lock fails closed without replacing it', async () => {
