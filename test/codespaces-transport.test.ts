@@ -298,6 +298,20 @@ test('a second interrupt detaches while the first cancel proof is pending and re
   assert.ok(recovery, 'the unknown outcome must be durably recoverable');
 });
 
+test('a pre-aborted signal cancels deterministically instead of hanging (N7)', async () => {
+  const chunk = new Uint8Array(4).fill(7);
+  const fixture = await transportFixture({ cancelGraceMs: 150, reconnectBudgetMs: 1000 });
+  fixture.helper.configure({ commandId: COMMAND_ID, outputs: [{ stream: 'stdout', bytes: chunk }], exitCode: null, stayRunning: true, cancelPolicy: 'never' });
+  const signal = new AbortController();
+  signal.abort();
+  const events: import('../src/types.js').CommandEvent[] = [];
+  const consumption = (async () => {
+    for await (const event of executeRemoteCommand({ ...fixture.deps, signal: signal.signal }, pipeInput())) events.push(event);
+  })();
+  await withSettleGuard(consumption, 'pre-aborted execute did not settle');
+  assert.equal(events.at(-1)?.type, 'cancel-unknown', 'a pre-aborted execute must yield a bounded cancel-unknown, never a hang');
+});
+
 test('a helper protocol mismatch on the serve handshake blocks execution fail-closed (N14)', async () => {
   const fixture = await transportFixture();
   fixture.helper.protocol = 99;

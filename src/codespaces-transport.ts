@@ -318,6 +318,9 @@ export async function* executeRemoteCommand(deps: RemoteTransportDependencies, i
     session?.close();
   };
   deps.signal?.addEventListener('abort', onAbort, { once: true });
+  /* N7: an already-aborted signal never dispatches its listener, so a first
+   * interrupt that raced the generator start must still cancel deterministically. */
+  if (deps.signal?.aborted) cancelRequested = true;
 
   const helper = await bootstrapRemoteHelper(helperDeps(deps));
   await inspectRemoteHelper(helperDeps(deps), helper.arch, helper.file);
@@ -362,6 +365,7 @@ export async function* executeRemoteCommand(deps: RemoteTransportDependencies, i
         yield { type: 'started', commandId };
         if (input.stdin === 'stream' && input.stdinSource) {
           for await (const chunk of input.stdinSource) {
+            if (deps.signal?.aborted) { void session.close(); break; }
             if (chunk.length > MAX_STDIN_FRAME_BYTES) throw new Error('A user stdin chunk exceeded the bounded frame size; refusing the oversized chunk.');
             await session.send(HelperFrameType.stdin, chunk);
           }
@@ -590,6 +594,13 @@ async function* streamSession(deps: RemoteTransportDependencies, now: () => stri
   let stderrCursor = BigInt(offsets.stderr);
   let terminalCursor = BigInt(offsets.terminal);
   let queuedBytes = 0n;
+  /* N7: a first interrupt arriving AFTER the session is established must
+   * terminate the stream deterministically. Closing the session makes the
+   * helper stream end, the caller re-enters its loop-top cancel gate, and the
+   * bounded cancel-proof path emits cancel-unknown rather than hanging. */
+  const onAbort = () => { void session.close(); };
+  deps.signal?.addEventListener('abort', onAbort, { once: true });
+  try {
   const persist = async (): Promise<void> => {
     const next: CodespacesCommandOffsets = { schemaVersion: 1, commandId, stdout: stdoutCursor.toString(), stderr: stderrCursor.toString(), terminal: terminalCursor.toString(), updatedAt: now() };
     await saveOffsets(deps, next, now);
@@ -644,6 +655,9 @@ async function* streamSession(deps: RemoteTransportDependencies, now: () => stri
       default:
         break;
     }
+  }
+  } finally {
+    deps.signal?.removeEventListener('abort', onAbort);
   }
 }
 
