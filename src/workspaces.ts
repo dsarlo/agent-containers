@@ -102,7 +102,14 @@ export function createNodeProcessRunner({
           reject(error);
         };
         const abortChild = () => {
-          if (settled || cancellationStarted || rootExited) return;
+          if (settled || cancellationStarted) return;
+          if (rootExited) {
+            // The exited root PID may already have been recycled, so do not
+            // target it. Close still confirms normal completion; otherwise
+            // retain the lock only until bounded reap uncertainty is reported.
+            cancellationDeadline = schedule(unconfirmed, platform === 'win32' ? windowsReapTimeoutMs : posixGraceMs + posixVerificationTimeoutMs);
+            return;
+          }
           cancellationStarted = true;
           if (platform === 'win32') {
             reapWindowsProcessTree();
@@ -211,7 +218,6 @@ export function createNodeProcessRunner({
         });
         child.on('exit', () => {
           rootExited = true;
-          if (!cancellationStarted) options.signal?.removeEventListener('abort', abortChild);
         });
         child.on('close', (code) => {
           rootClosed = true;

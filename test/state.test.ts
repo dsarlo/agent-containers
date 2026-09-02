@@ -694,6 +694,35 @@ test('unlock preserves malformed published lifecycle locks and directs verified 
   assert.equal((await lstat(lockPath)).isDirectory(), true, 'unlock never deletes a published lock whose owner cannot be identified');
 });
 
+test('withWorkspaceLock rejects an empty published lifecycle lock without running or replacing it', async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), 'agent-containers-empty-published-lock-'));
+  const lockPath = join(stateDir, 'locks', 'safe.lock');
+  const recoverable: StateDurabilityAdapter = {
+    publicationMode: async () => 'recoverable',
+    assertStateWriteSupport: async () => undefined,
+    syncFile: async () => undefined,
+    syncDirectory: async () => undefined,
+    moveFileWriteThrough: async (source, destination) => {
+      try {
+        await lstat(destination);
+        throw Object.assign(new Error('Windows directory collision'), { code: 'EEXIST' });
+      } catch (error: unknown) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      }
+      await rename(source, destination);
+    },
+  };
+  await mkdir(lockPath, { recursive: true });
+  let ran = false;
+
+  await assert.rejects(
+    () => withWorkspaceLock(stateDir, 'safe', async () => { ran = true; }, { timeoutMs: 0, durabilityAdapter: recoverable }),
+    /malformed owner metadata/i,
+  );
+  assert.equal(ran, false, 'a malformed published lock cannot be adopted as lifecycle ownership');
+  assert.equal((await lstat(lockPath)).isDirectory(), true, 'the original malformed lock remains for verified manual repair');
+});
+
 test('stale lock recovery serializes validation and removal with a new lifecycle acquisition', async () => {
   const stateDir = await mkdtemp(join(tmpdir(), 'agent-containers-stale-lock-race-'));
   const lockPath = join(stateDir, 'locks', 'safe.lock');

@@ -321,6 +321,48 @@ test('nodeProcessRunner stops cancellation targeting after the root exits but be
   assert.equal((await windowsRunning).code, 0, 'the Windows runner still waits for stdio close');
 });
 
+test('nodeProcessRunner bounds lifecycle cancellation after root exit when inherited streams never close', async () => {
+  const posixRoot = Object.assign(new EventEmitter(), { pid: 2474, kill: () => true }) as unknown as ChildProcess;
+  const posixTimers: Array<() => void> = [];
+  const posixTargets: Array<{ pid: number; signal: NodeJS.Signals | 0 | undefined }> = [];
+  const posixRunner = createNodeProcessRunner({
+    platform: 'linux',
+    spawn: (() => posixRoot) as typeof spawn,
+    processKill: ((pid: number, signal?: NodeJS.Signals | 0) => { posixTargets.push({ pid, signal }); return true; }) as typeof process.kill,
+    setTimeout: ((callback: () => void) => { posixTimers.push(callback); return {} as NodeJS.Timeout; }) as typeof setTimeout,
+    clearTimeout: (() => undefined) as typeof clearTimeout,
+  });
+  const posixController = new AbortController();
+  const posixRunning = posixRunner.run('managed-command', [], { kind: 'lifecycle', signal: posixController.signal });
+  posixRoot.emit('exit', 0);
+  posixController.abort();
+
+  assert.equal(posixTimers.length, 1, 'post-exit cancellation schedules a bounded uncertainty deadline');
+  assert.deepEqual(posixTargets, [], 'an exited root PID is never reused as a POSIX process-group target');
+  posixTimers[0]?.();
+  await assert.rejects(posixRunning, UnconfirmedProcessReapError);
+
+  const windowsRoot = Object.assign(new EventEmitter(), { pid: 2475, kill: () => true }) as unknown as ChildProcess;
+  const windowsTimers: Array<() => void> = [];
+  const windowsCommands: string[] = [];
+  const windowsRunner = createNodeProcessRunner({
+    platform: 'win32',
+    spawn: ((command: string) => { windowsCommands.push(command); return windowsRoot; }) as typeof spawn,
+    windowsDirectory: () => 'C:\\Windows',
+    setTimeout: ((callback: () => void) => { windowsTimers.push(callback); return {} as NodeJS.Timeout; }) as typeof setTimeout,
+    clearTimeout: (() => undefined) as typeof clearTimeout,
+  });
+  const windowsController = new AbortController();
+  const windowsRunning = windowsRunner.run('managed-command', [], { kind: 'lifecycle', signal: windowsController.signal });
+  windowsRoot.emit('exit', 0);
+  windowsController.abort();
+
+  assert.equal(windowsTimers.length, 1, 'post-exit cancellation schedules a bounded uncertainty deadline');
+  assert.deepEqual(windowsCommands, ['managed-command'], 'an exited root PID is never passed to taskkill');
+  windowsTimers[0]?.();
+  await assert.rejects(windowsRunning, UnconfirmedProcessReapError);
+});
+
 test('nodeProcessRunner retains POSIX escalation after root close when a descendant may remain', async () => {
   const root = Object.assign(new EventEmitter(), { pid: 2469, kill: () => true }) as unknown as ChildProcess;
   const signals: NodeJS.Signals[] = [];
