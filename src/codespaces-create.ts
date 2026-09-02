@@ -43,6 +43,8 @@ export interface CodespacesCreateDependencies {
   provider: GhCodespacesProvider;
   signal?: AbortSignal;
   now?: () => string;
+  /** Bounded deadline for the provider create dispatch; relayed as an abort. */
+  createTimeoutMs?: number;
   saveMetadata?: (stateDir: string, metadata: CodespacesWorkspaceMetadata, options: MetadataSaveOptions) => Promise<void>;
   loadMetadata?: (stateDir: string, name: string) => Promise<CodespacesWorkspaceMetadata | undefined>;
   ghVersion: string;
@@ -183,7 +185,7 @@ async function dispatchCreate(deps: CodespacesCreateDependencies, preflight: Cod
     retentionPeriodMinutes: config.backends.codespaces.retentionPeriodMinutes,
     geo: config.backends.codespaces.geo === 'auto' ? undefined : config.backends.codespaces.geo,
     displayName: deps.displayNameHint ?? undefined,
-  });
+  }, { timeoutMs: deps.createTimeoutMs, signal: deps.signal });
 
   const recorded = { ...intent, state: 'resource-recorded' as const, providerResource: resource, updatedAt: now() };
   await updateCreateIntent(deps.stateDir, recorded, { expectedState: 'create-dispatched' });

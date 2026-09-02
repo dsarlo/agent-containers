@@ -2,6 +2,7 @@ import type { ProcessResult, ProcessRunner, ProcessRunOptions } from './types.js
 import { redactSecretDiagnostic, secretShaped } from './secrets.js';
 
 const API_VERSION = '2022-11-28';
+const DEFAULT_CREATE_TIMEOUT_MS = 5 * 60 * 1000;
 
 export type CodespacesProviderProcess = Pick<ProcessRunner, 'run'>;
 export interface GithubActor { id: string; login: string }
@@ -83,7 +84,7 @@ export class GhCodespacesProvider {
   }
 
   /** Documented Codespaces create endpoint. Every payload field is explicitly passed as argv. */
-  async create(payload: CodespacesCreatePayload): Promise<CodespacesResource> {
+  async create(payload: CodespacesCreatePayload, options: { timeoutMs?: number; signal?: AbortSignal } = {}): Promise<CodespacesResource> {
     if (!losslessId(payload.repositoryId) || !safeRef(payload.ref) || !safeRepositoryPath(payload.devcontainerPath) || !safeDisplay(payload.machine) || !positiveInteger(payload.idleTimeoutMinutes) || !positiveInteger(payload.retentionPeriodMinutes)) throw new Error('Codespaces create request fields are unsafe.');
     if (payload.geo !== undefined && !safeLocation(payload.geo)) throw new Error('Codespaces create geo field is unsafe.');
     if (payload.displayName !== undefined && !safeDisplay(payload.displayName)) throw new Error('Codespaces create display-name hint is unsafe.');
@@ -100,9 +101,16 @@ export class GhCodespacesProvider {
     const args = ['api', '--method', 'POST', '-H', `X-GitHub-Api-Version: ${API_VERSION}`];
     for (let index = 0; index < fields.length; index += 2) args.push('-f', `${fields[index]}=${fields[index + 1] ?? ''}`);
     args.push('/user/codespaces');
-    const result = await this.process.run('gh', args, { kind: 'lifecycle' });
-    if (result.code !== 0) throw providerError('POST', '/user/codespaces', result);
-    return parseCodespacesResource(parseJson(result.stdout, 'POST /user/codespaces'), 'create response');
+    const controller = new AbortController();
+    const relayed = options.signal;
+    relayed?.addEventListener('abort', () => controller.abort(), { once: true });
+    try {
+      const result = await raceBoundedCreate(this.process.run('gh', args, { kind: 'lifecycle', signal: controller.signal }), options.timeoutMs ?? DEFAULT_CREATE_TIMEOUT_MS, controller);
+      if (result.code !== 0) throw providerError('POST', '/user/codespaces', result);
+      return parseCodespacesResource(parseJson(result.stdout, 'POST /user/codespaces'), 'create response');
+    } finally {
+      controller.abort();
+    }
   }
 
   /** Bounded, read-only creation/build log diagnostics for an exact recorded Codespace. */
@@ -195,6 +203,30 @@ export function assertSafeExecuteRequest(request: SafeExecuteRequest): void {
 function providerError(method: string, path: string, result: ProcessResult): Error { return new Error(`GitHub ${method} ${path} failed: ${redactDiagnostic(result.stderr || result.stdout || `exit code ${result.code}`)}`); }
 function redactDiagnostic(value: string): string { return redactSecretDiagnostic(value); }
 function parseJson(stdout: string, context: string): unknown { try { return JSON.parse(stdout); } catch { throw new Error(`GitHub ${context} returned truncated or invalid JSON; refusing to infer remote state.`); } }
+
+/**
+ * Bound a create dispatch even when the child transport itself cannot observe
+ * the deadline: the abort fires at the bound and the readback promise is
+ * settled with the correct ambiguous classification. If the child completes
+ * first, the timer is cleared.
+ */
+function raceBoundedCreate<T>(pending: Promise<T>, timeoutMs: number, controller: AbortController): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      controller.abort();
+      reject(createDeadlineError());
+    }, timeoutMs);
+    pending.then(
+      (value) => { clearTimeout(timer); resolve(value); },
+      (error: unknown) => { clearTimeout(timer); reject(error); },
+    );
+  });
+}
+function createDeadlineError(): Error {
+  const error = new Error('GitHub create POST exceeded its bounded deadline; the request may or may not have been dispatched and nothing was adopted.');
+  error.name = 'AbortError';
+  return error;
+}
 
 /** Parse and validate the complete documented Codespace resource without a wildcard field. */
 export function parseCodespacesResource(value: unknown, context: string): CodespacesResource {

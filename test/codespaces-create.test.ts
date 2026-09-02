@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { createCodespacesWorkspace, verifyCodespacesIdentity, verifyIdenticalResources, type CodespacesCreateDependencies } from '../src/codespaces-create.js';
 import { GhCodespacesProvider } from '../src/codespaces.js';
-import { loadCreateIntent, codespacesOpsDir, listCreateIntents } from '../src/codespaces-ops.js';
+import { loadCreateIntent, loadCodespacesJournal, codespacesOpsDir, listCreateIntents } from '../src/codespaces-ops.js';
 import { loadMetadata, type CodespacesWorkspaceMetadata, type WorkspaceMetadata } from '../src/state.js';
 import type { CodespacesAgentContainersConfig, ProcessRunner } from '../src/types.js';
 
@@ -146,6 +146,7 @@ async function harness(overrides: RouteOverrides = {}): Promise<CreateHarness> {
     dispatch.push({ method: method ?? '?', args });
     routes.postHook?.(args);
     const result = body();
+    if (result && typeof (result as { then?: unknown }).then === 'function') return result as unknown as Promise<import('../src/types.js').ProcessResult>;
     if ('code' in result) return { code: (result as { code: number }).code, stdout: '', stderr: (result as { stderr: string }).stderr };
     return { code: 0, stdout: JSON.stringify(result), stderr: '' };
   };
@@ -228,6 +229,24 @@ test('provider timeout after creation is ambiguous and never adopts or deletes a
   assert.equal(postCount, 1);
   const intents = await listCreateIntents(stateDir);
   assert.deepEqual(intents.map((summary) => summary.state), ['ambiguous-create']);
+});
+
+test('a hung create aborts within its bounded deadline and journals ambiguous-create exactly once (N3)', async () => {
+  const { deps, stateDir, dispatch } = await harness({ create: () => new Promise<never>(() => {}) } as unknown as RouteOverrides);
+  deps.createTimeoutMs = 60;
+  const started = Date.now();
+  const outcome = await createCodespacesWorkspace(deps);
+  const elapsed = Date.now() - started;
+  assert.equal(outcome.outcome, 'ambiguous');
+  if (outcome.outcome !== 'ambiguous') return;
+  assert.equal(outcome.reason, 'provider-timeout-before-dispatch');
+  assert.ok(elapsed < 5000, `a hung create must abort within its bounded deadline (${elapsed}ms)`);
+  const intent = await loadCreateIntent(stateDir, deps.requestId);
+  assert.equal(intent?.state, 'ambiguous-create');
+  assert.equal(intent?.recoveryContext?.reason, 'provider-timeout-before-dispatch');
+  const journal = await loadCodespacesJournal(stateDir, deps.name);
+  assert.equal(journal.filter((event) => event.event === 'ambiguous-create').length, 1, 'ambiguous-create must be journaled exactly once');
+  assert.equal(dispatch.filter((entry) => entry.args.includes('/user/codespaces') && entry.args.includes('POST')).length, 1);
 });
 
 test('duplicate local request ID fails closed and never issues a create', async () => {
