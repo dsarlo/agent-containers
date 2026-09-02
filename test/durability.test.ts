@@ -55,8 +55,11 @@ test('a native Windows contention result retains its machine-readable code and s
       try {
         await rename(source, destination);
         return { ok: true, source, destination, method: 'move-file-write-through' };
-      } catch {
-        return { ok: false, source, destination, method: 'move-file-write-through', code: 'EEXIST', error: 'The file already exists.' };
+      } catch (error: unknown) {
+        if (typeof error === 'object' && error !== null && 'code' in error && (error.code === 'EEXIST' || error.code === 'ENOTEMPTY')) {
+          return { ok: false, source, destination, method: 'move-file-write-through', code: error.code, error: error instanceof Error ? error.message : String(error) };
+        }
+        throw error;
       }
     },
   }));

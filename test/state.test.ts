@@ -819,11 +819,14 @@ test('withWorkspaceLock makes a lifecycle contender observe deletion rather than
   await saveMetadata(stateDir, metadata);
   let releaseFirst!: () => void;
   const firstCanFinish = new Promise<void>((resolveFirst) => { releaseFirst = resolveFirst; });
+  let deletionFinished!: () => void;
+  const deletionHasFinished = new Promise<void>((resolveDeletionFinished) => { deletionFinished = resolveDeletionFinished; });
   const first = withWorkspaceLock(stateDir, 'safe', async () => {
     await rm(join(stateDir, 'workspaces', 'safe.json'));
+    deletionFinished();
     await firstCanFinish;
   });
-  await new Promise((resolve) => setImmediate(resolve));
+  await deletionHasFinished;
   let contenderRan = false;
   const contender = withWorkspaceLock(stateDir, 'safe', async () => {
     contenderRan = true;
