@@ -752,10 +752,7 @@ async function acquireOwnedDirectory(path: string, locksDir: string, temporarySt
     await onLockPublication?.('owner-file-synced');
     await syncDirectory(temporaryPath, durability);
     await onLockPublication?.('staging-directory-synced');
-    if (await durability.publicationMode() === 'recoverable') await durability.moveFileWriteThrough(temporaryPath, path);
-    else await rename(temporaryPath, path);
-    await onLockPublication?.('published');
-    await syncDirectory(locksDir, durability);
+    await durableRename(temporaryPath, path, locksDir, durability, async () => await onLockPublication?.('published'));
     await onLockPublication?.('locks-directory-synced');
     return owner;
   } catch (error: unknown) {
@@ -817,9 +814,10 @@ async function syncDirectory(directory: string, durability: StateDurabilityAdapt
   await durability.syncDirectory(directory);
 }
 
-async function durableRename(source: string, destination: string, directory: string, durability: StateDurabilityAdapter): Promise<void> {
+async function durableRename(source: string, destination: string, directory: string, durability: StateDurabilityAdapter, afterRename?: () => void | Promise<void>): Promise<void> {
   if (await durability.publicationMode() === 'recoverable') await durability.moveFileWriteThrough(source, destination);
   else await (testDurableRename ?? rename)(source, destination);
+  await afterRename?.();
   await syncDirectory(directory, durability);
 }
 
