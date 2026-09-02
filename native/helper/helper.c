@@ -744,8 +744,11 @@ static void record_child_exit(struct ac_run *run, int code) {
   pump_once(run);
   char iso[48];
   iso_timestamp(iso, sizeof(iso));
-  if (run->framed) emit_jsonf(AC_E_EXIT, "{\"command_id\":\"%s\",\"code\":%d,\"exited_at\":\"%s\"}", run->command_id, code, iso);
+  /* Persist the exited state durably BEFORE announcing it: the exit event is
+   * the client-visible commitment, and it must never race the status write or
+   * leave status.json at "running" after exit was reported (durability order). */
   write_status_json(run, "exited", code);
+  if (run->framed) emit_jsonf(AC_E_EXIT, "{\"command_id\":\"%s\",\"code\":%d,\"exited_at\":\"%s\"}", run->command_id, code, iso);
   run->live = 0;
 }
 
