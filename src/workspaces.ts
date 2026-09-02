@@ -3,7 +3,7 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import { resolve, win32 } from 'node:path';
 import type { AgentContainersConfig, ProcessResult, ProcessRunner, ProcessRunOptions } from './types.js';
 import { validateWorkspaceName } from './names.js';
-import { bootstrapManualRecoveryJournal, deleteMetadata, isAgentContainersWorkspace, isCanonicalContainerId, isLocalWorkspaceMetadata, loadMetadata, saveMetadata, type LocalMetadata, type WorkspaceMetadata } from './state.js';
+import { bootstrapManualRecoveryJournal, deleteMetadata, isAgentContainersWorkspace, isCanonicalContainerId, isLocalWorkspaceMetadata, loadMetadata, saveMetadata, type LocalMetadata, type MetadataSaveOptions, type WorkspaceMetadata } from './state.js';
 import { getAuthoritativeWindowsDirectory } from './durability.js';
 
 export type { ProcessRunner } from './types.js';
@@ -274,7 +274,7 @@ export async function createWorkspace(options: {
   runner: ProcessRunner;
   baseBranch?: string;
   signal?: AbortSignal;
-  save?: (stateDir: string, metadata: WorkspaceMetadata) => Promise<void>;
+  save?: (stateDir: string, metadata: WorkspaceMetadata, options: MetadataSaveOptions) => Promise<void>;
 }): Promise<LocalMetadata> {
   const name = validateWorkspaceName(options.name);
   if (await loadMetadata(options.stateDir, name)) throw new Error(`Agent Containers workspace "${name}" already exists.`);
@@ -319,7 +319,7 @@ export async function createWorkspace(options: {
     createdAt: new Date().toISOString(),
   };
   try {
-    await (options.save ?? saveMetadata)(options.stateDir, metadata);
+    await (options.save ?? saveMetadata)(options.stateDir, metadata, { expectedGeneration: null });
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : String(error);
     throw new Error(`Could not persist workspace metadata: ${message}. The worktree was left intact to avoid destroying untracked work; recover it with git worktree list and branch ${branch}.`, { cause: error });

@@ -4,7 +4,7 @@ import { basename, dirname, isAbsolute, join, posix, win32 } from 'node:path';
 import { parse } from 'yaml';
 import type { AgentContainersConfig, CodespacesAgentContainersConfig, LocalAgentContainersConfig, ProcessResult, ProcessRunner, ProcessRunOptions } from './types.js';
 import { getProductionStateDurabilityAdapter, type StateDurabilityAdapter } from './durability.js';
-import { redactSecretDiagnostic, secretShaped } from './secrets.js';
+import { credentialOptionShaped, redactSecretDiagnostic, secretShaped } from './secrets.js';
 
 let testDurabilityAdapter: StateDurabilityAdapter | undefined;
 export function setConfigDurabilityAdapterForTesting(adapter: StateDurabilityAdapter | undefined): void { testDurabilityAdapter = adapter; }
@@ -480,15 +480,14 @@ function requiredStrings(value: unknown, label: string): string[] {
 }
 
 function rejectCredentialArgv(argv: string[], label: string): void {
-  const credentialOption = /^(?:--?(?:token|access-token|auth-token|oauth-token|password|secret|client-secret|api[_-]?key|credentials?|private[-_]?key)|authorization)$/i;
   for (let index = 0; index < argv.length; index += 1) {
     const value = argv[index];
-    if (credentialOption.test(value) || (value.includes('=') && credentialOption.test(value.slice(0, value.indexOf('='))))) {
+    if (credentialOptionShaped(value) || /^authorization$/i.test(value)) {
       throw new Error(`Invalid configuration: ${label} contains a credential option`);
     }
     // A value split from its credential flag is still a credential, even when it
     // does not independently resemble a provider token.
-    if (index > 0 && credentialOption.test(argv[index - 1])) {
+    if (index > 0 && credentialOptionShaped(argv[index - 1])) {
       throw new Error(`Invalid configuration: ${label} contains a credential option`);
     }
     // curl-style headers can split both the header option and Bearer value.
@@ -509,7 +508,8 @@ export function redactConfig<T>(value: T): T {
   if (!isRecord(value)) return typeof value === 'string' && secretShaped(value) ? '[redacted]' as T : value;
   return Object.fromEntries(Object.entries(value).map(([key, item]) => {
     const policyField = key === 'secrets' || key === 'allowedRemoteSecretNames' || key === 'allowCodespaceGitCredential';
-    return [policyField ? key : safeField(key), policyField ? redactConfig(item) : /(?:token|password|secret|credential|key)/i.test(key) ? '[redacted]' : redactConfig(item)];
+    const credentialArgv = key === 'command' && Array.isArray(item) && item.some((entry) => typeof entry === 'string' && credentialOptionShaped(entry));
+    return [policyField ? key : safeField(key), policyField ? redactConfig(item) : credentialArgv ? item.map(() => '[redacted]') : /(?:token|password|secret|credential|key)/i.test(key) ? '[redacted]' : redactConfig(item)];
   })) as T;
 }
 

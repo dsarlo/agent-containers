@@ -181,6 +181,14 @@ test('createWorkspace preserves its worktree and branch if metadata persistence 
   assert.equal(calls.some((args) => args[0] === 'branch' && args[1] === '-D'), false);
 });
 
+test('createWorkspace publishes metadata with expected absence', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'agent-containers-workspace-cas-'));
+  let expectedGeneration: string | null | undefined;
+  const runner: ProcessRunner = { async run(_command, args) { if (args[0] === 'rev-parse') return { code: 0, stdout: `${directory}\n`, stderr: '' }; if (args[0] === 'show-ref') return { code: args.at(-1) === 'refs/heads/main' ? 0 : 1, stdout: '', stderr: '' }; if (args.at(-1) === '-h') return { code: 129, stdout: '', stderr: '--[no-]relative-paths\n' }; return { code: 0, stdout: '', stderr: '' }; } };
+  await createWorkspace({ cwd: directory, name: 'cas', config: { version: 1, workspace: { worktreeRoot: 'worktrees', baseBranch: 'main' }, environment: { devcontainerPath: '.devcontainer/devcontainer.json' }, commands: {} }, stateDir: join(directory, 'state'), runner, save: async (_state, _metadata, options) => { expectedGeneration = options.expectedGeneration; } });
+  assert.equal(expectedGeneration, null);
+});
+
 test('createWorkspace constructs git commands through the injected runner and writes metadata', async () => {
   const directory = await realpath(await mkdtemp(join(tmpdir(), 'agent-containers-workspace-')));
   const stateDir = join(directory, 'state');

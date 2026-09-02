@@ -123,7 +123,7 @@ async function localChecks(config: AgentContainersConfig, runner: ProcessRunner,
      }
     if (metadata.error || !metadata.value || !('repoRoot' in metadata.value) || recovery.error || recovery.value) {
       if (recovery.error) workspaceChecks.push(action('local.workspace.recovery', 'Manual recovery journal is unreadable or corrupt; recovery is required before treating the provisioned runtime as stopped.', 'provisioned-runtime'));
-      else if (recovery.value) workspaceChecks.push(action('local.workspace.recovery', `Local workspace may still be active because durable manual recovery is required (${recovery.value.reason}). Run ac recover ${options.workspaceName} --yes --remote-command-stopped after verifying remote state.`, 'provisioned-runtime'));
+      else if (recovery.value) workspaceChecks.push(action('local.workspace.recovery', `Local workspace may still be active because durable manual recovery is required (${recovery.value.reason}). Repair or quarantine workspace metadata and verify backend identity before considering recovery.`, 'provisioned-runtime'));
     }
   }
   return [
@@ -154,9 +154,10 @@ async function codespacesChecks(config: AgentContainersConfig, runner: ProcessRu
     : Boolean(selectedMachine && await attemptValue(async () => (await provider.machines(v2.project.repository!, v2.project.ref!, v2.backends.codespaces.geo)).machines.some((machine) => machine.name === selected)));
   const workspaceChecks: DoctorCheck[] = [];
   if (options.workspaceName && options.stateDir) {
-    const metadata = await attemptValue(() => loadMetadata(options.stateDir!, options.workspaceName!));
-    if (!metadata) workspaceChecks.push(action('codespaces.workspace.metadata', `No Codespaces workspace metadata exists for ${options.workspaceName}.`, 'provisioned-runtime'));
-    else if ('repoRoot' in metadata) workspaceChecks.push(action('codespaces.workspace.metadata', `Workspace ${options.workspaceName} belongs to the local backend.`, 'provisioned-runtime'));
+    const metadata = await observe(() => loadMetadata(options.stateDir!, options.workspaceName!));
+    if (metadata.error) workspaceChecks.push(action('codespaces.workspace.metadata', `Codespaces workspace metadata for ${options.workspaceName} is unreadable or corrupt; repair or quarantine it and verify backend identity before remote operations.`, 'provisioned-runtime'));
+    else if (!metadata.value) workspaceChecks.push(action('codespaces.workspace.metadata', `No Codespaces workspace metadata exists for ${options.workspaceName}.`, 'provisioned-runtime'));
+    else if ('repoRoot' in metadata.value) workspaceChecks.push(action('codespaces.workspace.metadata', `Workspace ${options.workspaceName} belongs to the local backend.`, 'provisioned-runtime'));
     else workspaceChecks.push({ ...ready('codespaces.workspace.metadata', `Codespaces workspace metadata for ${options.workspaceName} is valid.`), phase: 'provisioned-runtime' }, action('codespaces.workspace.runtime', 'Codespaces lifecycle is phase-gated; provisioned runtime was not contacted.', 'provisioned-runtime'));
   }
   return [

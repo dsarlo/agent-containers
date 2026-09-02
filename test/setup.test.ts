@@ -175,6 +175,29 @@ test('configuration classifier rejects embedded shell credential flags and stric
   }
 });
 
+test('configuration uses one redacted classifier for quoted and separator credential option variants', () => {
+  const sentinel = 'CLASSIFIER_SECRET_SENTINEL';
+  for (const flag of ['--auth_token', '--auth-token', '--oauth_token', '--oauth-token', '--access_token', '--access-token', '--client_secret', '--client-secret', '--api_key', '--api-key', '--private_key', '--private-key']) {
+    for (const command of [`tool ${flag} ${sentinel}`, `tool ${flag}=${sentinel}`, `tool "${flag}" ${sentinel}`]) {
+      const legacy = { version: 1, workspace: { worktreeRoot: 'worktrees', baseBranch: 'main' }, environment: { devcontainerPath: '.devcontainer/devcontainer.json' }, commands: { run: command } };
+      let diagnostic = '';
+      assert.throws(() => parseConfig(JSON.stringify(legacy)), (error: Error) => {
+        diagnostic = error.message;
+        return !diagnostic.includes(sentinel);
+      });
+      assert.doesNotMatch(diagnostic, new RegExp(sentinel));
+      assert.doesNotMatch(configurationDiff(null, legacy as never), new RegExp(sentinel));
+    }
+    for (const argv of [['tool', flag, sentinel], ['tool', `${flag}=${sentinel}`], ['tool', `"${flag}"`, sentinel]]) {
+      const candidate = structuredClone(codespaces);
+      candidate.backends.codespaces.readiness.command = argv;
+      assert.throws(() => parseConfig(JSON.stringify(candidate)), (error: Error) => !error.message.includes(sentinel));
+      assert.doesNotMatch(configurationDiff(null, candidate), new RegExp(sentinel));
+    }
+  }
+  assert.throws(() => parseConfig(`commands:\n  run: tool "--auth_token" ${sentinel}\n  broken: [\n`), (error: Error) => !error.message.includes(sentinel));
+});
+
 test('configuration rejects authorization and bearer assignment keys before validating commands or unknown keys', () => {
   for (const key of ['Authorization=SETUP_KEY_SENTINEL', 'authorization=Bearer SETUP_KEY_SENTINEL', 'AUTH=SETUP_KEY_SENTINEL', 'bearer=SETUP_KEY_SENTINEL']) {
     const legacy = { version: 1, workspace: { worktreeRoot: 'worktrees', baseBranch: 'main' }, environment: { devcontainerPath: '.devcontainer/devcontainer.json' }, commands: { [key]: '' } };
@@ -288,12 +311,32 @@ test('doctor independently reports corrupt metadata and recovery without a stopp
       else await writeFile(journal, '{not journal}\n');
       const report = await doctor({ version: 1, workspace: { worktreeRoot: 'worktrees', baseBranch: 'main' }, environment: { devcontainerPath: '.devcontainer/devcontainer.json' }, commands: {} }, 'local', { async run(_command, args) { return { code: 0, stdout: args[0] === 'rev-parse' ? `${root}\n` : '--relative-paths\n', stderr: '' }; } }, root, { stateDir, workspaceName: 'safe' });
       assert.equal(report.checks.find((check) => check.id === 'local.workspace.metadata')?.state, 'action-required');
-      assert.equal(report.checks.find((check) => check.id === 'local.workspace.recovery')?.state, 'action-required');
+      const recoveryCheck = report.checks.find((check) => check.id === 'local.workspace.recovery');
+      assert.equal(recoveryCheck?.state, 'action-required');
+      if (recovery === 'valid') {
+        assert.match(recoveryCheck?.summary ?? '', /Repair or quarantine workspace metadata and verify backend identity/);
+        assert.doesNotMatch(recoveryCheck?.summary ?? '', /Run ac recover/);
+      }
       assert.equal(report.checks.find((check) => check.id === 'local.workspace.runtime'), undefined);
       await rm(metadataPath, { recursive: true, force: true });
       await rm(journal, { force: true });
     }
   } finally { setStateDurabilityAdapterForTesting(undefined); }
+});
+
+test('Codespaces doctor distinguishes absent workspace metadata from corrupt metadata behind its experimental gate', async () => {
+  const stateDir = join(await mkdtemp(join(tmpdir(), 'agent-containers-codespaces-doctor-metadata-')), 'state');
+  const previous = process.env.AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES;
+  process.env.AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES = '1';
+  try {
+    for (const [name, content] of [['missing', undefined], ['malformed', '{bad'], ['schema', '{}']] as const) {
+      if (content !== undefined) { await mkdir(join(stateDir, 'workspaces'), { recursive: true }); await writeFile(join(stateDir, 'workspaces', `${name}.json`), content); }
+      const report = await doctor(codespaces, 'codespaces', { async run() { return { code: 1, stdout: '', stderr: '' }; } }, '/repo', { stateDir, workspaceName: name });
+      const check = report.checks.find((entry) => entry.id === 'codespaces.workspace.metadata');
+      assert.equal(check?.state, 'action-required');
+      assert.match(check?.summary ?? '', content === undefined ? /No Codespaces workspace metadata/ : /unreadable or corrupt/);
+    }
+  } finally { if (previous === undefined) delete process.env.AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES; else process.env.AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES = previous; }
 });
 
 test('v2 setup drafts may omit discovered evidence, while persisted v2 configurations may not', () => {
