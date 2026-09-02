@@ -47,6 +47,28 @@ test('Windows file flush and write-through move select recoverable publication r
   assert.equal(await adapter.publicationMode(), 'recoverable');
 });
 
+test('native Windows access-denied move failures map to EPERM', async () => {
+  const adapter = createNativeDurabilityAdapter(binding({
+    moveFileWriteThrough: (source, destination) => ({
+      ok: false,
+      source,
+      destination,
+      method: 'move-file-write-through',
+      windowsError: 'ERROR_ACCESS_DENIED',
+      error: 'Access is denied.',
+    }),
+  }));
+
+  await assert.rejects(
+    () => adapter.moveFileWriteThrough('/state/source', '/state/destination'),
+    (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.equal((error as NodeJS.ErrnoException).code, 'EPERM');
+      return true;
+    },
+  );
+});
+
 test('a native Windows contention result retains its machine-readable code and serializes lifecycle locks', async () => {
   const stateDir = join(await mkdtemp(join(tmpdir(), 'agent-containers-windows-contention-')), 'state');
   const adapter = createNativeDurabilityAdapter(binding({

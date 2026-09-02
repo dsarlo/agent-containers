@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve, sep } from 'node:path';
 import { createHash } from 'node:crypto';
 import test from 'node:test';
+import { createNativeDurabilityAdapter } from '../src/durability.js';
 import * as state from '../src/state.js';
 import { acknowledgeUnconfirmedProcessReap, bootstrapManualRecoveryJournal, listMetadata, loadManualRecovery, loadMetadata, recordManualRecovery, releaseStaleWorkspaceLock, saveMetadata, setStateDurabilityAdapterForTesting, setStateDurableRenameForTesting, setStateJournalStagingWriteForTesting, withWorkspaceLock, type WorkspaceLockOptions, type WorkspaceMetadata } from '../src/state.js';
 import type { ProcessRunner } from '../src/types.js';
@@ -468,21 +469,23 @@ test('withWorkspaceLock does not retry an EPERM without a published recovery-loc
   }
 });
 
-test('withWorkspaceLock retries a Windows-style EPERM while retiring its validated recovery lock', async () => {
+test('withWorkspaceLock retries native Windows access denial while retiring its validated recovery lock', async () => {
   const stateDir = await mkdtemp(join(tmpdir(), 'agent-containers-windows-recovery-retirement-'));
   let retirementAttempts = 0;
-  setStateDurableRenameForTesting(async (source, destination) => {
-    if (source.endsWith('safe.recovery') && destination.endsWith('.retired') && retirementAttempts++ === 0) {
-      throw Object.assign(new Error('Windows recovery retirement contention'), { code: 'EPERM' });
-    }
-    await rename(source, destination);
+  const recoverable = createNativeDurabilityAdapter({
+    capabilities: () => ({ regularFileSync: true, directorySync: false, writeThroughMove: true }),
+    syncPath: (path) => ({ ok: true, path, target: 'file', method: 'flush-file-buffers' }),
+    moveFileWriteThrough: async (source, destination) => {
+      if (source.endsWith('safe.recovery') && destination.endsWith('.retired') && retirementAttempts++ === 0) {
+        return { ok: false, source, destination, method: 'move-file-write-through', windowsError: 'ERROR_ACCESS_DENIED', error: 'Windows recovery retirement contention' };
+      }
+      await rename(source, destination);
+      return { ok: true, source, destination, method: 'move-file-write-through' };
+    },
   });
-  try {
-    await withWorkspaceLock(stateDir, 'safe', async () => undefined);
-    assert.equal(retirementAttempts, 2);
-  } finally {
-    setStateDurableRenameForTesting(undefined);
-  }
+
+  await withWorkspaceLock(stateDir, 'safe', async () => undefined, { durabilityAdapter: recoverable });
+  assert.equal(retirementAttempts, 2);
 });
 
 test('lock publication durably syncs the owner, staging directory, and locks directory in order', async () => {

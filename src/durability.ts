@@ -28,6 +28,8 @@ export interface NativeMoveDurabilityResult {
   method: 'move-file-write-through' | 'unsupported';
   /** Stable filesystem error code when the native move did not publish. */
   code?: 'EEXIST' | 'ENOTEMPTY';
+  /** Windows error identifier emitted by the native MoveFileExW bridge. */
+  windowsError?: 'ERROR_ACCESS_DENIED';
   error?: string;
 }
 
@@ -81,7 +83,8 @@ export function createNativeDurabilityAdapter(binding: NativeDurabilityBinding):
       const result = await binding.moveFileWriteThrough(source, destination);
       if (!result.ok) {
         const error = new Error(result.error ?? `Native write-through move failed for ${source} -> ${destination}.`);
-        if (result.code) Object.assign(error, { code: result.code });
+        const code = result.windowsError === 'ERROR_ACCESS_DENIED' ? 'EPERM' : result.code;
+        if (code) Object.assign(error, { code });
         throw error;
       }
     },
