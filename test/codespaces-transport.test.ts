@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { transportFixture, COMMAND_ID, helperBootstrapRunner, type TransportFixture } from './transport-fixtures.js';
-import { executeRemoteCommand, attachRemoteCommand } from '../src/codespaces-transport.js';
+import { transportFixture, COMMAND_ID, collect, helperBootstrapRunner, type TransportFixture } from './transport-fixtures.js';
+import { executeRemoteCommand, attachRemoteCommand, helperDeps } from '../src/codespaces-transport.js';
+import { bootstrapRemoteHelper } from '../src/codespaces-helper.js';
 import { loadCommandRequest, loadCommandOffsets, loadCommandStatus, loadCommandRecovery } from '../src/codespaces-command.js';
 import { loadMetadata } from '../src/state.js';
 import { loadCodespacesJournal } from '../src/codespaces-ops.js';
@@ -349,6 +350,42 @@ test('a second interrupt aborts an in-flight helper inspection probe before canc
   await withSettleGuard(consume, 'second interrupt did not abort helper inspection', 1000);
   assert.equal(probeAborted, true, 'detach signal must reach the controlled inspection probe');
   assert.equal(events.at(-1)?.type, 'cancel-unknown');
+});
+
+test('a pre-loop durable offset failure removes the first-interrupt listener (N7)', async () => {
+  const fixture = await transportFixture();
+  // Stage a known helper while durability works, so execution fails specifically
+  // after bootstrap at initial offset persistence.
+  await bootstrapRemoteHelper(helperDeps(fixture.deps));
+  const { setCodespacesCommandDurabilityAdapterForTesting } = await import('../src/codespaces-command.js');
+  const signal = new AbortController();
+  const normalAdapter = {
+    publicationMode: async () => 'strict' as const,
+    assertStateWriteSupport: async () => undefined,
+    syncFile: async () => undefined,
+    syncDirectory: async () => undefined,
+    moveFileWriteThrough: async () => undefined,
+  };
+  let syncs = 0;
+  setCodespacesCommandDurabilityAdapterForTesting({
+    publicationMode: async () => 'strict',
+    assertStateWriteSupport: async () => undefined,
+    syncFile: async () => {
+      syncs += 1;
+      if (syncs === 3) throw new Error('forced initial offset durability failure');
+    },
+    syncDirectory: async () => undefined,
+    moveFileWriteThrough: async () => undefined,
+  });
+  try {
+    await assert.rejects(collect(executeRemoteCommand({ ...fixture.deps, signal: signal.signal }, pipeInput())), /forced initial offset durability failure/);
+  } finally {
+    setCodespacesCommandDurabilityAdapterForTesting(normalAdapter);
+  }
+  signal.abort();
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  const journal = await loadCodespacesJournal(fixture.stateDir, fixture.metadata.name);
+  assert.equal(journal.some((entry) => entry.event === 'cancel-requested'), false, 'a failed execution must not retain a stale first-interrupt listener');
 });
 
 test('a helper protocol mismatch on the serve handshake blocks execution fail-closed (N14)', async () => {

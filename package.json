@@ -30,6 +30,8 @@
   },
   "files": [
     "dist/src",
+    "native/helper/manifest.json",
+    "native/helper/bin",
     "scripts/test-cli-setup-smoke.mjs",
     "prebuilds",
     "*.md",
@@ -44,6 +46,7 @@
     "verify:native-packaging-contract": "node scripts/verify-native-packaging-contract.mjs",
     "verify:native-helper-packaging-contract": "node scripts/verify-native-helper-packaging-contract.mjs",
     "test:native-helper-packaging-contract": "node scripts/test-native-helper-packaging-contract.mjs",
+    "verify:native-helper-pack-contents": "node scripts/verify-native-helper-pack-contents.mjs",
     "build:helper": "node scripts/build-helper.mjs pin",
     "test:native-packaging-contract": "node scripts/test-native-packaging-contract.mjs",
     "verify:ci-yaml": "node scripts/verify-ci-yaml.mjs",
@@ -51,7 +54,7 @@
     "test:native": "npm run build:native && npm run build && npm run verify:native-state-lifecycle-contract && node scripts/test-native.mjs",
     "lint": "eslint .",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "npm run build && node scripts/run-tests.mjs",
+    "test": "npm run build && node scripts/run-tests.mjs && npm run verify:native-helper-pack-contents",
     "test:cli-setup-smoke": "npm run build && node scripts/test-cli-setup-smoke.mjs",
     "test:integration": "AGENT_CONTAINERS_REQUIRE_LIVE_INTEGRATION=1 npm run build && AGENT_CONTAINERS_REQUIRE_LIVE_INTEGRATION=1 node --import ./dist/test/setup.js --test dist/test/integration.test.js",
     "prepack": "npm run build && npm run native:verify-prebuilds"

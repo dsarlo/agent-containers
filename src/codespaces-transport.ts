@@ -322,22 +322,15 @@ export async function* executeRemoteCommand(deps: RemoteTransportDependencies, i
    * interrupt that raced the generator start must still cancel deterministically. */
   if (deps.signal?.aborted) cancelRequested = true;
 
-  let helper: RemoteHelperBootstrapResult;
+  let offsets: CodespacesCommandOffsets;
   try {
-    // bootstrapRemoteHelper itself verifies both fresh and known helpers. Keeping
-    // this await inside the listener lifetime prevents a failed bootstrap from
-    // leaking the first-interrupt listener.
-    helper = await bootstrapRemoteHelper(helperDeps(deps));
-  } catch (error: unknown) {
-    deps.signal?.removeEventListener('abort', onAbort);
-    throw error;
-  }
-
-  let offsets = (await loadCommandOffsets(deps.stateDir, commandId)) ?? await zeroOffsets(deps, commandId, now);
-  const transportBudget = deps.reconnectBudgetMs ?? deps.config.backends.codespaces.transport.reconnectWindowSeconds * 1000;
-  const deadline = Date.now() + transportBudget;
-
-  try {
+    // bootstrapRemoteHelper verifies both fresh and known helpers. Keep every
+    // following await within this try/finally so the first-interrupt listener
+    // never survives a bootstrap, inspection, or durable-offset failure.
+    const helper = await bootstrapRemoteHelper(helperDeps(deps));
+    offsets = (await loadCommandOffsets(deps.stateDir, commandId)) ?? await zeroOffsets(deps, commandId, now);
+    const transportBudget = deps.reconnectBudgetMs ?? deps.config.backends.codespaces.transport.reconnectWindowSeconds * 1000;
+    const deadline = Date.now() + transportBudget;
     let attempt = 0;
     let attachNext = false;
     while (true) {
@@ -692,8 +685,6 @@ async function requestRemoteCancelProof(deps: RemoteTransportDependencies, comma
   try {
     if (detached) return 'unknown';
     const helper = await bootstrapRemoteHelper(helperDeps(deps));
-    if (detached) return 'unknown';
-    await inspectRemoteHelper(helperDeps(deps), helper.arch, helper.file);
     if (detached) return 'unknown';
     session = await openSession(deps, helper.binPath, deps.detachSignal);
     if (detached) return 'unknown';
