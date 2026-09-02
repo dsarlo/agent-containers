@@ -368,16 +368,20 @@ export async function saveMetadata(stateDir: string, metadata: WorkspaceMetadata
   const durability = stateDurability();
   await durability.assertStateWriteSupport();
   await ensureDurableDirectory(directory, durability);
-  const current = await loadMetadata(stateDir, metadata.name);
-  if (options.expectedGeneration === null && current) throw new Error(`Metadata for ${metadata.name} changed concurrently; it was created while this operation was in progress.`);
-  if (typeof options.expectedGeneration === 'string' && (!current || metadataGeneration(current) !== options.expectedGeneration)) {
-    throw new Error(`Metadata for ${metadata.name} changed concurrently; reload before retrying.`);
-  }
-  if (current && !sameMetadataIdentity(current, metadata)) {
-    throw new Error(`Metadata for ${metadata.name} has immutable backend/resource identity; refusing replacement.`);
-  }
-  const temporaryPath = join(directory, `.${metadata.name}.${randomUUID()}.tmp`);
-  await durableReplace(temporaryPath, path, directory, `${JSON.stringify(metadata, null, 2)}\n`, durability);
+  await withMetadataPublicationLock(stateDir, metadata.name, durability, async () => {
+    // Compare inside a durable per-record cross-process lock. This makes the
+    // expected generation and the following durable rename one publication.
+    const current = await loadMetadata(stateDir, metadata.name);
+    if (options.expectedGeneration === null && current) throw new Error(`Metadata for ${metadata.name} changed concurrently; it was created while this operation was in progress.`);
+    if (typeof options.expectedGeneration === 'string' && (!current || metadataGeneration(current) !== options.expectedGeneration)) {
+      throw new Error(`Metadata for ${metadata.name} changed concurrently; reload before retrying.`);
+    }
+    if (current && !sameMetadataIdentity(current, metadata)) {
+      throw new Error(`Metadata for ${metadata.name} has immutable backend/resource identity; refusing replacement.`);
+    }
+    const temporaryPath = join(directory, `.${metadata.name}.${randomUUID()}.tmp`);
+    await durableReplace(temporaryPath, path, directory, `${JSON.stringify(metadata, null, 2)}\n`, durability);
+  });
 }
 
 function sameMetadataIdentity(current: WorkspaceMetadata, next: WorkspaceMetadata): boolean {
@@ -386,7 +390,22 @@ function sameMetadataIdentity(current: WorkspaceMetadata, next: WorkspaceMetadat
     return current.repoRoot === next.repoRoot && current.worktree === next.worktree && current.branch === next.branch && current.baseRef === next.baseRef && current.devcontainerPath === next.devcontainerPath;
   }
   if (!isLocalWorkspaceMetadata(current) && !isLocalWorkspaceMetadata(next)) {
-    return current.workspaceId === next.workspaceId && current.remote.codespaceId === next.remote.codespaceId && current.remote.environmentId === next.remote.environmentId && current.repository.id === next.repository.id;
+    // Every provider ownership and immutable source fact is the durable
+    // authority for future remote operations. Lifecycle observations remain
+    // mutable, but none of these facts may be replaced by a later writer.
+    return current.workspaceId === next.workspaceId &&
+      JSON.stringify(current.control) === JSON.stringify(next.control) &&
+      JSON.stringify(current.repository) === JSON.stringify(next.repository) &&
+      JSON.stringify(current.source) === JSON.stringify(next.source) &&
+      current.remote.codespaceId === next.remote.codespaceId &&
+      current.remote.name === next.remote.name &&
+      current.remote.environmentId === next.remote.environmentId &&
+      current.remote.ownerId === next.remote.ownerId &&
+      current.remote.ownerLogin === next.remote.ownerLogin &&
+      current.remote.billableOwnerId === next.remote.billableOwnerId &&
+      current.remote.machine === next.remote.machine &&
+      current.remote.geo === next.remote.geo &&
+      current.remote.createdAt === next.remote.createdAt;
   }
   return false;
 }
@@ -398,7 +417,24 @@ export function isCanonicalContainerId(value: unknown): value is string {
 export async function deleteMetadata(stateDir: string, name: string): Promise<void> {
   const durability = stateDurability();
   await durability.assertStateWriteSupport();
-  await durableRemove(metadataPath(stateDir, name), join(stateDir, 'workspaces'), true, durability);
+  await withMetadataPublicationLock(stateDir, name, durability, async () => {
+    await durableRemove(metadataPath(stateDir, name), join(stateDir, 'workspaces'), true, durability);
+  });
+}
+
+/** Durable owner-directory serialization for direct metadata writers/deleters. */
+async function withMetadataPublicationLock<T>(stateDir: string, name: string, durability: StateDurabilityAdapter, action: () => Promise<T>): Promise<T> {
+  const locksDir = join(stateDir, 'locks');
+  await ensureDurableDirectory(locksDir, durability);
+  const lockPath = join(locksDir, `${validateWorkspaceName(name)}.metadata.lock`);
+  const deadline = Date.now() + 30_000;
+  let owner: LockOwner | undefined;
+  while (!owner) {
+    await reclaimDeadPublishedLock(lockPath, localPidIsAlive, durability);
+    owner = await acquireOwnedDirectory(lockPath, locksDir, `${name}.metadata`, deadline, name, durability);
+  }
+  try { return await action(); }
+  finally { await retireOwnedLock(lockPath, locksDir, owner, durability); }
 }
 
 export async function listMetadata(stateDir: string): Promise<WorkspaceMetadata[]> {

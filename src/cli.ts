@@ -1,7 +1,7 @@
 import { join, resolve } from 'node:path';
 import { readFile } from 'node:fs/promises';
 import { createInterface } from 'node:readline/promises';
-import { assertDevcontainerPathCommittedOnBaseBranch, configurationDiff, hashConfig, initConfigV2, loadConfig, parseCodespacesDraft, parseConfig, saveConfigAtomic } from './config.js';
+import { assertDevcontainerPathCommittedOnBaseBranch, configurationDiff, hashConfig, initConfigV2, loadConfig, parseCodespacesDraft, parseConfig, redactDiagnostic, saveConfigAtomic } from './config.js';
 import { discoverProjectSetup, doctor, validateCodespacesSetup } from './setup.js';
 import type { CodespacesAgentContainersConfig } from './types.js';
 import { acknowledgeUnconfirmedProcessReap, clearManualRecoveryIfCurrent, defaultStateDir, deleteMetadata, isLocalWorkspaceMetadata, listMetadata, loadManualRecovery, loadMetadata, recordManualRecovery, releaseStaleWorkspaceLock, saveMetadata, withWorkspaceLock } from './state.js';
@@ -227,7 +227,7 @@ export async function runCli(args: string[], cwd = process.cwd(), write: (messag
       write(JSON.stringify({ schemaVersion: 1, selectedBackends: [], overall: 'action-required', checks: [{ id: 'configuration', backend: 'local', phase: 'pre-provision', state: 'action-required', summary: 'Configuration or invocation prerequisites could not be verified; no runtime probes were attempted.', remediation: ['Correct the prerequisite.', 'Run ac doctor again.'] }] }, null, 2));
       return 1;
     }
-    write(`agent-containers: ${error instanceof Error ? error.message : String(error)}`);
+    write(`agent-containers: ${redactDiagnostic(error instanceof Error ? error.message : String(error))}`);
     return error instanceof UsageError ? 2 : exitCodeForError(error) ?? 1;
   }
 }
@@ -316,7 +316,7 @@ async function interactiveConfig(io: CliIo, root: string, current: import('./typ
     const discovered = backend === 'local' ? undefined : await discoverProjectSetup(root, nodeProcessRunner);
     const defaultBackend = backend === 'both' ? await ask(prompt, `Default backend [local|codespaces] (${prior?.backends.default ?? 'local'}): `, prior?.backends.default ?? 'local') : backend;
     if (defaultBackend !== 'local' && defaultBackend !== 'codespaces') throw new Error('Default backend must be local or codespaces.');
-    const devcontainerPath = await ask(prompt, `Committed Dev Container path [${prior?.environment.devcontainerPath ?? '.devcontainer/devcontainer.json'}]: `, prior?.environment.devcontainerPath ?? '.devcontainer/devcontainer.json');
+    const devcontainerPath = await ask(prompt, `Committed Dev Container path [${prior?.environment.devcontainerPath ?? discovered?.devcontainerPath ?? '.devcontainer/devcontainer.json'}]: `, prior?.environment.devcontainerPath ?? discovered?.devcontainerPath ?? '.devcontainer/devcontainer.json');
     const repository = backend === 'local' ? undefined : await ask(prompt, 'Repository [OWNER/REPOSITORY]: ', prior?.project.repository ?? discovered?.repository);
     const ref = backend === 'local' ? undefined : await ask(prompt, `Remote ref [${prior?.project.ref ?? discovered?.ref ?? 'refs/heads/main'}]: `, prior?.project.ref ?? discovered?.ref ?? 'refs/heads/main');
     const candidate = setupConfigTemplate(backend, defaultBackend as 'local' | 'codespaces', repository, ref, devcontainerPath);

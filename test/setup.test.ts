@@ -149,6 +149,17 @@ test('configuration rejects and redacts free-form, legacy, and split credential 
   assert.doesNotMatch(configurationDiff(codespaces, codespaces), /secret-value/);
 });
 
+test('configuration rejects compound credential argv and never exposes malformed YAML source', () => {
+  for (const flag of ['--token', '--access-token', '--client-secret']) {
+    const candidate = structuredClone(codespaces);
+    candidate.backends.codespaces.readiness.command = ['tool', flag, 'sentinel-secret-value'];
+    assert.throws(() => parseConfig(JSON.stringify(candidate)), (error: Error) => !error.message.includes('sentinel-secret-value'));
+  }
+  assert.throws(() => parseConfig('commands:\n  run: --token sentinel-secret-value\n  broken: [\n'), (error: Error) => !error.message.includes('sentinel-secret-value'));
+  const preview = configurationDiff(null, { ...codespaces, project: { ...codespaces.project, repository: 'token: sentinel-secret-value' } } as unknown as CodespacesAgentContainersConfig);
+  assert.doesNotMatch(preview, /sentinel-secret-value/);
+});
+
 test('strict v2 only accepts full 40 or 64 character OIDs and rejects visibility changes', () => {
   for (const length of [39, 41, 63, 65]) {
     const invalid = structuredClone(codespaces);
@@ -227,6 +238,30 @@ test('configuration CAS preserves a non-cooperating writer that changes the file
     beforePublish: async () => { await writeFile(path, 'external edit'); },
   }), /changed concurrently/);
   assert.equal(await readFile(path, 'utf8'), 'external edit');
+});
+
+test('discovery scans the resolved immutable OID rather than a moving tracking ref', async () => {
+  const calls: string[][] = [];
+  const runner: ProcessRunner = { async run(command, args) {
+    calls.push([command, ...args]);
+    if (args[0] === 'remote') return { code: 0, stdout: 'git@github.com:owner/repo.git\n', stderr: '' };
+    if (args[0] === 'symbolic-ref') return { code: 0, stdout: 'origin/main\n', stderr: '' };
+    if (args[0] === 'rev-parse') return { code: 0, stdout: '0123456789012345678901234567890123456789\n', stderr: '' };
+    return { code: 0, stdout: '100644 blob abcdefabcdefabcdefabcdefabcdefabcdefabcd\t.devcontainer/custom.json\0', stderr: '' };
+  } };
+  await discoverProjectSetup('/repo', runner);
+  assert.deepEqual(calls.at(-1), ['git', 'ls-tree', '-r', '-z', '0123456789012345678901234567890123456789']);
+});
+
+test('doctor returns action-required after cancellation even when a runner ignores abort', async () => {
+  const abort = new AbortController();
+  const runner: ProcessRunner = { async run(_command, _args, options) {
+    options?.signal?.addEventListener('abort', () => undefined);
+    return await new Promise<never>(() => undefined);
+  } };
+  setTimeout(() => abort.abort(), 5);
+  const report = await Promise.race([doctor(codespaces, 'codespaces', runner, '/repo', { abortSignal: abort.signal, timeoutMs: 50 }), new Promise<never>((_, reject) => setTimeout(() => reject(new Error('hung')), 200))]);
+  assert.equal(report.overall, 'action-required');
 });
 
 test('configuration publication rejects invalid candidates, leaves no-change unwritten, and preserves old data on durability failure', async () => {

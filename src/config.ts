@@ -69,20 +69,20 @@ export async function initConfig(directory: string, force = false): Promise<void
 /** Save a fully validated v2 candidate without silently replacing an existing configuration. */
 export async function initConfigV2(directory: string, config: CodespacesAgentContainersConfig, force = false): Promise<void> {
   const path = join(directory, '.agent-containers.yml');
+  let expected: string | null = null;
   try {
     const entry = await lstat(path);
     if (entry.isSymbolicLink()) throw new Error(`${path} is a symlink; refusing to overwrite it.`);
     if (entry.nlink > 1) throw new Error(`${path} has multiple hard links; refusing to overwrite it.`);
     if (!force) throw new Error(`${path} already exists; use --force to overwrite it.`);
+    // Snapshot the exact generation before preview/confirmation callers reach
+    // this force path; saveConfigAtomic rechecks it under publication locking.
+    expected = hashConfig(await readFile(path, 'utf8'));
   } catch (error: unknown) {
     if (!isNodeError(error, 'ENOENT')) throw error;
   }
   try {
-    if (force) {
-      const temporary = join(directory, `.${basename(path)}.${randomUUID()}.tmp`);
-      await writeFile(temporary, canonicalConfigSource(config), { encoding: 'utf8', flag: 'wx', mode: 0o600 });
-      await rename(temporary, path);
-    } else await saveConfigAtomic(path, config, null);
+    await saveConfigAtomic(path, config, force ? expected : null);
   }
   catch (error: unknown) {
     if (error instanceof Error && /changed concurrently/.test(error.message)) throw new Error('Configuration changed concurrently; it was created while onboarding was in progress.', { cause: error });
@@ -103,7 +103,9 @@ export async function loadConfig(path: string): Promise<AgentContainersConfig> {
 
 /** Parse exactly the same nonsecret configuration grammar used for files and stdin. */
 export function parseConfig(source: string): AgentContainersConfig {
-  const raw = parse(source);
+  let raw: unknown;
+  try { raw = parse(source); }
+  catch (error: unknown) { throw new Error(`Invalid configuration syntax: ${redactDiagnostic(error instanceof Error ? error.message : String(error))}`, { cause: error }); }
   if (!isRecord(raw)) throw new Error('Invalid configuration: root must be an object');
   // Preserve v1's useful validation for incomplete legacy-looking files while
   // recognizing v2 only once its discriminating backend section is present.
@@ -138,7 +140,9 @@ export function parseConfig(source: string): AgentContainersConfig {
 
 /** Parse a nonsecret v2 onboarding candidate before remote discovery supplies immutable evidence. */
 export function parseCodespacesDraft(source: string): CodespacesAgentContainersConfig {
-  const raw = parse(source);
+  let raw: unknown;
+  try { raw = parse(source); }
+  catch (error: unknown) { throw new Error(`Invalid Codespaces setup draft syntax: ${redactDiagnostic(error instanceof Error ? error.message : String(error))}`, { cause: error }); }
   if (!isRecord(raw) || raw.version !== 2 || raw.backends === undefined) throw new Error('Invalid Codespaces setup draft: schema version 2 is required');
   return parseV2Config(raw, false);
 }
@@ -432,12 +436,12 @@ function requiredStrings(value: unknown, label: string): string[] {
 function rejectCredentialArgv(argv: string[], label: string): void {
   for (let index = 0; index < argv.length; index += 1) {
     const value = argv[index];
-    if (/^(?:--?(?:token|password|secret|api[_-]?key)|authorization)$/i.test(value) || /^(?:--?(?:token|password|secret|api[_-]?key)|authorization)=/i.test(value)) {
+    if (/^(?:--?(?:token|access-token|password|secret|client-secret|api[_-]?key)|authorization)$/i.test(value) || /^(?:--?(?:token|access-token|password|secret|client-secret|api[_-]?key)|authorization)=/i.test(value)) {
       throw new Error(`Invalid configuration: ${label} contains a credential option`);
     }
     // A value split from its credential flag is still a credential, even when it
     // does not independently resemble a provider token.
-    if (index > 0 && /^(?:--?(?:token|password|secret|api[_-]?key)|authorization)$/i.test(argv[index - 1])) {
+    if (index > 0 && /^(?:--?(?:token|access-token|password|secret|client-secret|api[_-]?key)|authorization)$/i.test(argv[index - 1])) {
       throw new Error(`Invalid configuration: ${label} contains a credential option`);
     }
     // curl-style headers can split both the header option and Bearer value.
@@ -452,14 +456,24 @@ function rejectCredentialArgv(argv: string[], label: string): void {
 
 /** Setup accepts policy, never credential values or fragments. */
 function secretShaped(value: string): boolean {
-  return /(?:-----BEGIN [A-Z ]*PRIVATE KEY-----|\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|glpat-[A-Za-z0-9_-]{20,}|sk-[A-Za-z0-9_-]{20,})\b|\bauthorization\s*:\s*bearer(?:\s+\S+)?|\b(?:token|password|secret|api[_-]?key)\s*[:=]\s*\S+)/i.test(value);
+  return /(?:-----BEGIN [A-Z ]*PRIVATE KEY-----|\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|glpat-[A-Za-z0-9_-]{20,}|sk-[A-Za-z0-9_-]{20,})\b|\bauthorization\s*:\s*bearer(?:\s+\S+)?|\b(?:access[-_]?token|client[-_]?secret|token|password|secret|api[_-]?key)\s*[:=]\s*\S+)/i.test(value);
 }
 
 function safeField(value: string): string { return /(?:token|password|secret|credential|key)/i.test(value) ? '[redacted]' : value; }
-function redactConfig<T>(value: T): T {
+export function redactConfig<T>(value: T): T {
   if (Array.isArray(value)) return value.map(redactConfig) as T;
   if (!isRecord(value)) return typeof value === 'string' && secretShaped(value) ? '[redacted]' as T : value;
   return Object.fromEntries(Object.entries(value).map(([key, item]) => [safeField(key), /(?:token|password|secret|credential|key)/i.test(key) ? '[redacted]' : redactConfig(item)])) as T;
+}
+
+/** Never render input-derived diagnostics verbatim at a command boundary. */
+export function redactDiagnostic(value: string): string {
+  return value
+    .replace(/https?:\/\/[^\s]+/gi, '[url redacted]')
+    .replace(/\b(?:authorization|token|access[-_]?token|password|secret|client[-_]?secret|api[_-]?key)\s*[:=]\s*(?:Bearer\s+)?[^\s,'"\]]+/gi, '[credential redacted]')
+    .replace(/(?:--(?:token|access-token|password|secret|client-secret|api[-_]key))\s+[^\s,'"\]]+/gi, '$1 [redacted]')
+    .replace(/\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|glpat-[A-Za-z0-9_-]{20,}|sk-[A-Za-z0-9_-]{20,})\b/g, '[credential redacted]')
+    .slice(0, 1024);
 }
 
 function nonEmptyString(value: unknown): value is string {
