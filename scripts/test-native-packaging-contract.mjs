@@ -22,6 +22,13 @@ const packageArchiveDirectory = 'native-package';
 const packageInstallArchiveGlob = `./${packageArchiveDirectory}/*.tgz`;
 const liveNativeBuildStep = '      - run: npm run build:native';
 const actionRefs = Object.freeze({
+  'actions/checkout': 'fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09',
+  'actions/setup-node': 'a0853c24544627f65ddf259abe73b1d18a591444',
+  'actions/download-artifact': '634f93cb2916e3fdff6788551b99b062d0335ce0',
+  'actions/upload-artifact': '330a01c490aca151604b8cf639adc76d48f6c5d4',
+});
+
+const legacyV4ActionRefs = Object.freeze({
   'actions/checkout': '11d5960a326750d5838078e36cf38b85af677262',
   'actions/setup-node': '49933ea5288caeca8642d1e84afbd3f7d6820020',
   'actions/download-artifact': 'd3f86a106a0bac45b974a628896c90dbdf5c8093',
@@ -29,7 +36,7 @@ const actionRefs = Object.freeze({
 });
 
 function actionStep(action, ref = actionRefs[action]) {
-  return `      # ${action} v4\n      - uses: ${action}@${ref}`;
+  return `      # ${action} v5\n      - uses: ${action}@${ref}`;
 }
 
 function sourceBuildSteps(refs = actionRefs) {
@@ -188,6 +195,14 @@ try {
     pinnedActionsResult.status,
     0,
     `the static packaging contract must accept full immutable actions/* commit SHAs with adjacent action/version comments:\n${pinnedActionsResult.output}`,
+  );
+
+  await writeFixture(workflowFor(allSupportedArchitectures, '.', packageArchiveDirectory, '', legacyV4ActionRefs));
+  const legacyV4ActionsResult = verifyFixture();
+  assert.notEqual(
+    legacyV4ActionsResult.status,
+    0,
+    'the static packaging contract must reject the reviewed legacy Node-20-runtime actions/* v4 commit pins',
   );
 
   const liveNativeBuildGuardFixtures = [

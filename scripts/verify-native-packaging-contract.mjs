@@ -75,10 +75,10 @@ function assertAllNativeBuilds(jobName) {
 }
 
 const pinnedActions = Object.freeze({
-  'actions/checkout': { version: 'v4', sha: '11d5960a326750d5838078e36cf38b85af677262' },
-  'actions/setup-node': { version: 'v4', sha: '49933ea5288caeca8642d1e84afbd3f7d6820020' },
-  'actions/download-artifact': { version: 'v4', sha: 'd3f86a106a0bac45b974a628896c90dbdf5c8093' },
-  'actions/upload-artifact': { version: 'v4', sha: 'ea165f8d65b6e75b540449e92b4886f43607fa02' },
+  'actions/checkout': { version: 'v5', sha: 'fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09' },
+  'actions/setup-node': { version: 'v5', sha: 'a0853c24544627f65ddf259abe73b1d18a591444' },
+  'actions/download-artifact': { version: 'v5', sha: '634f93cb2916e3fdff6788551b99b062d0335ce0' },
+  'actions/upload-artifact': { version: 'v5', sha: '330a01c490aca151604b8cf639adc76d48f6c5d4' },
 });
 
 function actionRef(action) {
