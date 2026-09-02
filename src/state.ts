@@ -448,10 +448,14 @@ export function isCanonicalContainerId(value: unknown): value is string {
   return typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
 }
 
-export async function deleteMetadata(stateDir: string, name: string): Promise<void> {
+export async function deleteMetadata(stateDir: string, name: string, expectedGeneration?: string): Promise<void> {
   const durability = stateDurability();
   await durability.assertStateWriteSupport();
   await withMetadataPublicationLock(stateDir, name, durability, async () => {
+    if (expectedGeneration !== undefined) {
+      const current = await loadMetadata(stateDir, name);
+      if (!current || metadataGeneration(current) !== expectedGeneration) throw new Error(`Metadata for ${name} changed concurrently; reload before retrying.`);
+    }
     await durableRemove(metadataPath(stateDir, name), join(stateDir, 'workspaces'), true, durability);
   });
 }
@@ -498,8 +502,10 @@ export function isAgentContainersWorkspace(metadata: unknown): metadata is Works
     'worktree' in metadata && isCanonicalPath(metadata.worktree) &&
     'repoRoot' in metadata && isCanonicalPath(metadata.repoRoot) &&
     'baseRef' in metadata && isLocalBranchRef(metadata.baseRef) &&
-    'devcontainerPath' in metadata && typeof metadata.devcontainerPath === 'string' &&
-    'createdAt' in metadata && typeof metadata.createdAt === 'string' &&
+    'devcontainerPath' in metadata && safeRepositoryPath(metadata.devcontainerPath) &&
+    'createdAt' in metadata && typeof metadata.createdAt === 'string' && !secretShaped(metadata.createdAt) &&
+    // Readers retain legacy non-canonical IDs so callers can fail closed with
+    // an actionable repair path; saveMetadata refuses to persist them.
     (!('containerId' in metadata) || metadata.containerId === undefined || (typeof metadata.containerId === 'string' && metadata.containerId.length > 0)) &&
     (!('cleanup' in metadata) || metadata.cleanup === undefined || isCleanupState(metadata.cleanup)) &&
     (metadata.version === 1 || (isKnownLocalV2Record(metadata) && 'backend' in metadata && metadata.backend === 'local' && 'handle' in metadata && isLocalHandle(metadata.handle)));

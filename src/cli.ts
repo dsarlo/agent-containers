@@ -1,7 +1,7 @@
 import { join, resolve } from 'node:path';
 import { readFile } from 'node:fs/promises';
 import { createInterface } from 'node:readline/promises';
-import { assertDevcontainerPathCommittedOnBaseBranch, configurationDiff, hashConfig, initConfigV2, loadConfig, parseCodespacesDraft, parseConfig, redactDiagnostic, saveConfigAtomic, snapshotInitConfig } from './config.js';
+import { assertDevcontainerPathCommittedOnBaseBranch, configurationDiff, hashConfig, initConfigV2, loadConfig, parseCodespacesDraft, parseConfig, redactConfig, redactDiagnostic, saveConfigAtomic, snapshotInitConfig } from './config.js';
 import { discoverProjectSetup, doctor, validateCodespacesSetup } from './setup.js';
 import type { CodespacesAgentContainersConfig } from './types.js';
 import { acknowledgeUnconfirmedProcessReap, clearManualRecoveryIfCurrent, defaultStateDir, deleteMetadata, isLocalWorkspaceMetadata, listMetadata, loadManualRecovery, loadMetadata, recordManualRecovery, releaseStaleWorkspaceLock, saveMetadata, withWorkspaceLock } from './state.js';
@@ -198,7 +198,7 @@ export async function runCli(args: string[], cwd = process.cwd(), write: (messag
         if (rest.length > 1) throw new UsageError('Usage: agent-containers status [name]');
         const entries = rest[0] ? [await loadMetadata(stateDir, rest[0])] : await listMetadata(stateDir);
         if (entries.some((entry) => !entry)) throw new Error(`No Agent Containers workspace named "${rest[0]}".`);
-        write(JSON.stringify(entries, null, 2));
+        write(JSON.stringify(redactConfig(entries), null, 2));
         return 0;
       }
       case 'remove': {
@@ -218,7 +218,10 @@ export async function runCli(args: string[], cwd = process.cwd(), write: (messag
           recoveryWorktree = metadata.worktree;
           recoveryContainerIds = metadata.containerId ? [metadata.containerId] : [];
           const backend = resolveExecutionBackend('local', { remove: async () => {
-            await removeWorkspace(metadata, { confirmed: true, forceWorktree: rest.includes('--force-worktree'), skipContainerCleanup: rest.includes('--skip-container-cleanup'), signal }, nodeProcessRunner, (next) => saveMetadata(stateDir, next), () => deleteMetadata(stateDir, name));
+            await removeWorkspace(metadata, { confirmed: true, forceWorktree: rest.includes('--force-worktree'), skipContainerCleanup: rest.includes('--skip-container-cleanup'), signal }, nodeProcessRunner, (next, saveOptions) => saveMetadata(stateDir, next, saveOptions), (deleteOptions) => {
+              if (typeof deleteOptions.expectedGeneration !== 'string') throw new Error('Workspace metadata deletion requires its observed generation.');
+              return deleteMetadata(stateDir, name, deleteOptions.expectedGeneration);
+            });
           } });
           await backend.remove({ kind: 'local' }, signal);
         }, { onUnconfirmedProcessReap: () => recordManualRecovery(stateDir, name, { reason: 'local-process-reap-unconfirmed', containerIds: recoveryContainerIds, worktree: recoveryWorktree }) });

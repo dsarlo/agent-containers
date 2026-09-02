@@ -220,6 +220,28 @@ test('YAML syntax diagnostics reveal only sanitized locations for direct, file, 
   await assert.rejects(() => loadConfig(path), (error: Error) => /^Invalid configuration syntax at line \d+, column \d+\.$/.test(error.message) && !error.message.includes(sentinel));
 });
 
+test('malformed YAML errors retain no parser-owned secret surfaces', () => {
+  const sentinel = 'PARSER_SURFACE_SECRET_SENTINEL';
+  try { parseConfig(`commands:\n  ${sentinel}: [\n`); } catch (error: unknown) {
+    assert.ok(error instanceof Error);
+    assert.doesNotMatch(error.message, new RegExp(sentinel));
+    assert.equal(error.cause, undefined);
+    assert.doesNotMatch(error.stack ?? '', new RegExp(sentinel));
+    assert.doesNotMatch(JSON.stringify(Object.getOwnPropertyNames(error).map((key) => [key, (error as Error & Record<string, unknown>)[key]])), new RegExp(sentinel));
+    return;
+  }
+  assert.fail('expected malformed YAML to reject');
+});
+
+test('configuration diff redacts the complete split curl authorization argv', () => {
+  const sentinel = 'CURL_HEADER_SECRET_SENTINEL';
+  const candidate = structuredClone(codespaces);
+  candidate.backends.codespaces.readiness.command = ['curl', '-H', 'Authorization: Bearer ' + sentinel];
+  const diff = configurationDiff(null, candidate);
+  assert.doesNotMatch(diff, new RegExp(sentinel));
+  assert.match(diff, /"\[redacted\]"/);
+});
+
 test('configuration previews retain nonsecret Codespaces secret policy while redacting values', () => {
   const candidate = structuredClone(codespaces);
   candidate.backends.codespaces.secrets = { allowedRemoteSecretNames: ['DEPLOY_TOKEN'], allowCodespaceGitCredential: true };
@@ -273,6 +295,21 @@ test('local doctor reports a no-container workspace with every manual recovery r
       assert.equal(recovery?.state, 'action-required');
       assert.match(recovery?.summary ?? '', /may still be active/);
     }
+  } finally { setStateDurabilityAdapterForTesting(undefined); }
+});
+
+test('local doctor recognizes an owned running Docker inspection with Windows CRLF output', async () => {
+  const stateDir = join(await mkdtemp(join(tmpdir(), 'agent-containers-doctor-crlf-')), 'state');
+  const root = '/repo';
+  const id = 'a'.repeat(64);
+  setStateDurabilityAdapterForTesting(durability);
+  try {
+    await saveMetadata(stateDir, { version: 1, name: 'safe', repoRoot: root, worktree: `${root}/worktrees/safe`, branch: 'agent-containers/safe', baseRef: 'refs/heads/main', devcontainerPath: '.devcontainer/devcontainer.json', createdAt: '2026-01-01T00:00:00.000Z', containerId: id });
+    const report = await doctor({ version: 1, workspace: { worktreeRoot: 'worktrees', baseBranch: 'main' }, environment: { devcontainerPath: '.devcontainer/devcontainer.json' }, commands: {} }, 'local', { async run(command, args) {
+      if (command === 'docker' && args[0] === 'inspect') return { code: 0, stdout: `${id}\r\n${root}/worktrees/safe\r\ntrue\r\n`, stderr: '' };
+      return { code: 0, stdout: args[0] === 'rev-parse' ? `${root}\n` : '--relative-paths\n', stderr: '' };
+    } }, root, { stateDir, workspaceName: 'safe' });
+    assert.equal(report.checks.find((check) => check.id === 'local.workspace.runtime')?.state, 'ready');
   } finally { setStateDurabilityAdapterForTesting(undefined); }
 });
 

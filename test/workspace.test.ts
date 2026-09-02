@@ -52,6 +52,15 @@ test('createWorkspace only accepts and records a verified canonical local base r
   assert.deepEqual(calls.at(-1), ['worktree', 'add', '--relative-paths', '-b', 'agent-containers/local', join(directory, 'worktrees', 'local'), 'refs/heads/main']);
 });
 
+test('createWorkspace rejects a Codespaces-only config before recovery, Git, or metadata effects', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'agent-containers-codespaces-only-'));
+  const config = { version: 2, workspace: { worktreeRoot: 'worktrees', baseBranch: 'main' }, project: {}, environment: { devcontainerPath: '.devcontainer/devcontainer.json' }, backends: { enabled: ['codespaces'], default: 'codespaces', local: {}, codespaces: { enabled: true } } } as unknown as AgentContainersConfig;
+  let called = false;
+  await assert.rejects(() => createWorkspace({ cwd: directory, name: 'safe', config, stateDir: join(directory, 'state'), runner: { async run() { called = true; return { code: 0, stdout: '', stderr: '' }; } } }), /Local backend is disabled/);
+  assert.equal(called, false);
+  await assert.rejects(() => readFile(join(directory, 'state', 'locks', 'safe.manual-recovery.journal')), /ENOENT/);
+});
+
 
 test('createWorkspace uses relative Git directory pointers when Git supports them', async () => {
   const directory = await realpath(await mkdtemp(join(tmpdir(), 'agent-containers-workspace-')));

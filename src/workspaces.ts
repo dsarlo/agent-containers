@@ -3,7 +3,7 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import { resolve, win32 } from 'node:path';
 import type { AgentContainersConfig, ProcessResult, ProcessRunner, ProcessRunOptions } from './types.js';
 import { validateWorkspaceName } from './names.js';
-import { bootstrapManualRecoveryJournal, deleteMetadata, isAgentContainersWorkspace, isCanonicalContainerId, isLocalWorkspaceMetadata, loadMetadata, saveMetadata, type LocalMetadata, type MetadataSaveOptions, type WorkspaceMetadata } from './state.js';
+import { bootstrapManualRecoveryJournal, deleteMetadata, isAgentContainersWorkspace, isCanonicalContainerId, isLocalWorkspaceMetadata, loadMetadata, metadataGeneration, saveMetadata, type LocalMetadata, type MetadataSaveOptions, type WorkspaceMetadata } from './state.js';
 import { getAuthoritativeWindowsDirectory } from './durability.js';
 
 export type { ProcessRunner } from './types.js';
@@ -276,6 +276,9 @@ export async function createWorkspace(options: {
   signal?: AbortSignal;
   save?: (stateDir: string, metadata: WorkspaceMetadata, options: MetadataSaveOptions) => Promise<void>;
 }): Promise<LocalMetadata> {
+  // This public boundary must not initialize recovery or inspect Git for a
+  // configuration that cannot ever create a local workspace.
+  if (options.config.version === 2 && !options.config.backends.enabled.includes('local')) throw new Error('Local backend is disabled by configuration.');
   const name = validateWorkspaceName(options.name);
   if (await loadMetadata(options.stateDir, name)) throw new Error(`Agent Containers workspace "${name}" already exists.`);
   // A new workspace may establish its recovery journal before any Git side effect.
@@ -335,12 +338,17 @@ export interface RemoveWorkspaceOptions {
   signal?: AbortSignal;
 }
 
-export async function removeWorkspace(metadata: WorkspaceMetadata, options: RemoveWorkspaceOptions, runner: ProcessRunner, save: (metadata: WorkspaceMetadata) => Promise<void>, removeMetadata: () => Promise<void>): Promise<void> {
+export async function removeWorkspace(metadata: WorkspaceMetadata, options: RemoveWorkspaceOptions, runner: ProcessRunner, save: (metadata: WorkspaceMetadata, options: MetadataSaveOptions) => Promise<void>, removeMetadata: (options: MetadataSaveOptions) => Promise<void>): Promise<void> {
   if (!options.confirmed) throw new Error('Refusing to remove a workspace without --yes.');
   if (!isAgentContainersWorkspace(metadata)) throw new Error('Refusing to remove metadata that is not an Agent Containers workspace.');
   if (!isLocalWorkspaceMetadata(metadata)) throw new Error(`Workspace "${metadata.name}" records the Codespaces backend, which is phase-gated and cannot be removed by local cleanup.`);
   if (metadata.containerId !== undefined && !isCanonicalContainerId(metadata.containerId)) throw new Error('Refusing to inspect or remove a legacy or non-canonical recorded Docker container ID. Verify it manually and repair the metadata first.');
   let current: LocalMetadata = metadata;
+  let generation = metadataGeneration(metadata);
+  const checkpoint = async (): Promise<void> => {
+    await save(current, { expectedGeneration: generation });
+    generation = metadataGeneration(current);
+  };
 
   let worktreePresent = false;
   if (!current.cleanup?.worktree) {
@@ -402,7 +410,7 @@ export async function removeWorkspace(metadata: WorkspaceMetadata, options: Remo
       if (container.code !== 0) throw commandError('docker rm', container);
     }
     current = withCleanup(current, 'container');
-    await save(current);
+    await checkpoint();
   }
 
   if (!current.cleanup?.worktree) {
@@ -414,7 +422,7 @@ export async function removeWorkspace(metadata: WorkspaceMetadata, options: Remo
       }
     }
     current = withCleanup(current, 'worktree');
-    await save(current);
+    await checkpoint();
   }
 
   if (!current.cleanup?.branch) {
@@ -424,9 +432,9 @@ export async function removeWorkspace(metadata: WorkspaceMetadata, options: Remo
       if (branchResult.code !== 0) throw commandError('git update-ref', branchResult);
     }
     current = withCleanup(current, 'branch');
-    await save(current);
+    await checkpoint();
   }
-  await removeMetadata();
+  await removeMetadata({ expectedGeneration: generation });
 }
 
 function isOwnedContainerInspection(output: string, containerId: string, worktree: string): boolean {

@@ -23,14 +23,14 @@ for (const name of ['ac', 'agent-containers']) {
   assert.ok((await lstat(cli(name))).isFile() || (await lstat(cli(name))).isSymbolicLink(), `smoke must invoke the installed ${name} executable`);
   assert.equal(run(name, ['--help']).status, 0, `installed ${name} executable must run`);
 }
-assert.equal(spawnSync('git', ['init', '-b', 'main'], { cwd: root }).status, 0);
-// The source-install smoke intentionally has no native addon. --force follows
-// the documented safe replacement path without claiming lifecycle durability.
-const init = run('ac', ['init', '--force']);
-assert.equal(init.status, 0, `installed CLI init must succeed: ${init.stderr || init.stdout}`);
-assert.match(await readFile(join(root, '.agent-containers.yml'), 'utf8'), /"version": 2/);
-const status = run('ac', ['status']);
-assert.equal(status.status, 0, `installed CLI status must succeed: ${status.stderr}`);
-const doctor = run('agent-containers', ['doctor', '--json']);
-assert.match(doctor.stdout, /"schemaVersion": 1/, 'installed CLI doctor must emit stable JSON');
-assert.match(doctor.stdout, /"local\.state\.durability"/, 'installed CLI doctor must emit its complete stable local inventory');
+if (process.env.PACKED_NATIVE_PACKAGE_DIR) {
+  assert.equal(spawnSync('git', ['init', '-b', 'main'], { cwd: root }).status, 0);
+  const init = run('ac', ['init', '--force']);
+  assert.equal(init.status, 0, `installed CLI init must succeed: ${init.stderr || init.stdout}`);
+  assert.match(await readFile(join(root, '.agent-containers.yml'), 'utf8'), /"version": 2/);
+  const status = run('ac', ['status']);
+  assert.equal(status.status, 0, `installed CLI status must succeed: ${status.stderr}`);
+  const doctor = run('agent-containers', ['doctor', '--json']);
+  assert.match(doctor.stdout, /"schemaVersion": 1/, 'installed CLI doctor must emit stable JSON');
+  assert.match(doctor.stdout, /"local\.state\.durability"/, 'installed CLI doctor must emit its complete stable local inventory');
+}

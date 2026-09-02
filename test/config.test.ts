@@ -203,6 +203,19 @@ test('force onboarding snapshots the original file before confirmation and refus
   assert.equal(await readFile(path, 'utf8'), 'intervening content\n');
 });
 
+test('force onboarding hashes malformed raw bytes and can replace them only under that exact CAS generation', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'agent-containers-init-malformed-snapshot-'));
+  const path = join(directory, '.agent-containers.yml');
+  const malformed = 'commands:\n  SNAPSHOT_SECRET_SENTINEL: [\n';
+  await writeFile(path, malformed);
+  const snapshot = await snapshotInitConfig(directory, true);
+  assert.equal(snapshot.current, null);
+  assert.equal(snapshot.expectedHash, hashConfig(malformed));
+  const config = { version: 2 as const, workspace: { worktreeRoot: 'worktrees', baseBranch: 'main' }, project: {}, environment: { devcontainerPath: '.devcontainer/devcontainer.json' }, backends: { enabled: ['local' as const], default: 'local' as const, local: {}, codespaces: { enabled: false, machine: null, geo: 'auto', idleTimeoutMinutes: 30, retentionPeriodMinutes: 10080, maxTotal: 4, maxRunning: 2, maxCreating: 1, maxParallelCommandsPerWorkspace: 1, readiness: { providerTimeoutSeconds: 1200, sshTimeoutSeconds: 120, command: [], commandTimeoutSeconds: 600 }, transport: { reconnectWindowSeconds: 60, cancelGraceSeconds: 10, remoteLogBytesPerStream: 1, remoteLogRetentionHours: 1 }, ports: { allowVisibilityChanges: false, allowPublic: false }, secrets: { allowedRemoteSecretNames: [], allowCodespaceGitCredential: false } } } };
+  await initConfigV2(directory, config, true, snapshot.expectedHash);
+  assert.equal(parseConfig(await readFile(path, 'utf8')).version, 2);
+});
+
 test('loadConfig rejects wrong-shaped roots and sections instead of defaulting them', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'agent-containers-config-'));
   const path = join(directory, 'config.yml');

@@ -114,7 +114,7 @@ async function localChecks(config: AgentContainersConfig, runner: ProcessRunner,
           workspaceChecks.push(action('local.workspace.runtime', 'Recorded container identity is not a canonical full Docker ID; refusing runtime probe.', 'provisioned-runtime'));
         } else {
           const inspected = await attempt(runner, 'docker', ['inspect', '--format', '{{.Id}}\n{{index .Config.Labels "devcontainer.local_folder"}}\n{{.State.Running}}', metadata.value.containerId], root);
-          const [id, worktree, running] = inspected?.stdout.trim().split('\n') ?? [];
+          const [id, worktree, running] = inspected?.stdout.replace(/\r/g, '').trim().split('\n') ?? [];
           workspaceChecks.push(inspected?.code === 0 && id === metadata.value.containerId && worktree === metadata.value.worktree && running === 'true'
            ? { ...ready('local.workspace.runtime', `Recorded Dev Container ${metadata.value.containerId} is running.`), phase: 'provisioned-runtime' }
            : action('local.workspace.runtime', `Recorded Dev Container ${metadata.value.containerId} is stopped or cannot be inspected.`, 'provisioned-runtime'));

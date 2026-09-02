@@ -249,3 +249,19 @@ test('removeWorkspace atomically verifies the captured base OID before deleting 
   });
   assert.equal(removedMetadata, false, 'a changed base leaves branch cleanup and state intact');
 });
+
+test('removeWorkspace advances expected metadata generations through every checkpoint and final deletion', async () => {
+  const generations: Array<string | null | undefined> = [];
+  const initial = { ...metadata, cleanup: { container: true } };
+  const runner = { async run(_command: string, args: string[]) {
+    if (args[0] === 'worktree' && args[1] === 'list') return { code: 0, stdout: worktreeListing, stderr: '' };
+    if (args[0] === 'show-ref') return { code: 0, stdout: '', stderr: '' };
+    if (args[0] === 'rev-parse') return { code: 0, stdout: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n', stderr: '' };
+    return { code: 0, stdout: '', stderr: '' };
+  } };
+  await removeWorkspace(initial, { confirmed: true }, runner, async (_next, options) => { generations.push(options.expectedGeneration); }, async (options) => { generations.push(options.expectedGeneration); });
+  assert.equal(generations.length, 3);
+  assert.ok(generations.every((generation) => typeof generation === 'string' && generation.length === 64));
+  assert.notEqual(generations[0], generations[1]);
+  assert.notEqual(generations[1], generations[2]);
+});

@@ -4,7 +4,7 @@ import { basename, dirname, isAbsolute, join, posix, win32 } from 'node:path';
 import { parse } from 'yaml';
 import type { AgentContainersConfig, CodespacesAgentContainersConfig, LocalAgentContainersConfig, ProcessResult, ProcessRunner, ProcessRunOptions } from './types.js';
 import { getProductionStateDurabilityAdapter, type StateDurabilityAdapter } from './durability.js';
-import { credentialOptionShaped, redactSecretDiagnostic, secretShaped } from './secrets.js';
+import { credentialArgvShaped, credentialOptionShaped, redactSecretDiagnostic, secretShaped } from './secrets.js';
 
 let testDurabilityAdapter: StateDurabilityAdapter | undefined;
 export function setConfigDurabilityAdapterForTesting(adapter: StateDurabilityAdapter | undefined): void { testDurabilityAdapter = adapter; }
@@ -101,7 +101,11 @@ export async function snapshotInitConfig(directory: string, force: boolean): Pro
     if (entry.nlink > 1) throw new Error(`${path} has multiple hard links; refusing to overwrite it.`);
     if (!force) throw new Error(`${path} already exists; use --force to overwrite it.`);
     const source = await readFile(path, 'utf8');
-    return { current: parseConfig(source), expectedHash: hashConfig(source) };
+    // Force replacement is bound to raw bytes, not a successful parse. A
+    // malformed existing file can be safely replaced after review, while any
+    // intervening byte change still rejects at the CAS boundary.
+    try { return { current: parseConfig(source), expectedHash: hashConfig(source) }; }
+    catch { return { current: null, expectedHash: hashConfig(source) }; }
   } catch (error: unknown) {
     if (isNodeError(error, 'ENOENT')) return { current: null, expectedHash: null };
     throw error;
@@ -508,7 +512,7 @@ export function redactConfig<T>(value: T): T {
   if (!isRecord(value)) return typeof value === 'string' && secretShaped(value) ? '[redacted]' as T : value;
   return Object.fromEntries(Object.entries(value).map(([key, item]) => {
     const policyField = key === 'secrets' || key === 'allowedRemoteSecretNames' || key === 'allowCodespaceGitCredential';
-    const credentialArgv = key === 'command' && Array.isArray(item) && item.some((entry) => typeof entry === 'string' && credentialOptionShaped(entry));
+    const credentialArgv = key === 'command' && Array.isArray(item) && item.every((entry) => typeof entry === 'string') && credentialArgvShaped(item as string[]);
     return [policyField ? key : safeField(key), policyField ? redactConfig(item) : credentialArgv ? item.map(() => '[redacted]') : /(?:token|password|secret|credential|key)/i.test(key) ? '[redacted]' : redactConfig(item)];
   })) as T;
 }
@@ -516,7 +520,9 @@ export function redactConfig<T>(value: T): T {
 function syntaxError(prefix: string, error: unknown): Error {
   const message = error instanceof Error ? error.message : String(error);
   const location = /at line (\d+), column (\d+)/i.exec(message);
-  return new Error(`${prefix}${location ? ` at line ${location[1]}, column ${location[2]}` : ''}.`, { cause: error });
+  // YAML's error object retains source excerpts in message, stack, and marks.
+  // Only retain its non-secret location in our public error.
+  return new Error(`${prefix}${location ? ` at line ${location[1]}, column ${location[2]}` : ''}.`);
 }
 
 /** Never render input-derived diagnostics verbatim at a command boundary. */
