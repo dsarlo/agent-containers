@@ -5,12 +5,13 @@ import { fileURLToPath } from 'node:url';
 import process from 'node:process';
 
 const repository = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm';
-const output = execFileSync(npm, ['pack', '--dry-run', '--json', '--ignore-scripts'], {
-  cwd: repository,
-  encoding: 'utf8',
-  stdio: ['ignore', 'pipe', 'pipe'],
-});
+const packArgs = ['pack', '--dry-run', '--json', '--ignore-scripts'];
+const npmCli = process.env.npm_execpath;
+const output = npmCli
+  ? execFileSync(process.execPath, [npmCli, ...packArgs], { cwd: repository, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
+  : process.platform === 'win32'
+    ? (() => { throw new Error('npm_execpath is required to run the npm pack contract on Windows without a shell.'); })()
+    : execFileSync('npm', packArgs, { cwd: repository, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
 const parsed = JSON.parse(output);
 const packed = Array.isArray(parsed) ? parsed[0] : Object.values(parsed)[0];
 assert.ok(packed && Array.isArray(packed.files), 'npm pack dry-run must report one package file list');
