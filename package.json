@@ -30,6 +30,7 @@
   },
   "files": [
     "dist/src",
+    "scripts/test-cli-setup-smoke.mjs",
     "prebuilds",
     "*.md",
     "docs",
@@ -42,11 +43,13 @@
     "native:verify-prebuilds": "node scripts/verify-native-prebuilds.mjs",
     "verify:native-packaging-contract": "node scripts/verify-native-packaging-contract.mjs",
     "test:native-packaging-contract": "node scripts/test-native-packaging-contract.mjs",
+    "verify:ci-yaml": "node scripts/verify-ci-yaml.mjs",
     "verify:native-state-lifecycle-contract": "node scripts/verify-native-state-lifecycle-contract.mjs",
     "test:native": "npm run build:native && npm run build && npm run verify:native-state-lifecycle-contract && node scripts/test-native.mjs",
     "lint": "eslint .",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "npm run build && node scripts/run-tests.mjs",
+    "test:cli-setup-smoke": "npm run build && node scripts/test-cli-setup-smoke.mjs",
     "test:integration": "AGENT_CONTAINERS_REQUIRE_LIVE_INTEGRATION=1 npm run build && AGENT_CONTAINERS_REQUIRE_LIVE_INTEGRATION=1 node --import ./dist/test/setup.js --test dist/test/integration.test.js",
     "prepack": "npm run build && npm run native:verify-prebuilds"
   },

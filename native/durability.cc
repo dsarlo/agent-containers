@@ -172,6 +172,25 @@ napi_value MoveFileWriteThrough(napi_env env, napi_callback_info info) {
 #endif
 }
 
+napi_value MoveFileNoReplaceWriteThrough(napi_env env, napi_callback_info info) {
+  const std::string source = ArgumentString(env, info, 0);
+  if (source.empty()) return nullptr;
+  const std::string destination = ArgumentString(env, info, 1);
+  if (destination.empty()) return nullptr;
+#ifdef _WIN32
+  const std::wstring wideSource = ToWide(source);
+  const std::wstring wideDestination = ToWide(destination);
+  if (wideSource.empty() || wideDestination.empty()) return MoveResult(env, false, source, destination, "move-file-write-through", "Paths are not valid UTF-8.");
+  const bool ok = MoveFileExW(wideSource.c_str(), wideDestination.c_str(), MOVEFILE_WRITE_THROUGH) != 0;
+  const DWORD error = ok ? ERROR_SUCCESS : GetLastError();
+  const char* code = error == ERROR_ALREADY_EXISTS || error == ERROR_FILE_EXISTS ? "EEXIST" : nullptr;
+  const char* windows_error = error == ERROR_ACCESS_DENIED ? "ERROR_ACCESS_DENIED" : nullptr;
+  return MoveResult(env, ok, source, destination, "move-file-write-through", ok ? "" : WinError(error), code, windows_error);
+#else
+  return MoveResult(env, false, source, destination, "unsupported", "Write-through rename is only available through MoveFileExW on Windows.");
+#endif
+}
+
 napi_value WindowsDirectory(napi_env env, napi_callback_info) {
 #ifdef _WIN32
   std::vector<wchar_t> buffer(MAX_PATH);
@@ -197,6 +216,7 @@ napi_value Init(napi_env env, napi_value exports) {
       {"capabilities", nullptr, Capabilities, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"syncPath", nullptr, SyncPath, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"moveFileWriteThrough", nullptr, MoveFileWriteThrough, nullptr, nullptr, nullptr, napi_default, nullptr},
+      {"moveFileNoReplaceWriteThrough", nullptr, MoveFileNoReplaceWriteThrough, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"windowsDirectory", nullptr, WindowsDirectory, nullptr, nullptr, nullptr, napi_default, nullptr},
   };
   napi_define_properties(env, exports, sizeof(properties) / sizeof(properties[0]), properties);

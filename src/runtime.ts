@@ -2,7 +2,7 @@ import { readFile, realpath } from 'node:fs/promises';
 import { parse, type ParseError } from 'jsonc-parser';
 import { isAbsolute, relative, resolve } from 'node:path';
 import type { ProcessOutputEvent, ProcessResult, ProcessRunner, ProcessRunOptions } from './types.js';
-import { bootstrapManualRecoveryJournal, clearManualRecovery, isCanonicalContainerId, loadMetadata, recordManualRecovery, saveMetadata, withWorkspaceLock, type WorkspaceMetadata } from './state.js';
+import { bootstrapManualRecoveryJournal, clearManualRecovery, isCanonicalContainerId, isLocalWorkspaceMetadata, loadMetadata, metadataGeneration, recordManualRecovery, saveMetadata, withWorkspaceLock, type LocalMetadata, type WorkspaceMetadata } from './state.js';
 import { resolveDevcontainerInvocation, type DevcontainerInvocation } from './devcontainer.js';
 import { UnconfirmedProcessReapError } from './workspaces.js';
 
@@ -27,16 +27,22 @@ const readDevcontainerConfig: ConfigReader = (path) => readFile(path, 'utf8');
 const resolveSyntheticPath: PathResolver = async (path) => path;
 
 /** Run the remote lifecycle under its durable workspace lock and recovery guard. */
-export async function execWorkspaceLifecycle(metadata: WorkspaceMetadata, command: string[], runner: ProcessRunner, _save: (metadata: WorkspaceMetadata) => Promise<void>, stateDir: string, readConfig: ConfigReader = readDevcontainerConfig): Promise<ProcessResult> {
+export async function execWorkspaceLifecycle(metadata: WorkspaceMetadata, command: string[], runner: ProcessRunner, save: (metadata: LocalMetadata) => Promise<void>, stateDir: string, readConfig: ConfigReader = readDevcontainerConfig): Promise<ProcessResult> {
+  assertLocalMetadata(metadata);
+  // Reject a durable backend swap before constructing any local lifecycle state.
+  const initial = await loadMetadata(stateDir, metadata.name);
+  if (!initial) throw new Error(`No Agent Containers workspace named "${metadata.name}".`);
+  assertLocalMetadata(initial);
   return withWorkspaceLock(stateDir, metadata.name, async (signal) => {
     const recorded = await loadMetadata(stateDir, metadata.name);
     if (!recorded) throw new Error(`No Agent Containers workspace named "${metadata.name}".`);
+    assertLocalMetadata(recorded);
     await requireInitializedRecoveryJournal(stateDir, metadata.name);
     return execWorkspace(
       recorded,
       command,
       runner,
-      (next) => saveMetadata(stateDir, next),
+      (next) => saveMetadata(stateDir, next, { expectedGeneration: metadataGeneration(recorded) }),
       readConfig,
       signal,
       (recovery) => recordManualRecovery(stateDir, recorded.name, recovery),
@@ -47,15 +53,22 @@ export async function execWorkspaceLifecycle(metadata: WorkspaceMetadata, comman
 
 /** Load the current workspace record only after acquiring its lifecycle lock. */
 export async function execNamedWorkspaceLifecycle(name: string, command: string[], runner: ProcessRunner, stateDir: string, readConfig: ConfigReader = readDevcontainerConfig): Promise<ProcessResult> {
+  // Narrow durable identity before creating any local recovery/journal state.
+  // A same-name remote record must never cause local lifecycle side effects.
+  const initial = await loadMetadata(stateDir, name);
+  // A missing record can be created or removed before the lock is acquired;
+  // only a positively observed remote record is safe to reject before lock IO.
+  if (initial) assertLocalMetadata(initial);
   return withWorkspaceLock(stateDir, name, async (signal) => {
     const metadata = await loadMetadata(stateDir, name);
     if (!metadata) throw new Error(`No Agent Containers workspace named "${name}".`);
+    assertLocalMetadata(metadata);
     await requireInitializedRecoveryJournal(stateDir, name);
     return execWorkspace(
       metadata,
       command,
       runner,
-      (next) => saveMetadata(stateDir, next),
+      (next) => saveMetadata(stateDir, next, { expectedGeneration: metadataGeneration(metadata) }),
       readConfig,
       signal,
       (recovery) => recordManualRecovery(stateDir, metadata.name, recovery),
@@ -64,7 +77,8 @@ export async function execNamedWorkspaceLifecycle(name: string, command: string[
   });
 }
 
-export async function execWorkspace(metadata: WorkspaceMetadata, command: string[], runner: ProcessRunner, save: (metadata: WorkspaceMetadata) => Promise<void>, readConfig: ConfigReader = readDevcontainerConfig, signal?: AbortSignal, recordRecovery: RecoveryRecorder = missingRecoveryRecorder, clearRecovery: RecoveryClearer = missingRecoveryClearer, resolvePath: PathResolver = readConfig === readDevcontainerConfig ? realpath : resolveSyntheticPath, devcontainer?: DevcontainerInvocation): Promise<ProcessResult> {
+export async function execWorkspace(metadata: WorkspaceMetadata, command: string[], runner: ProcessRunner, save: (metadata: LocalMetadata) => Promise<void>, readConfig: ConfigReader = readDevcontainerConfig, signal?: AbortSignal, recordRecovery: RecoveryRecorder = missingRecoveryRecorder, clearRecovery: RecoveryClearer = missingRecoveryClearer, resolvePath: PathResolver = readConfig === readDevcontainerConfig ? realpath : resolveSyntheticPath, devcontainer?: DevcontainerInvocation): Promise<ProcessResult> {
+  assertLocalMetadata(metadata);
   if (command.length === 0) throw new Error('A command is required after --.');
   if (metadata.containerId !== undefined && !isCanonicalContainerId(metadata.containerId)) throw new Error(`Workspace ${metadata.name} has a legacy or non-canonical container ID. Verify the container manually, then clear or repair the recorded metadata before running lifecycle commands.`);
   const configPath = await resolveDevcontainerConfigPath(metadata.worktree, metadata.devcontainerPath, resolvePath);
@@ -122,11 +136,15 @@ export async function execWorkspace(metadata: WorkspaceMetadata, command: string
   return result;
 }
 
+function assertLocalMetadata(metadata: WorkspaceMetadata): asserts metadata is LocalMetadata {
+  if (!isLocalWorkspaceMetadata(metadata)) throw new Error(`Workspace "${metadata.name}" records the Codespaces backend, which is not implemented in this release.`);
+}
+
 /**
  * An aborted local `up` has no trustworthy terminal container ID. Query Docker
  * by the exact Dev Containers local-folder label, but never remove a result.
  */
-async function ambiguousUpRecovery(metadata: WorkspaceMetadata, runner: ProcessRunner, _save: (metadata: WorkspaceMetadata) => Promise<void>, recordRecovery: RecoveryRecorder, outcome: string): Promise<never> {
+async function ambiguousUpRecovery(metadata: LocalMetadata, runner: ProcessRunner, _save: (metadata: LocalMetadata) => Promise<void>, recordRecovery: RecoveryRecorder, outcome: string): Promise<never> {
   const inspectionSignal = AbortSignal.timeout(5_000);
   const zeroCandidatePolls = 3;
   let matching: string[] = [];
@@ -162,14 +180,14 @@ async function ambiguousUpRecovery(metadata: WorkspaceMetadata, runner: ProcessR
     : `${outcome}. Found ${matching.length} containers with the exact worktree label; ownership is ambiguous`);
 }
 
-async function recordAmbiguousUp(recordRecovery: RecoveryRecorder, metadata: WorkspaceMetadata, containerIds: string[], detail: string): Promise<never> {
+async function recordAmbiguousUp(recordRecovery: RecoveryRecorder, metadata: LocalMetadata, containerIds: string[], detail: string): Promise<never> {
   await recordRecovery({ reason: 'devcontainer-up-ambiguous', containerIds: recoveryHints(metadata, containerIds), worktree: metadata.worktree });
   throw new Error(`${detail}. Agent Containers did not remove any container and recorded a manual recovery block; verify Docker state before clearing it.`);
 }
 
 function isDockerContainerId(value: string): boolean { return isCanonicalContainerId(value); }
 
-async function inspectOwnedContainer(metadata: WorkspaceMetadata, containerId: string, runner: ProcessRunner, signal?: AbortSignal): Promise<boolean> {
+async function inspectOwnedContainer(metadata: LocalMetadata, containerId: string, runner: ProcessRunner, signal?: AbortSignal): Promise<boolean> {
   const inspection = await runner.run('docker', ['inspect', '--format', '{{.Id}}\n{{ index .Config.Labels "devcontainer.local_folder" }}', containerId], withSignal({ kind: 'readonly-probe' }, signal));
   return inspection.code === 0 && isOwnedContainerInspection(inspection.stdout, containerId, metadata.worktree);
 }
@@ -179,12 +197,12 @@ function isOwnedContainerInspection(output: string, containerId: string, worktre
   return extra.length === 0 && id === containerId && label === worktree;
 }
 
-async function unconfirmedReapRecovery(metadata: WorkspaceMetadata, recordRecovery: RecoveryRecorder, detail: string, containerIds: string[] = []): Promise<never> {
+async function unconfirmedReapRecovery(metadata: LocalMetadata, recordRecovery: RecoveryRecorder, detail: string, containerIds: string[] = []): Promise<never> {
   await recordRecovery({ reason: 'local-process-reap-unconfirmed', containerIds: recoveryHints(metadata, containerIds), worktree: metadata.worktree });
   throw new Error(`Local Dev Containers process reaping could not be confirmed: ${detail} Agent Containers recorded a manual-recovery block; verify the local process tree and remote container state, then explicitly acknowledge recovery before running another lifecycle operation.`);
 }
 
-function recoveryHints(metadata: WorkspaceMetadata, observed: string[]): string[] {
+function recoveryHints(metadata: LocalMetadata, observed: string[]): string[] {
   return [...new Set([metadata.containerId, ...observed].filter(isCanonicalContainerId))];
 }
 

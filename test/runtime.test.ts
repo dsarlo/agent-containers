@@ -1,11 +1,11 @@
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, symlink, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, mkdtemp, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import test from 'node:test';
 import { createDevcontainerProgressReporter, devcontainerUpFailureDetail, execNamedWorkspaceLifecycle, execWorkspace, execWorkspaceLifecycle, formatDevcontainerProgressLine, type ProcessRunner } from '../src/runtime.js';
 import type { ProcessRunOptions } from '../src/types.js';
-import { bootstrapManualRecoveryJournal, clearManualRecovery, deleteMetadata, loadManualRecovery, loadMetadata, recordManualRecovery, saveMetadata, withWorkspaceLock, type WorkspaceMetadata } from '../src/state.js';
+import { bootstrapManualRecoveryJournal, clearManualRecovery, deleteMetadata, isLocalWorkspaceMetadata, loadManualRecovery, loadMetadata, recordManualRecovery, saveMetadata, withWorkspaceLock, type CodespacesWorkspaceMetadata, type LocalMetadata, type WorkspaceMetadata } from '../src/state.js';
 import { UnconfirmedProcessReapError } from '../src/workspaces.js';
 
 const noOpRecovery = async (): Promise<void> => undefined;
@@ -15,7 +15,7 @@ const knownContainerId = 'fedcba9876543210fedcba9876543210fedcba9876543210fedcba
 const repoRoot = resolve(tmpdir(), 'agent-containers-runtime-repo');
 const worktree = join(repoRoot, 'worktrees', 'safe-name');
 
-const metadata: WorkspaceMetadata = {
+const metadata: LocalMetadata = {
   version: 1,
   name: 'safe-name',
   repoRoot,
@@ -26,11 +26,41 @@ const metadata: WorkspaceMetadata = {
   createdAt: '2026-01-01T00:00:00.000Z',
 };
 
+const codespacesMetadata: CodespacesWorkspaceMetadata = {
+  version: 2,
+  backend: 'codespaces',
+  name: 'safe-name',
+  workspaceId: '11111111-1111-4111-8111-111111111111',
+  createdAt: '2026-01-01T00:00:00.000Z',
+  control: { githubHost: 'github.com', actorId: '1', actorLogin: 'octo', ghVersion: '2.0.0' },
+  repository: { id: '2', owner: 'owner', name: 'repo' },
+  source: { requestedRef: 'refs/heads/main', expectedOid: '0123456789012345678901234567890123456789', effectiveBranch: 'agent-containers/safe-name', devcontainerPath: '.devcontainer/devcontainer.json', devcontainerBlobOid: 'abcdefabcdefabcdefabcdefabcdefabcdefabcd' },
+  remote: { codespaceId: '3', name: 'safe-codespace', environmentId: 'env', ownerId: '1', ownerLogin: 'octo', billableOwnerId: '1', machine: 'basicLinux32gb', geo: 'WestUs2', createdAt: '2026-01-01T00:00:00.000Z' },
+  lifecycle: { desired: 'ready', normalized: 'provisioning', providerRawState: 'Provisioning', lastObservedAt: '2026-01-01T00:00:00.000Z', activeOperation: null },
+  recovery: null,
+  cleanup: { remoteStopped: false, remoteDeleted: false, tombstoneWritten: false },
+};
+
 const ownedInspection = (id: string): string => `${id}\n${metadata.worktree}\n`;
+
+test('Codespaces metadata never enters a local lifecycle, recovery, or container path', async () => {
+  let runnerCalls = 0;
+  let saveCalls = 0;
+  let recoveryCalls = 0;
+  const runner: ProcessRunner = { async run() { runnerCalls += 1; return { code: 0, stdout: '', stderr: '' }; } };
+
+  await assert.rejects(
+    () => execWorkspace(codespacesMetadata, ['true'], runner, async () => { saveCalls += 1; }, async () => '{}', undefined, async () => { recoveryCalls += 1; }),
+    /Codespaces backend.*not implemented/i,
+  );
+  assert.equal(runnerCalls, 0);
+  assert.equal(saveCalls, 0);
+  assert.equal(recoveryCalls, 0);
+});
 
 test('execWorkspace uses the linked-worktree mount, requires a current container ID, and inherits the terminal for agents', async () => {
   const calls: Array<{ command: string; args: string[]; options?: ProcessRunOptions }> = [];
-  let saved: WorkspaceMetadata | undefined;
+  let saved: LocalMetadata | undefined;
   const runner: ProcessRunner = {
     async run(command, args, options) {
       calls.push({ command, args, options });
@@ -145,6 +175,16 @@ test('execWorkspaceLifecycle supplies durable recovery callbacks under the works
   await withWorkspaceLock(stateDir, metadata.name, async () => undefined);
 });
 
+test('execWorkspaceLifecycle rejects a durably reloaded Codespaces record before any local journal or runner side effect', async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), 'agent-containers-remote-reload-'));
+  await saveMetadata(stateDir, codespacesMetadata);
+  let runnerCalls = 0;
+  const runner: ProcessRunner = { async run() { runnerCalls += 1; return { code: 0, stdout: '', stderr: '' }; } };
+  await assert.rejects(() => execWorkspaceLifecycle(metadata, ['true'], runner, async () => undefined, stateDir, async () => '{}'), /Codespaces backend.*not implemented/i);
+  assert.equal(runnerCalls, 0);
+  await assert.rejects(() => lstat(join(stateDir, 'locks', `${metadata.name}.manual-recovery.journal`)), { code: 'ENOENT' });
+});
+
 test('execWorkspaceLifecycle reloads recorded metadata under its lock instead of persisting a stale terminal ID', async () => {
   const stateDir = await mkdtemp(join(tmpdir(), 'agent-containers-stale-lifecycle-'));
   const recorded = { ...metadata, containerId: knownContainerId };
@@ -179,7 +219,9 @@ test('execWorkspaceLifecycle reloads recorded metadata under its lock instead of
     () => executing,
     /recorded container.*manual recovery/i,
   );
-  assert.equal((await loadMetadata(stateDir, metadata.name))?.containerId, knownContainerId, 'the canonical record is not replaced by the stale invocation');
+  const persisted = await loadMetadata(stateDir, metadata.name);
+  assert.ok(persisted && isLocalWorkspaceMetadata(persisted));
+  assert.equal(persisted.containerId, knownContainerId, 'the canonical record is not replaced by the stale invocation');
   const recovery = await loadManualRecovery(stateDir, metadata.name);
   assert.equal(recovery?.reason, 'devcontainer-up-ambiguous');
   assert.deepEqual(recovery?.containerIds, [knownContainerId, untrackedContainerId]);
@@ -204,7 +246,9 @@ test('execWorkspaceLifecycle records known and terminal IDs when Docker inspecti
   };
 
   await assert.rejects(() => execWorkspaceLifecycle(recorded, ['true'], runner, async () => undefined, stateDir, async () => '{}'), /Docker inspection transport failed.*manual recovery/i);
-  assert.equal((await loadMetadata(stateDir, metadata.name))?.containerId, knownContainerId);
+  const persisted = await loadMetadata(stateDir, metadata.name);
+  assert.ok(persisted && isLocalWorkspaceMetadata(persisted));
+  assert.equal(persisted.containerId, knownContainerId);
   const recovery = await loadManualRecovery(stateDir, metadata.name);
   assert.equal(recovery?.reason, 'devcontainer-up-ambiguous');
   assert.deepEqual(recovery?.containerIds, [knownContainerId, untrackedContainerId]);
@@ -228,7 +272,9 @@ test('execWorkspaceLifecycle retains the terminal ID without adoption when Docke
   };
 
   await assert.rejects(() => execWorkspaceLifecycle(metadata, ['true'], runner, async () => undefined, stateDir, async () => '{}'), /Docker inspection transport failed.*manual recovery/i);
-  assert.equal((await loadMetadata(stateDir, metadata.name))?.containerId, undefined, 'an unverified terminal ID is not adopted');
+  const persisted = await loadMetadata(stateDir, metadata.name);
+  assert.ok(persisted && isLocalWorkspaceMetadata(persisted));
+  assert.equal(persisted.containerId, undefined, 'an unverified terminal ID is not adopted');
   const recovery = await loadManualRecovery(stateDir, metadata.name);
   assert.equal(recovery?.reason, 'devcontainer-up-ambiguous');
   assert.deepEqual(recovery?.containerIds, [untrackedContainerId]);
@@ -611,7 +657,7 @@ test('execWorkspace never replaces a recorded canonical container ID with a dist
 });
 
 test('execWorkspace adopts an exact inspected terminal ID only when no ID was previously recorded', async () => {
-  let saved: WorkspaceMetadata | undefined;
+  let saved: LocalMetadata | undefined;
   const runner: ProcessRunner = {
     async run(_command, args) {
       return args[0] === 'up'

@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict';
-import { lstat, link, mkdtemp, readFile, symlink, writeFile } from 'node:fs/promises';
+import { lstat, link, mkdtemp, readFile, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
-import { CONFIG_OUTLINE, assertDevcontainerPathCommittedOnBaseBranch, initConfig, loadConfig } from '../src/config.js';
+import { CONFIG_OUTLINE, assertDevcontainerPathCommittedOnBaseBranch, hashConfig, initConfig, initConfigV2, loadConfig, parseCodespacesDraft, parseConfig, saveConfigAtomic, snapshotInitConfig } from '../src/config.js';
 import type { AgentContainersConfig, ProcessRunner } from '../src/types.js';
 
 test('base-branch Dev Container validation uses a safe Git path through the injected runner', async () => {
@@ -159,17 +159,61 @@ test('initConfig never overwrites a symlink, including with --force', async (t) 
   assert.equal((await lstat(path)).isSymbolicLink(), true);
 });
 
-test('initConfig force-replaces only its own hard link', async () => {
+test('initConfigV2 never replaces a dangling configuration symlink', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'agent-containers-config-v2-symlink-'));
+  const path = join(directory, '.agent-containers.yml');
+  await symlink(join(directory, 'missing.yml'), path);
+  const config = { version: 2 as const, workspace: { worktreeRoot: 'worktrees', baseBranch: 'main' }, project: {}, environment: { devcontainerPath: '.devcontainer/devcontainer.json' }, backends: { enabled: ['local' as const], default: 'local' as const, local: {}, codespaces: { enabled: false, machine: null, geo: 'auto', idleTimeoutMinutes: 30, retentionPeriodMinutes: 10080, maxTotal: 4, maxRunning: 2, maxCreating: 1, maxParallelCommandsPerWorkspace: 1, readiness: { providerTimeoutSeconds: 1200, sshTimeoutSeconds: 120, command: [], commandTimeoutSeconds: 600 }, transport: { reconnectWindowSeconds: 60, cancelGraceSeconds: 10, remoteLogBytesPerStream: 67108864, remoteLogRetentionHours: 168 }, ports: { allowVisibilityChanges: false, allowPublic: false }, secrets: { allowedRemoteSecretNames: [], allowCodespaceGitCredential: false } } } };
+  await assert.rejects(() => initConfigV2(directory, config), /symlink/);
+  assert.equal((await lstat(path)).isSymbolicLink(), true);
+});
+
+test('initConfig force refuses a hard-linked configuration', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'agent-containers-config-'));
   const external = join(directory, 'external.yml');
   const path = join(directory, '.agent-containers.yml');
   await writeFile(external, 'external contents\n');
   await link(external, path);
 
-  await initConfig(directory, true);
+  await assert.rejects(() => initConfig(directory, true), /multiple hard links/);
 
   assert.equal(await readFile(external, 'utf8'), 'external contents\n');
-  assert.equal(await readFile(path, 'utf8'), CONFIG_OUTLINE);
+  assert.equal(await readFile(path, 'utf8'), 'external contents\n');
+});
+
+test('force onboarding snapshots the original file before confirmation and refuses an intervening change', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'agent-containers-init-snapshot-'));
+  const path = join(directory, '.agent-containers.yml');
+  await writeFile(path, 'version: 1\n');
+  const snapshot = await snapshotInitConfig(directory, true);
+  assert.equal(snapshot.expectedHash, hashConfig('version: 1\n'));
+  assert.equal(snapshot.current?.version, 1);
+  await writeFile(path, 'intervening content\n');
+  const config = {
+    version: 2 as const,
+    workspace: { worktreeRoot: 'worktrees', baseBranch: 'main' }, project: {}, environment: { devcontainerPath: '.devcontainer/devcontainer.json' },
+    backends: { enabled: ['local' as const], default: 'local' as const, local: {}, codespaces: {
+      enabled: false, machine: null, geo: 'auto', idleTimeoutMinutes: 30, retentionPeriodMinutes: 10080, maxTotal: 4, maxRunning: 2, maxCreating: 1, maxParallelCommandsPerWorkspace: 1,
+      readiness: { providerTimeoutSeconds: 1200, sshTimeoutSeconds: 120, command: [], commandTimeoutSeconds: 600 },
+      transport: { reconnectWindowSeconds: 60, cancelGraceSeconds: 10, remoteLogBytesPerStream: 67108864, remoteLogRetentionHours: 168 },
+      ports: { allowVisibilityChanges: false, allowPublic: false }, secrets: { allowedRemoteSecretNames: [], allowCodespaceGitCredential: false },
+    } },
+  };
+  await assert.rejects(() => initConfigV2(directory, config, true, snapshot.expectedHash), /changed concurrently/);
+  assert.equal(await readFile(path, 'utf8'), 'intervening content\n');
+});
+
+test('force onboarding hashes malformed raw bytes and can replace them only under that exact CAS generation', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'agent-containers-init-malformed-snapshot-'));
+  const path = join(directory, '.agent-containers.yml');
+  const malformed = 'commands:\n  SNAPSHOT_SECRET_SENTINEL: [\n';
+  await writeFile(path, malformed);
+  const snapshot = await snapshotInitConfig(directory, true);
+  assert.equal(snapshot.current, null);
+  assert.equal(snapshot.expectedHash, hashConfig(malformed));
+  const config = { version: 2 as const, workspace: { worktreeRoot: 'worktrees', baseBranch: 'main' }, project: {}, environment: { devcontainerPath: '.devcontainer/devcontainer.json' }, backends: { enabled: ['local' as const], default: 'local' as const, local: {}, codespaces: { enabled: false, machine: null, geo: 'auto', idleTimeoutMinutes: 30, retentionPeriodMinutes: 10080, maxTotal: 4, maxRunning: 2, maxCreating: 1, maxParallelCommandsPerWorkspace: 1, readiness: { providerTimeoutSeconds: 1200, sshTimeoutSeconds: 120, command: [], commandTimeoutSeconds: 600 }, transport: { reconnectWindowSeconds: 60, cancelGraceSeconds: 10, remoteLogBytesPerStream: 1, remoteLogRetentionHours: 1 }, ports: { allowVisibilityChanges: false, allowPublic: false }, secrets: { allowedRemoteSecretNames: [], allowCodespaceGitCredential: false } } } };
+  await initConfigV2(directory, config, true, snapshot.expectedHash);
+  assert.equal(parseConfig(await readFile(path, 'utf8')).version, 2);
 });
 
 test('loadConfig rejects wrong-shaped roots and sections instead of defaulting them', async () => {
@@ -193,5 +237,47 @@ test('loadConfig rejects unknown schema keys while allowing arbitrary command na
     await assert.rejects(() => loadConfig(path), /unknown key/);
   }
   await writeFile(path, 'commands:\n  any-user-defined-name: npm test\n');
-  assert.equal((await loadConfig(path)).commands['any-user-defined-name'], 'npm test');
+  const config = await loadConfig(path);
+  assert.equal(config.version, 1);
+  if (config.version !== 1) throw new Error('expected legacy local configuration');
+  assert.equal(config.commands['any-user-defined-name'], 'npm test');
+});
+
+test('Codespaces setup rejects secret-shaped freeform values before preview or persistence', async () => {
+  const candidate = {
+    version: 2,
+    workspace: { worktreeRoot: 'worktrees', baseBranch: 'main' },
+    project: { repository: 'owner/repo', ref: 'refs/heads/main' },
+    environment: { devcontainerPath: '.devcontainer/devcontainer.json' },
+    backends: { enabled: ['codespaces'], default: 'codespaces', local: {}, codespaces: { enabled: true, machine: null, geo: 'auto', idleTimeoutMinutes: 30, retentionPeriodMinutes: 10080, maxTotal: 4, maxRunning: 2, maxCreating: 1, maxParallelCommandsPerWorkspace: 1, readiness: { providerTimeoutSeconds: 1200, sshTimeoutSeconds: 120, command: ['curl', 'Authorization: Bearer ghp_abcdefghijklmnopqrstuvwxyz1234567890'], commandTimeoutSeconds: 600 }, transport: { reconnectWindowSeconds: 60, cancelGraceSeconds: 10, remoteLogBytesPerStream: 67108864, remoteLogRetentionHours: 168 }, ports: { allowVisibilityChanges: false, allowPublic: false }, secrets: { allowedRemoteSecretNames: [], allowCodespaceGitCredential: false } } },
+  };
+  assert.throws(() => parseCodespacesDraft(JSON.stringify(candidate)), /secret-shaped/i);
+});
+
+test('Codespaces secret policy rejects token-shaped identifiers before persistence while retaining capability names', () => {
+  const candidate = { version: 2, workspace: { worktreeRoot: 'worktrees', baseBranch: 'main' }, project: { repository: 'owner/repo', ref: 'refs/heads/main' }, environment: { devcontainerPath: '.devcontainer/devcontainer.json' }, backends: { enabled: ['codespaces'], default: 'codespaces', local: {}, codespaces: { enabled: true, machine: null, geo: 'auto', idleTimeoutMinutes: 30, retentionPeriodMinutes: 10080, maxTotal: 4, maxRunning: 2, maxCreating: 1, maxParallelCommandsPerWorkspace: 1, readiness: { providerTimeoutSeconds: 1200, sshTimeoutSeconds: 120, command: [], commandTimeoutSeconds: 600 }, transport: { reconnectWindowSeconds: 60, cancelGraceSeconds: 10, remoteLogBytesPerStream: 1, remoteLogRetentionHours: 1 }, ports: { allowVisibilityChanges: false, allowPublic: false }, secrets: { allowedRemoteSecretNames: ['DEPLOY_TOKEN'], allowCodespaceGitCredential: false } } } };
+  assert.doesNotThrow(() => parseCodespacesDraft(JSON.stringify(candidate)));
+  candidate.backends.codespaces.secrets.allowedRemoteSecretNames = ['github_pat_abcdefghijklmnopqrstuvwxyz1234567890'];
+  assert.throws(() => parseCodespacesDraft(JSON.stringify(candidate)), (error: Error) => !error.message.includes('github_pat_'));
+});
+
+test('legacy command names reject credential-shaped identifiers without exposing them', () => {
+  const key = 'github_pat_abcdefghijklmnopqrstuvwxyz1234567890';
+  assert.throws(() => parseConfig(`version: 1\ncommands:\n  ${key}: npm test\n`), (error: Error) => !error.message.includes(key));
+});
+
+test('Codespaces setup rejects split curl Authorization headers without exposing their value', () => {
+  const candidate = { version: 2, workspace: { worktreeRoot: 'worktrees', baseBranch: 'main' }, project: { repository: 'owner/repo', ref: 'refs/heads/main' }, environment: { devcontainerPath: '.devcontainer/devcontainer.json' }, backends: { enabled: ['codespaces'], default: 'codespaces', local: {}, codespaces: { enabled: true, machine: null, geo: 'auto', idleTimeoutMinutes: 30, retentionPeriodMinutes: 10080, maxTotal: 4, maxRunning: 2, maxCreating: 1, maxParallelCommandsPerWorkspace: 1, readiness: { providerTimeoutSeconds: 1200, sshTimeoutSeconds: 120, command: ['curl', '-H', 'Authorization:', 'Bearer', 'not-token-shaped'], commandTimeoutSeconds: 600 }, transport: { reconnectWindowSeconds: 60, cancelGraceSeconds: 10, remoteLogBytesPerStream: 67108864, remoteLogRetentionHours: 168 }, ports: { allowVisibilityChanges: false, allowPublic: false }, secrets: { allowedRemoteSecretNames: [], allowCodespaceGitCredential: false } } } };
+  assert.throws(() => parseCodespacesDraft(JSON.stringify(candidate)), (error: Error) => /credential header/.test(error.message) && !error.message.includes('not-token-shaped'));
+});
+
+test('equivalent canonical config returns no-change without durability or lock writes', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'agent-containers-config-no-change-'));
+  const path = join(directory, '.agent-containers.yml');
+  const config = { version: 2 as const, workspace: { worktreeRoot: 'worktrees', baseBranch: 'main' }, project: {}, environment: { devcontainerPath: '.devcontainer/devcontainer.json' }, backends: { enabled: ['local' as const], default: 'local' as const, local: {}, codespaces: { enabled: false, machine: null, geo: 'auto', idleTimeoutMinutes: 30, retentionPeriodMinutes: 10080, maxTotal: 4, maxRunning: 2, maxCreating: 1, maxParallelCommandsPerWorkspace: 1, readiness: { providerTimeoutSeconds: 1200, sshTimeoutSeconds: 120, command: [], commandTimeoutSeconds: 600 }, transport: { reconnectWindowSeconds: 60, cancelGraceSeconds: 10, remoteLogBytesPerStream: 67108864, remoteLogRetentionHours: 168 }, ports: { allowVisibilityChanges: false, allowPublic: false }, secrets: { allowedRemoteSecretNames: [], allowCodespaceGitCredential: false } } } };
+  await writeFile(path, `${JSON.stringify(config, null, 2)}\n`);
+  const before = await stat(path);
+  const result = await saveConfigAtomic(path, config, undefined, { durabilityAdapter: { assertStateWriteSupport: async () => { throw new Error('must not write'); }, publicationMode: async () => 'strict', syncFile: async () => undefined, syncDirectory: async () => undefined, moveFileWriteThrough: async () => undefined } });
+  assert.equal(result, 'no-change');
+  assert.equal((await stat(path)).mtimeMs, before.mtimeMs);
 });

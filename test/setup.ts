@@ -1,4 +1,5 @@
 import { setStateDurabilityAdapterForTesting } from '../src/state.js';
+import { setConfigDurabilityAdapterForTesting } from '../src/config.js';
 import type { StateDurabilityAdapter } from '../src/durability.js';
 
 const testDurabilityAdapter: StateDurabilityAdapter = {
@@ -10,3 +11,4 @@ const testDurabilityAdapter: StateDurabilityAdapter = {
 };
 
 setStateDurabilityAdapterForTesting(testDurabilityAdapter);
+setConfigDurabilityAdapterForTesting(testDurabilityAdapter);

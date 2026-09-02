@@ -4,8 +4,9 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
+import { Readable, Writable } from 'node:stream';
 import test from 'node:test';
-import { loadManualRecovery, loadMetadata, recordManualRecovery, saveMetadata, setStateDurableRenameForTesting, withWorkspaceLock } from '../src/state.js';
+import { isLocalWorkspaceMetadata, loadManualRecovery, loadMetadata, recordManualRecovery, saveMetadata, setStateDurableRenameForTesting, withWorkspaceLock } from '../src/state.js';
 import { exitCodeForError, runCli } from '../src/cli.js';
 import { nodeProcessRunner, UnconfirmedProcessReapError } from '../src/workspaces.js';
 
@@ -54,6 +55,22 @@ test('CLI help returns success and describes public commands', async () => {
   const recoveryMessages: string[] = [];
   assert.equal(await runCli(['recover', 'safe', '--yes'], process.cwd(), (message) => recoveryMessages.push(message)), 2);
   assert.match(recoveryMessages.at(-1) ?? '', /--remote-command-stopped/);
+});
+
+test('CLI stdin YAML syntax failures expose only a generic sanitized location', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agent-containers-cli-yaml-'));
+  assert.equal(spawnSync('git', ['init', '-b', 'main'], { cwd: root }).status, 0);
+  const messages: string[] = [];
+  const sentinel = 'CLI_UNKNOWN_SOURCE_SENTINEL';
+  const code = await runCli(
+    ['init', '--non-interactive', '--stdin', '--yes'],
+    root,
+    (message) => messages.push(message),
+    { input: Readable.from([`commands:\n  ${sentinel}: [\n`]), output: new Writable({ write(_chunk, _encoding, callback) { callback(); } }), isTTY: false },
+  );
+  assert.equal(code, 1);
+  assert.match(messages.at(-1) ?? '', /^agent-containers: Invalid Codespaces setup draft syntax at line \d+, column \d+\.$/);
+  assert.doesNotMatch(messages.at(-1) ?? '', new RegExp(sentinel));
 });
 
 test('recover retires a dead guarded lifecycle lock without a manual recovery record', async (t) => {
@@ -171,7 +188,9 @@ test('recover refuses an unconfirmed-reap quarantine whose recorded owner remain
 
   assert.equal(await runCli(['recover', 'safe', '--yes', '--remote-command-stopped'], process.cwd(), () => undefined), 1);
   assert.ok(await loadManualRecovery(stateDir, 'safe'));
-  assert.equal((await loadMetadata(stateDir, 'safe'))?.containerId, '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef');
+  const saved = await loadMetadata(stateDir, 'safe');
+  assert.ok(saved && isLocalWorkspaceMetadata(saved));
+  assert.equal(saved.containerId, '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef');
   await assert.rejects(() => withWorkspaceLock(stateDir, 'safe', async () => undefined, { timeoutMs: 0 }), /quarantined|lock/i);
 });
 
@@ -310,12 +329,82 @@ test('init and implicit validation resolve the repository root from a subdirecto
   assert.equal(spawnSync('git', ['init', '-b', 'main'], { cwd: root }).status, 0);
   const messages: string[] = [];
   assert.equal(await runCli(['init'], nested, (message) => messages.push(message)), 0);
-  assert.match(messages[0], new RegExp(`Wrote ${join(root, '.agent-containers.yml').replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
-  assert.match(await readFile(join(root, '.agent-containers.yml'), 'utf8'), /version: 1/);
+  assert.match(messages[0], new RegExp(`Wrote ${root.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}[\\\\/]\\.agent-containers\\.yml`));
+  assert.match(await readFile(join(root, '.agent-containers.yml'), 'utf8'), /"version": 2/);
   await writeFile(join(root, '.agent-containers.yml'), 'version: 1\n');
   await mkdir(join(root, '.devcontainer'), { recursive: true });
   await writeFile(join(root, '.devcontainer', 'devcontainer.json'), '{}\n');
   assert.equal(spawnSync('git', ['add', '.agent-containers.yml', '.devcontainer/devcontainer.json'], { cwd: root }).status, 0);
   assert.equal(spawnSync('git', ['-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '-m', 'config'], { cwd: root }).status, 0);
   assert.equal(await runCli(['validate'], nested, () => undefined), 0);
+});
+
+test('Codespaces setup commands are unavailable without the explicit experimental gate', async () => {
+  const messages: string[] = [];
+  const previous = process.env.AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES;
+  delete process.env.AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES;
+  try {
+    assert.equal(await runCli(['init', '--backends', 'codespaces'], process.cwd(), (message) => messages.push(message)), 1);
+  } finally {
+    if (previous === undefined) delete process.env.AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES;
+    else process.env.AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES = previous;
+  }
+  assert.match(messages.at(-1) ?? '', /AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES=1/);
+});
+
+test('doctor resolves a v1 local configuration before applying the Codespaces experimental gate', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agent-containers-cli-doctor-local-'));
+  assert.equal(spawnSync('git', ['init', '-b', 'main'], { cwd: root }).status, 0);
+  await writeFile(join(root, '.agent-containers.yml'), 'version: 1\n');
+  const previous = process.env.AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES;
+  delete process.env.AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES;
+  const messages: string[] = [];
+  try {
+    await runCli(['doctor', '--json'], root, (message) => messages.push(message));
+  } finally {
+    if (previous === undefined) delete process.env.AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES;
+    else process.env.AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES = previous;
+  }
+  assert.doesNotMatch(messages.at(-1) ?? '', /experimental/i);
+  assert.match(messages.at(-1) ?? '', /"local"/);
+});
+
+test('local create fails closed when schema v2 disables the local backend', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agent-containers-cli-local-disabled-'));
+  assert.equal(spawnSync('git', ['init', '-b', 'main'], { cwd: root }).status, 0);
+  await writeFile(join(root, '.agent-containers.yml'), JSON.stringify({ version: 2, workspace: { worktreeRoot: 'worktrees', baseBranch: 'main' }, project: { repository: 'owner/repo', ref: 'refs/heads/main', expectedOid: '0123456789012345678901234567890123456789' }, environment: { devcontainerPath: '.devcontainer/devcontainer.json', devcontainerBlobOid: 'abcdefabcdefabcdefabcdefabcdefabcdefabcd' }, backends: { enabled: ['codespaces'], default: 'codespaces', local: {}, codespaces: { enabled: true, machine: null, geo: 'auto', idleTimeoutMinutes: 30, retentionPeriodMinutes: 1, maxTotal: 1, maxRunning: 1, maxCreating: 1, maxParallelCommandsPerWorkspace: 1, readiness: { providerTimeoutSeconds: 1, sshTimeoutSeconds: 1, command: [], commandTimeoutSeconds: 1 }, transport: { reconnectWindowSeconds: 1, cancelGraceSeconds: 1, remoteLogBytesPerStream: 1, remoteLogRetentionHours: 1 }, ports: { allowVisibilityChanges: false, allowPublic: false }, secrets: { allowedRemoteSecretNames: [], allowCodespaceGitCredential: false } } } }));
+  assert.equal(await runCli(['create', 'blocked'], root, () => undefined), 1);
+});
+
+test('create and exec fail closed when schema v2 selects Codespaces as the default backend', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agent-containers-cli-codespaces-default-'));
+  assert.equal(spawnSync('git', ['init', '-b', 'main'], { cwd: root }).status, 0);
+  const source = JSON.stringify({ version: 2, workspace: { worktreeRoot: 'worktrees', baseBranch: 'main' }, project: { repository: 'owner/repo', ref: 'refs/heads/main', expectedOid: '0123456789012345678901234567890123456789' }, environment: { devcontainerPath: '.devcontainer/devcontainer.json', devcontainerBlobOid: 'abcdefabcdefabcdefabcdefabcdefabcdefabcd' }, backends: { enabled: ['local', 'codespaces'], default: 'codespaces', local: {}, codespaces: { enabled: true, machine: null, geo: 'auto', idleTimeoutMinutes: 30, retentionPeriodMinutes: 1, maxTotal: 1, maxRunning: 1, maxCreating: 1, maxParallelCommandsPerWorkspace: 1, readiness: { providerTimeoutSeconds: 1, sshTimeoutSeconds: 1, command: [], commandTimeoutSeconds: 1 }, transport: { reconnectWindowSeconds: 1, cancelGraceSeconds: 1, remoteLogBytesPerStream: 1, remoteLogRetentionHours: 1 }, ports: { allowVisibilityChanges: false, allowPublic: false }, secrets: { allowedRemoteSecretNames: [], allowCodespaceGitCredential: false } } } });
+  await writeFile(join(root, '.agent-containers.yml'), source);
+  const stateHome = await mkdtemp(join(tmpdir(), 'agent-containers-cli-codespaces-state-'));
+  const previousStateHome = process.env.XDG_STATE_HOME;
+  process.env.XDG_STATE_HOME = stateHome;
+  try {
+    assert.equal(await runCli(['create', 'blocked'], root, () => undefined), 1);
+    await assert.rejects(() => readFile(join(stateHome, 'agent-containers', 'locks', 'blocked.lock', 'owner.json')), { code: 'ENOENT' });
+  } finally {
+    if (previousStateHome === undefined) delete process.env.XDG_STATE_HOME; else process.env.XDG_STATE_HOME = previousStateHome;
+    await rm(stateHome, { recursive: true, force: true });
+  }
+});
+
+test('exec dispatches a recorded local workspace without reading mutable checkout configuration', async (t) => {
+  const stateHome = await mkdtemp(join(tmpdir(), 'agent-containers-cli-recorded-local-'));
+  const stateDir = join(stateHome, 'agent-containers');
+  const previousStateHome = process.env.XDG_STATE_HOME;
+  process.env.XDG_STATE_HOME = stateHome;
+  t.after(async () => { if (previousStateHome === undefined) delete process.env.XDG_STATE_HOME; else process.env.XDG_STATE_HOME = previousStateHome; await rm(stateHome, { recursive: true, force: true }); });
+  const { saveMetadata, setStateDurabilityAdapterForTesting } = await import('../src/state.js');
+  setStateDurabilityAdapterForTesting({ publicationMode: async () => 'strict', assertStateWriteSupport: async () => undefined, syncFile: async () => undefined, syncDirectory: async () => undefined, moveFileWriteThrough: async () => undefined });
+  try {
+    await saveMetadata(stateDir, { version: 1, name: 'recorded', repoRoot: join(stateHome, 'repo'), worktree: join(stateHome, 'repo', 'worktrees', 'recorded'), branch: 'agent-containers/recorded', baseRef: 'refs/heads/main', devcontainerPath: '.devcontainer/devcontainer.json', createdAt: '2026-01-01T00:00:00.000Z' });
+    const messages: string[] = [];
+    assert.equal(await runCli(['exec', 'recorded', '--', 'true'], tmpdir(), (message) => messages.push(message)), 1);
+    assert.doesNotMatch(messages.at(-1) ?? '', /Configuration not found|Codespaces is selected/);
+  } finally { setStateDurabilityAdapterForTesting(undefined); }
 });

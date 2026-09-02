@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { appendFile, lstat, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
+import { spawnSync } from 'node:child_process';
 import process, { stdout } from 'node:process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
@@ -25,6 +26,7 @@ const truncatedJournalName = 'native-truncated';
 const source = join(directory, 'source.json');
 const destination = join(directory, 'published.json');
 const payload = JSON.stringify({ protocol: 'native-durability-smoke' });
+const cliPath = join(packageRoot, 'dist/src/bin/agent-containers.js');
 const metadata = {
   version: 1,
   name,
@@ -43,6 +45,12 @@ async function assertMissing(path, description) {
 try {
   const adapter = getProductionStateDurabilityAdapter();
   await adapter.assertStateWriteSupport();
+  // Exercise the installed package's public bin, not the source checkout.
+  const init = spawnSync(process.execPath, [cliPath, 'init'], { cwd: directory, encoding: 'utf8' });
+  assert.equal(init.status, 1, 'init outside a Git repository must fail safely');
+  const help = spawnSync(process.execPath, [cliPath, '--help'], { cwd: directory, encoding: 'utf8' });
+  assert.equal(help.status, 0, 'installed CLI help must run');
+  assert.match(help.stdout, /init.*configure.*doctor/s, 'installed CLI must expose setup commands');
   await writeFile(source, payload, 'utf8');
   await adapter.syncFile(source);
 

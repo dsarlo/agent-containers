@@ -15,13 +15,55 @@ commands:
 
 | Field | Required | Default | Description |
 | --- | --- | --- | --- |
-| `version` | No | `1` | Only version `1` is accepted. |
+| `version` | No | `1` | Schema version `1` is local-only; experimental schema version `2` is documented below. |
 | `workspace.worktreeRoot` | No | `../.agent-containers-worktrees` | Parent for named worktrees; relative paths resolve from the Git root. |
 | `workspace.baseBranch` | No | `main` | Base used by `agent-containers create` unless `--base` is supplied. |
 | `environment.devcontainerPath` | No | `.devcontainer/devcontainer.json` | Safe repository-relative Dev Container **regular file**; Git symlinks are rejected and runtime refuses a resolved path outside the worktree. Both `validate` and `create` require it on `workspace.baseBranch`; `create --base` requires it on that effective local base too, all before any worktree side effect. |
 | `commands` | No | `{}` | Optional named, non-empty strings for people and agents to discover; never executed by Agent Containers. |
 
 Defaults are merged before validation. Supplied empty values, wrong types, unknown keys, or non-mapping root/section values are errors.
+
+## Schema v2 Codespaces setup
+
+Schema v1 remains local-only and unchanged. Schema v2 is experimental and requires `AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES=1`. Use `ac init --interactive` or `ac configure --interactive` for the field-oriented setup flow, or import a v2 onboarding draft with `--non-interactive --from FILE` / `--stdin`. Drafts omit only discovered OID/blob evidence; persisted v2 documents always contain it. It is a nonsecret policy document: unknown fields, public ports, invalid paths, and invalid limits are rejected before any side effect.
+
+Configuration updates serialize cooperating Agent Containers writers through a durable publication lock and replace only the generation reviewed during onboarding. Both strict POSIX and recoverable Windows publication check again immediately before replacement to preserve an independent writer that arrived before that boundary. Neither mode can prevent an arbitrary external writer from replacing the file after that check; do not edit the configuration outside Agent Containers while an update is in progress. First publication uses atomic no-replace publication.
+
+Interactive setup offers local, Codespaces, or both; it collects worktree/base, backend/default, source, Dev Container path, machine/geo, capacity, readiness, transport, ports, and secret-name policy. It validates entered fields and, for Codespaces, obtains immutable source evidence before previewing the exact object that `yes` saves. `cancel` or any other confirmation leaves no file write. It does not accept pasted configuration. Each Codespaces save validates the canonical GitHub origin, remote ref, immutable commit OID, and committed regular Dev Container blob through read-only `git`/`gh api GET` calls, then persists `project.expectedOid` and `environment.devcontainerBlobOid` as immutable source evidence. Agent Containers never solicits, accepts, prints, or persists token values; Codespaces setup uses existing `gh` authentication. Codespaces lifecycle is intentionally unavailable in this release.
+
+```yaml
+version: 2
+workspace:
+  worktreeRoot: ../.agent-containers-worktrees
+  baseBranch: main
+project:
+  repository: OWNER/REPOSITORY
+  ref: refs/heads/main
+  expectedOid: '0123456789012345678901234567890123456789'
+environment:
+  devcontainerPath: .devcontainer/devcontainer.json
+  devcontainerBlobOid: 'abcdefabcdefabcdefabcdefabcdefabcdefabcd'
+backends:
+  enabled: [codespaces]
+  default: codespaces
+  local: {}
+  codespaces:
+    enabled: true
+    machine: null # Required later before any paid create operation.
+    geo: auto
+    idleTimeoutMinutes: 30
+    retentionPeriodMinutes: 10080
+    maxTotal: 4
+    maxRunning: 2
+    maxCreating: 1
+    maxParallelCommandsPerWorkspace: 1
+    readiness: { providerTimeoutSeconds: 1200, sshTimeoutSeconds: 120, command: [], commandTimeoutSeconds: 600 }
+    transport: { reconnectWindowSeconds: 60, cancelGraceSeconds: 10, remoteLogBytesPerStream: 67108864, remoteLogRetentionHours: 168 }
+    ports: { allowVisibilityChanges: false, allowPublic: false }
+    secrets: { allowedRemoteSecretNames: [], allowCodespaceGitCredential: false }
+```
+
+`ac doctor --backend local|codespaces|all [--json]` is noninteractive and read-only. Local-only configurations do not require the Codespaces gate; a selected Codespaces diagnostic requires `AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES=1`. Its Codespaces provider calls are pinned-version, machine-readable `gh api` GET requests only. Machine availability uses GitHub's documented repository machine inventory endpoint. Owner/billing, port, secret, and runtime facts are action-required when no documented read-only endpoint proves them. It never retrieves a token, alters authentication, creates an SSH key, changes a resource/configuration/secret/port, or starts a Codespace.
 
 ## v0.1 Dev Container compatibility
 

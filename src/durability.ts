@@ -37,6 +37,7 @@ export interface NativeDurabilityBinding {
   capabilities(): NativeDurabilityCapabilities | Promise<NativeDurabilityCapabilities>;
   syncPath(path: string): NativePathDurabilityResult | Promise<NativePathDurabilityResult>;
   moveFileWriteThrough(source: string, destination: string): NativeMoveDurabilityResult | Promise<NativeMoveDurabilityResult>;
+  moveFileNoReplaceWriteThrough?(source: string, destination: string): NativeMoveDurabilityResult | Promise<NativeMoveDurabilityResult>;
 }
 
 interface NativeWindowsDirectoryBinding {
@@ -53,6 +54,7 @@ export interface StateDurabilityAdapter {
   syncDirectory(path: string): Promise<void>;
   /** Windows MoveFileExW(MOVEFILE_WRITE_THROUGH); intentionally exposed for a later publication protocol. */
   moveFileWriteThrough(source: string, destination: string): Promise<void>;
+  moveFileNoReplaceWriteThrough?(source: string, destination: string): Promise<void>;
 }
 
 export function createNativeDurabilityAdapter(binding: NativeDurabilityBinding): StateDurabilityAdapter {
@@ -83,6 +85,16 @@ export function createNativeDurabilityAdapter(binding: NativeDurabilityBinding):
       const result = await binding.moveFileWriteThrough(source, destination);
       if (!result.ok) {
         const error = new Error(result.error ?? `Native write-through move failed for ${source} -> ${destination}.`);
+        const code = result.windowsError === 'ERROR_ACCESS_DENIED' ? 'EPERM' : result.code;
+        if (code) Object.assign(error, { code });
+        throw error;
+      }
+    },
+    async moveFileNoReplaceWriteThrough(source: string, destination: string): Promise<void> {
+      if (!('moveFileNoReplaceWriteThrough' in binding) || typeof binding.moveFileNoReplaceWriteThrough !== 'function') throw new Error('Native write-through no-replace publication is unavailable; refusing first state publication.');
+      const result = await binding.moveFileNoReplaceWriteThrough(source, destination);
+      if (!result.ok) {
+        const error = new Error(result.error ?? `Native write-through no-replace move failed for ${source} -> ${destination}.`);
         const code = result.windowsError === 'ERROR_ACCESS_DENIED' ? 'EPERM' : result.code;
         if (code) Object.assign(error, { code });
         throw error;

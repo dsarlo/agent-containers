@@ -6,7 +6,7 @@ import { createHash } from 'node:crypto';
 import test from 'node:test';
 import { createNativeDurabilityAdapter } from '../src/durability.js';
 import * as state from '../src/state.js';
-import { acknowledgeUnconfirmedProcessReap, bootstrapManualRecoveryJournal, listMetadata, loadManualRecovery, loadMetadata, recordManualRecovery, releaseStaleWorkspaceLock, saveMetadata, setStateDurabilityAdapterForTesting, setStateDurableRenameForTesting, setStateJournalStagingWriteForTesting, withWorkspaceLock, type WorkspaceLockOptions, type WorkspaceMetadata } from '../src/state.js';
+import { acknowledgeUnconfirmedProcessReap, bootstrapManualRecoveryJournal, listMetadata, loadManualRecovery, loadMetadata, metadataGeneration, recordManualRecovery, releaseStaleWorkspaceLock, saveMetadata, setStateDurabilityAdapterForTesting, setStateDurableRenameForTesting, setStateJournalStagingWriteForTesting, withWorkspaceLock, type ManualRecovery, type WorkspaceLockOptions, type WorkspaceMetadata } from '../src/state.js';
 import type { ProcessRunner } from '../src/types.js';
 import type { StateDurabilityAdapter } from '../src/durability.js';
 
@@ -54,6 +54,27 @@ test('legacy recorded container IDs fail closed before removal can inspect or de
   assert.equal(invoked, false);
 });
 
+test('metadata accepts an explicit v2 local backend and requires a complete strict Codespaces record', async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), 'agent-containers-state-v2-'));
+  const local = { ...metadata, version: 2 as const, backend: 'local' as const, handle: { kind: 'local' as const } };
+  await saveMetadata(stateDir, local);
+  assert.deepEqual(await loadMetadata(stateDir, 'safe'), local);
+  const codespaces = {
+    version: 2 as const, backend: 'codespaces' as const, name: 'safe', workspaceId: '11111111-1111-4111-8111-111111111111', createdAt: '2026-01-01T00:00:00.000Z',
+    control: { githubHost: 'github.com', actorId: '1', actorLogin: 'octo', ghVersion: '2.0.0' },
+    repository: { id: '2', owner: 'owner', name: 'repo' },
+    source: { requestedRef: 'refs/heads/main', expectedOid: '0123456789012345678901234567890123456789', effectiveBranch: 'agent-containers/safe', devcontainerPath: '.devcontainer/devcontainer.json', devcontainerBlobOid: 'abcdefabcdefabcdefabcdefabcdefabcdefabcd' },
+    remote: { codespaceId: '3', name: 'safe-codespace', environmentId: 'env', ownerId: '1', ownerLogin: 'octo', billableOwnerId: '1', machine: 'basicLinux32gb', geo: 'WestUs2', createdAt: '2026-01-01T00:00:00.000Z' },
+    lifecycle: { desired: 'ready' as const, normalized: 'provisioning', providerRawState: 'Provisioning', lastObservedAt: '2026-01-01T00:00:00.000Z', activeOperation: null }, recovery: null,
+    cleanup: { remoteStopped: false, remoteDeleted: false, tombstoneWritten: false },
+  };
+  const remoteStateDir = await mkdtemp(join(tmpdir(), 'agent-containers-state-remote-'));
+  await saveMetadata(remoteStateDir, codespaces);
+  assert.deepEqual(await loadMetadata(remoteStateDir, 'safe'), codespaces);
+  await assert.rejects(() => saveMetadata(remoteStateDir, { ...codespaces, worktree: '/repo' } as never), /invalid/);
+  await assert.rejects(() => saveMetadata(remoteStateDir, { ...codespaces, token: 'secret' } as never), /invalid/);
+});
+
 test('metadata writes are atomic and never expose a predictable temporary file', async () => {
   const stateDir = await mkdtemp(join(tmpdir(), 'agent-containers-state-'));
   await saveMetadata(stateDir, metadata);
@@ -61,6 +82,56 @@ test('metadata writes are atomic and never expose a predictable temporary file',
   assert.deepEqual(JSON.parse(content), metadata);
   await writeFile(join(stateDir, 'workspaces', '.safe.json.tmp'), 'partial');
   assert.deepEqual(JSON.parse(await readFile(join(stateDir, 'workspaces', 'safe.json'), 'utf8')), metadata);
+});
+
+test('metadata expected generation and immutable identity reject stale or cross-backend replacement', async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), 'agent-containers-metadata-cas-'));
+  await saveMetadata(stateDir, metadata, { expectedGeneration: null });
+  const observed = await loadMetadata(stateDir, 'safe');
+  assert.ok(observed);
+  await saveMetadata(stateDir, { ...metadata, containerId: 'a'.repeat(64) }, { expectedGeneration: metadataGeneration(observed) });
+  await assert.rejects(() => saveMetadata(stateDir, { ...metadata, containerId: 'b'.repeat(64) }, { expectedGeneration: metadataGeneration(observed) }), /changed concurrently/);
+  await assert.rejects(() => saveMetadata(stateDir, { ...metadata, repoRoot: join(repoRoot, 'other-repository') }), /immutable backend\/resource identity/);
+});
+
+test('metadata expected absence is a durable no-replace boundary in strict and recoverable publication modes', async () => {
+  for (const mode of ['strict', 'recoverable'] as const) {
+    const stateDir = await mkdtemp(join(tmpdir(), `agent-containers-metadata-no-replace-${mode}-`));
+    const external: WorkspaceMetadata = { ...metadata, createdAt: '2026-02-01T00:00:00.000Z' };
+    const adapter: StateDurabilityAdapter = mode === 'strict' ? testDurabilityAdapter : {
+      ...testDurabilityAdapter,
+      publicationMode: async () => 'recoverable',
+      moveFileWriteThrough: async (source, destination) => { await rename(source, destination); },
+      moveFileNoReplaceWriteThrough: async (source, destination) => {
+        try { await lstat(destination); const error = new Error('exists'); Object.assign(error, { code: 'EEXIST' }); throw error; }
+        catch (error: unknown) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+        await rename(source, destination);
+      },
+    };
+    setStateDurabilityAdapterForTesting(adapter);
+    try {
+      await assert.rejects(() => saveMetadata(stateDir, metadata, {
+        expectedGeneration: null,
+        afterCheckBeforePublish: async () => {
+          await mkdir(join(stateDir, 'workspaces'), { recursive: true });
+          await writeFile(join(stateDir, 'workspaces', 'safe.json'), `${JSON.stringify(external)}\n`);
+        },
+      }), /changed concurrently/);
+      assert.equal(await readFile(join(stateDir, 'workspaces', 'safe.json'), 'utf8'), `${JSON.stringify(external)}\n`);
+    } finally { setStateDurabilityAdapterForTesting(testDurabilityAdapter); }
+  }
+});
+
+test('metadata rejects credential-shaped refs and display fields before persistence', async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), 'agent-containers-metadata-secret-'));
+  const sentinel = 'METADATA_SECRET_SENTINEL';
+  for (const candidate of [
+    { ...metadata, baseRef: `refs/heads/main--auth-token=${sentinel}` },
+    { ...metadata, baseRef: 'refs/heads/main.lock' },
+    { version: 2, backend: 'codespaces', name: 'safe', workspaceId: '11111111-1111-4111-8111-111111111111', createdAt: '2026-01-01T00:00:00.000Z', control: { githubHost: 'github.com', actorId: '1', actorLogin: `sh -c 'tool --auth-token ${sentinel}'`, ghVersion: '2.0.0' }, repository: { id: '2', owner: 'owner', name: 'repo' }, source: { requestedRef: 'refs/heads/main', expectedOid: '0123456789012345678901234567890123456789', effectiveBranch: 'agent-containers/safe', devcontainerPath: '.devcontainer/devcontainer.json', devcontainerBlobOid: 'abcdefabcdefabcdefabcdefabcdefabcdefabcd' }, remote: { codespaceId: '3', name: 'safe-codespace', environmentId: 'env', ownerId: '1', ownerLogin: 'octo', billableOwnerId: '1', machine: 'basic', geo: 'WestUs2', createdAt: '2026-01-01T00:00:00.000Z' }, lifecycle: { desired: 'ready', normalized: 'ready', providerRawState: 'ready', lastObservedAt: '2026-01-01T00:00:00.000Z', activeOperation: null }, recovery: null, cleanup: { remoteStopped: false, remoteDeleted: false, tombstoneWritten: false } },
+  ] as WorkspaceMetadata[]) {
+    await assert.rejects(() => saveMetadata(stateDir, candidate), (error: Error) => !error.message.includes(sentinel));
+  }
 });
 
 test('listMetadata reads in bounded batches and returns deterministic workspace-name order', async () => {
@@ -118,7 +189,7 @@ test('legacy recovery remains a barrier when every staged journal migration boun
   for (const boundary of ['staging write', 'staging sync', 'publication', 'journal parent sync'] as const) {
     const stateDir = await mkdtemp(join(tmpdir(), `agent-containers-legacy-migration-${boundary.replace(' ', '-')}-`));
     await mkdir(join(stateDir, 'locks'), { recursive: true });
-    const legacy = { version: 1, reason: 'operation-may-be-active', containerIds: [], worktree: metadata.worktree, createdAt: '2026-01-01T00:00:00.000Z' };
+    const legacy: Omit<ManualRecovery, 'generation'> = { version: 1, reason: 'operation-may-be-active', containerIds: [], worktree: metadata.worktree, createdAt: '2026-01-01T00:00:00.000Z' };
     await writeFile(join(stateDir, 'locks', 'safe.manual-recovery.json'), JSON.stringify(legacy));
     let fail = true;
     const adapter: StateDurabilityAdapter = {

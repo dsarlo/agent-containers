@@ -52,6 +52,15 @@ test('createWorkspace only accepts and records a verified canonical local base r
   assert.deepEqual(calls.at(-1), ['worktree', 'add', '--relative-paths', '-b', 'agent-containers/local', join(directory, 'worktrees', 'local'), 'refs/heads/main']);
 });
 
+test('createWorkspace rejects a Codespaces-only config before recovery, Git, or metadata effects', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'agent-containers-codespaces-only-'));
+  const config = { version: 2, workspace: { worktreeRoot: 'worktrees', baseBranch: 'main' }, project: {}, environment: { devcontainerPath: '.devcontainer/devcontainer.json' }, backends: { enabled: ['codespaces'], default: 'codespaces', local: {}, codespaces: { enabled: true } } } as unknown as AgentContainersConfig;
+  let called = false;
+  await assert.rejects(() => createWorkspace({ cwd: directory, name: 'safe', config, stateDir: join(directory, 'state'), runner: { async run() { called = true; return { code: 0, stdout: '', stderr: '' }; } } }), /Local backend is disabled/);
+  assert.equal(called, false);
+  await assert.rejects(() => readFile(join(directory, 'state', 'locks', 'safe.manual-recovery.journal')), /ENOENT/);
+});
+
 
 test('createWorkspace uses relative Git directory pointers when Git supports them', async () => {
   const directory = await realpath(await mkdtemp(join(tmpdir(), 'agent-containers-workspace-')));
@@ -179,6 +188,14 @@ test('createWorkspace preserves its worktree and branch if metadata persistence 
   await assert.rejects(() => createWorkspace({ cwd: directory, name: 'rollback', config: { version: 1, workspace: { worktreeRoot: 'worktrees', baseBranch: 'main' }, environment: { devcontainerPath: '.devcontainer/devcontainer.json' }, commands: {} }, stateDir: join(directory, 'state'), runner, save: async () => { throw new Error('disk full'); } }), /disk full/);
   assert.equal(calls.some((args) => args[0] === 'worktree' && args[1] === 'remove'), false);
   assert.equal(calls.some((args) => args[0] === 'branch' && args[1] === '-D'), false);
+});
+
+test('createWorkspace publishes metadata with expected absence', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'agent-containers-workspace-cas-'));
+  let expectedGeneration: string | null | undefined;
+  const runner: ProcessRunner = { async run(_command, args) { if (args[0] === 'rev-parse') return { code: 0, stdout: `${directory}\n`, stderr: '' }; if (args[0] === 'show-ref') return { code: args.at(-1) === 'refs/heads/main' ? 0 : 1, stdout: '', stderr: '' }; if (args.at(-1) === '-h') return { code: 129, stdout: '', stderr: '--[no-]relative-paths\n' }; return { code: 0, stdout: '', stderr: '' }; } };
+  await createWorkspace({ cwd: directory, name: 'cas', config: { version: 1, workspace: { worktreeRoot: 'worktrees', baseBranch: 'main' }, environment: { devcontainerPath: '.devcontainer/devcontainer.json' }, commands: {} }, stateDir: join(directory, 'state'), runner, save: async (_state, _metadata, options) => { expectedGeneration = options.expectedGeneration; } });
+  assert.equal(expectedGeneration, null);
 });
 
 test('createWorkspace constructs git commands through the injected runner and writes metadata', async () => {

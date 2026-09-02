@@ -1,11 +1,13 @@
-import { lstat, mkdir, open, readdir, readFile, rename, rm, type FileHandle } from 'node:fs/promises';
+import { link, lstat, mkdir, open, readdir, readFile, rename, rm, type FileHandle } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { dirname, isAbsolute, join, resolve } from 'node:path';
+import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { randomUUID, createHash } from 'node:crypto';
 import { isValidWorkspaceName, validateWorkspaceName } from './names.js';
 import { getProductionStateDurabilityAdapter, type StateDurabilityAdapter } from './durability.js';
+import { secretShaped } from './secrets.js';
+import type { WorkspaceHandle } from './types.js';
 
-export interface WorkspaceMetadata {
+export interface LocalWorkspaceMetadata {
   version: 1;
   name: string;
   repoRoot: string;
@@ -22,6 +24,30 @@ export interface WorkspaceMetadata {
     branch?: boolean;
   };
 }
+
+/** Schema v2 records the selected backend and a discriminated backend handle. */
+export interface V2LocalWorkspaceMetadata extends Omit<LocalWorkspaceMetadata, 'version'> {
+  version: 2;
+  backend: 'local';
+  handle: Extract<WorkspaceHandle, { kind: 'local' }>;
+}
+/** Remote records intentionally have no local worktree, branch, or Docker fields. */
+export interface CodespacesWorkspaceMetadata {
+  version: 2;
+  backend: 'codespaces';
+  name: string;
+  workspaceId: string;
+  createdAt: string;
+  control: { githubHost: string; actorId: string; actorLogin: string; ghVersion: string };
+  repository: { id: string; owner: string; name: string };
+  source: { requestedRef: string; expectedOid: string; effectiveBranch: string; devcontainerPath: string; devcontainerBlobOid: string };
+  remote: { codespaceId: string; name: string; environmentId: string; ownerId: string; ownerLogin: string; billableOwnerId: string; machine: string; geo: string; createdAt: string };
+  lifecycle: { desired: 'ready' | 'stopped'; normalized: string; providerRawState: string; lastObservedAt: string; activeOperation: null | { id: string; kind: 'create' | 'stop' | 'remove'; startedAt: string; checkpoint: string } };
+  recovery: null | { reason: string; operationId: string; recordedAt: string };
+  cleanup: { remoteStopped: boolean; remoteDeleted: boolean; tombstoneWritten: boolean };
+}
+export type WorkspaceMetadata = LocalWorkspaceMetadata | V2LocalWorkspaceMetadata | CodespacesWorkspaceMetadata;
+export type LocalMetadata = LocalWorkspaceMetadata | V2LocalWorkspaceMetadata;
 
 export interface StaleLockRecoveryHooks {
   /** Test seam: runs after ownership is validated while normal acquisition remains blocked. */
@@ -325,26 +351,128 @@ export async function loadMetadata(stateDir: string, name: string): Promise<Work
   }
 }
 
-export async function saveMetadata(stateDir: string, metadata: WorkspaceMetadata): Promise<void> {
+export interface MetadataSaveOptions {
+  /** `null` requires absence; a generation binds an update to the observed record. */
+  expectedGeneration?: string | null;
+  /** Test seam after comparison and immediately before the no-replace boundary. */
+  afterCheckBeforePublish?: () => Promise<void>;
+}
+
+/** A stable generation suitable for an expected-generation metadata publication. */
+export function metadataGeneration(metadata: WorkspaceMetadata): string {
+  return createHash('sha256').update(JSON.stringify(metadata)).digest('hex');
+}
+
+export async function saveMetadata(stateDir: string, metadata: WorkspaceMetadata, options: MetadataSaveOptions = {}): Promise<void> {
   if (!isAgentContainersWorkspace(metadata)) throw new Error('Refusing to save invalid Agent Containers workspace metadata.');
-  if (metadata.containerId !== undefined && !isCanonicalContainerId(metadata.containerId)) throw new Error('Refusing to save a non-canonical Docker container ID.');
+  if (isLocalWorkspaceMetadata(metadata) && metadata.containerId !== undefined && !isCanonicalContainerId(metadata.containerId)) throw new Error('Refusing to save a non-canonical Docker container ID.');
   const path = metadataPath(stateDir, metadata.name);
   const directory = join(stateDir, 'workspaces');
   const durability = stateDurability();
   await durability.assertStateWriteSupport();
   await ensureDurableDirectory(directory, durability);
-  const temporaryPath = join(directory, `.${metadata.name}.${randomUUID()}.tmp`);
-  await durableReplace(temporaryPath, path, directory, `${JSON.stringify(metadata, null, 2)}\n`, durability);
+  await withMetadataPublicationLock(stateDir, metadata.name, durability, async () => {
+    // Compare inside a durable per-record cross-process lock. This makes the
+    // expected generation and the following durable rename one publication.
+    const current = await loadMetadata(stateDir, metadata.name);
+    if (options.expectedGeneration === null && current) throw new Error(`Metadata for ${metadata.name} changed concurrently; it was created while this operation was in progress.`);
+    if (typeof options.expectedGeneration === 'string' && (!current || metadataGeneration(current) !== options.expectedGeneration)) {
+      throw new Error(`Metadata for ${metadata.name} changed concurrently; reload before retrying.`);
+    }
+    if (current && !sameMetadataIdentity(current, metadata)) {
+      throw new Error(`Metadata for ${metadata.name} has immutable backend/resource identity; refusing replacement.`);
+    }
+    const temporaryPath = join(directory, `.${metadata.name}.${randomUUID()}.tmp`);
+    if (options.expectedGeneration === null) {
+      await durableCreate(temporaryPath, path, directory, `${JSON.stringify(metadata, null, 2)}\n`, durability, options.afterCheckBeforePublish);
+    } else {
+      await options.afterCheckBeforePublish?.();
+      await durableReplace(temporaryPath, path, directory, `${JSON.stringify(metadata, null, 2)}\n`, durability);
+    }
+  });
+}
+
+/** Publish first metadata generation without replacing a concurrent destination. */
+async function durableCreate(temporaryPath: string, path: string, directory: string, content: string, durability: StateDurabilityAdapter, afterCheckBeforePublish?: () => Promise<void>): Promise<void> {
+  let file: FileHandle | undefined;
+  try {
+    file = await open(temporaryPath, 'wx', 0o600);
+    await file.writeFile(content, 'utf8');
+    await file.close();
+    file = undefined;
+    await durability.syncFile(temporaryPath);
+    await afterCheckBeforePublish?.();
+    if (await durability.publicationMode() === 'recoverable') {
+      if (!durability.moveFileNoReplaceWriteThrough) throw new Error('Native write-through no-replace publication is unavailable; refusing first metadata publication.');
+      await durability.moveFileNoReplaceWriteThrough(temporaryPath, path);
+    } else {
+      await link(temporaryPath, path);
+      await rm(temporaryPath, { force: false });
+      await durability.syncDirectory(directory);
+    }
+  } catch (error: unknown) {
+    await file?.close();
+    await rm(temporaryPath, { force: true });
+    if (isNodeError(error, 'EEXIST')) throw new Error(`Metadata for ${basename(path, '.json')} changed concurrently; it was created while this operation was in progress.`, { cause: error });
+    throw error;
+  }
+}
+
+function sameMetadataIdentity(current: WorkspaceMetadata, next: WorkspaceMetadata): boolean {
+  if (isLocalWorkspaceMetadata(current) !== isLocalWorkspaceMetadata(next)) return false;
+  if (isLocalWorkspaceMetadata(current) && isLocalWorkspaceMetadata(next)) {
+    return current.repoRoot === next.repoRoot && current.worktree === next.worktree && current.branch === next.branch && current.baseRef === next.baseRef && current.devcontainerPath === next.devcontainerPath;
+  }
+  if (!isLocalWorkspaceMetadata(current) && !isLocalWorkspaceMetadata(next)) {
+    // Every provider ownership and immutable source fact is the durable
+    // authority for future remote operations. Lifecycle observations remain
+    // mutable, but none of these facts may be replaced by a later writer.
+    return current.workspaceId === next.workspaceId &&
+      JSON.stringify(current.control) === JSON.stringify(next.control) &&
+      JSON.stringify(current.repository) === JSON.stringify(next.repository) &&
+      JSON.stringify(current.source) === JSON.stringify(next.source) &&
+      current.remote.codespaceId === next.remote.codespaceId &&
+      current.remote.name === next.remote.name &&
+      current.remote.environmentId === next.remote.environmentId &&
+      current.remote.ownerId === next.remote.ownerId &&
+      current.remote.ownerLogin === next.remote.ownerLogin &&
+      current.remote.billableOwnerId === next.remote.billableOwnerId &&
+      current.remote.machine === next.remote.machine &&
+      current.remote.geo === next.remote.geo &&
+      current.remote.createdAt === next.remote.createdAt;
+  }
+  return false;
 }
 
 export function isCanonicalContainerId(value: unknown): value is string {
   return typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
 }
 
-export async function deleteMetadata(stateDir: string, name: string): Promise<void> {
+export async function deleteMetadata(stateDir: string, name: string, expectedGeneration?: string): Promise<void> {
   const durability = stateDurability();
   await durability.assertStateWriteSupport();
-  await durableRemove(metadataPath(stateDir, name), join(stateDir, 'workspaces'), true, durability);
+  await withMetadataPublicationLock(stateDir, name, durability, async () => {
+    if (expectedGeneration !== undefined) {
+      const current = await loadMetadata(stateDir, name);
+      if (!current || metadataGeneration(current) !== expectedGeneration) throw new Error(`Metadata for ${name} changed concurrently; reload before retrying.`);
+    }
+    await durableRemove(metadataPath(stateDir, name), join(stateDir, 'workspaces'), true, durability);
+  });
+}
+
+/** Durable owner-directory serialization for direct metadata writers/deleters. */
+async function withMetadataPublicationLock<T>(stateDir: string, name: string, durability: StateDurabilityAdapter, action: () => Promise<T>): Promise<T> {
+  const locksDir = join(stateDir, 'locks');
+  await ensureDurableDirectory(locksDir, durability);
+  const lockPath = join(locksDir, `${validateWorkspaceName(name)}.metadata.lock`);
+  const deadline = Date.now() + 30_000;
+  let owner: LockOwner | undefined;
+  while (!owner) {
+    await reclaimDeadPublishedLock(lockPath, localPidIsAlive, durability);
+    owner = await acquireOwnedDirectory(lockPath, locksDir, `${name}.metadata`, deadline, name, durability);
+  }
+  try { return await action(); }
+  finally { await retireOwnedLock(lockPath, locksDir, owner, durability); }
 }
 
 export async function listMetadata(stateDir: string): Promise<WorkspaceMetadata[]> {
@@ -366,27 +494,59 @@ export async function listMetadata(stateDir: string): Promise<WorkspaceMetadata[
 export const METADATA_LIST_CONCURRENCY = 8;
 
 export function isAgentContainersWorkspace(metadata: unknown): metadata is WorkspaceMetadata {
+  if (isCodespacesWorkspace(metadata)) return true;
   return typeof metadata === 'object' && metadata !== null &&
-    'version' in metadata && metadata.version === 1 &&
-    'name' in metadata && typeof metadata.name === 'string' && isValidWorkspaceName(metadata.name) &&
+    'version' in metadata && (metadata.version === 1 || metadata.version === 2) &&
+    'name' in metadata && typeof metadata.name === 'string' && isValidWorkspaceName(metadata.name) && !secretShaped(metadata.name) &&
     'branch' in metadata && metadata.branch === `agent-containers/${metadata.name}` &&
     'worktree' in metadata && isCanonicalPath(metadata.worktree) &&
     'repoRoot' in metadata && isCanonicalPath(metadata.repoRoot) &&
     'baseRef' in metadata && isLocalBranchRef(metadata.baseRef) &&
-    'devcontainerPath' in metadata && typeof metadata.devcontainerPath === 'string' &&
-    'createdAt' in metadata && typeof metadata.createdAt === 'string' &&
-    (!('containerId' in metadata) || metadata.containerId === undefined || typeof metadata.containerId === 'string') &&
-    (!('cleanup' in metadata) || metadata.cleanup === undefined || isCleanupState(metadata.cleanup));
+    'devcontainerPath' in metadata && safeRepositoryPath(metadata.devcontainerPath) &&
+    'createdAt' in metadata && typeof metadata.createdAt === 'string' && !secretShaped(metadata.createdAt) &&
+    // Readers retain legacy non-canonical IDs so callers can fail closed with
+    // an actionable repair path; saveMetadata refuses to persist them.
+    (!('containerId' in metadata) || metadata.containerId === undefined || (typeof metadata.containerId === 'string' && metadata.containerId.length > 0)) &&
+    (!('cleanup' in metadata) || metadata.cleanup === undefined || isCleanupState(metadata.cleanup)) &&
+    (metadata.version === 1 || (isKnownLocalV2Record(metadata) && 'backend' in metadata && metadata.backend === 'local' && 'handle' in metadata && isLocalHandle(metadata.handle)));
 }
+
+export function isLocalWorkspaceMetadata(metadata: WorkspaceMetadata): metadata is LocalMetadata {
+  return metadata.version === 1 || metadata.backend === 'local';
+}
+function isKnownLocalV2Record(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && Object.keys(value).every((key) => ['version', 'backend', 'handle', 'name', 'repoRoot', 'worktree', 'branch', 'baseRef', 'devcontainerPath', 'createdAt', 'containerId', 'cleanup'].includes(key) && !/(token|secret|password|credential|key)/i.test(key));
+}
+function isLocalHandle(value: unknown): boolean { return isStrictRecord(value, ['kind']) && value.kind === 'local'; }
+function isCodespacesWorkspace(value: unknown): value is CodespacesWorkspaceMetadata {
+  if (!isStrictRecord(value, ['version', 'backend', 'name', 'workspaceId', 'createdAt', 'control', 'repository', 'source', 'remote', 'lifecycle', 'recovery', 'cleanup']) || value.version !== 2 || value.backend !== 'codespaces' || typeof value.name !== 'string' || !isValidWorkspaceName(value.name) || secretShaped(value.name) || !isUuid(value.workspaceId) || !isTimestamp(value.createdAt)) return false;
+  const control = value.control, repository = value.repository, source = value.source, remote = value.remote, lifecycle = value.lifecycle, cleanup = value.cleanup;
+  if (!isStrictRecord(control, ['githubHost', 'actorId', 'actorLogin', 'ghVersion']) || control.githubHost !== 'github.com' || !losslessId(control.actorId) || !safeDisplay(control.actorLogin) || !safeDisplay(control.ghVersion)) return false;
+  if (!isStrictRecord(repository, ['id', 'owner', 'name']) || !losslessId(repository.id) || !safeIdentifier(repository.owner) || !safeIdentifier(repository.name)) return false;
+  if (!isStrictRecord(source, ['requestedRef', 'expectedOid', 'effectiveBranch', 'devcontainerPath', 'devcontainerBlobOid']) || !safeRef(source.requestedRef) || source.effectiveBranch !== `agent-containers/${value.name}` || !isOid(source.expectedOid) || !safeRepositoryPath(source.devcontainerPath) || !isOid(source.devcontainerBlobOid)) return false;
+  if (!isStrictRecord(remote, ['codespaceId', 'name', 'environmentId', 'ownerId', 'ownerLogin', 'billableOwnerId', 'machine', 'geo', 'createdAt']) || !losslessId(remote.codespaceId) || !safeDisplay(remote.name) || !safeDisplay(remote.environmentId) || !losslessId(remote.ownerId) || !safeDisplay(remote.ownerLogin) || !losslessId(remote.billableOwnerId) || !safeDisplay(remote.machine) || !safeDisplay(remote.geo) || !isTimestamp(remote.createdAt)) return false;
+  if (!isStrictRecord(lifecycle, ['desired', 'normalized', 'providerRawState', 'lastObservedAt', 'activeOperation']) || (lifecycle.desired !== 'ready' && lifecycle.desired !== 'stopped') || !safeDisplay(lifecycle.normalized) || !safeDisplay(lifecycle.providerRawState) || !isTimestamp(lifecycle.lastObservedAt) || !validOperation(lifecycle.activeOperation)) return false;
+  if (value.recovery !== null && (!isStrictRecord(value.recovery, ['reason', 'operationId', 'recordedAt']) || !safeDisplay(value.recovery.reason) || !isUuid(value.recovery.operationId) || !isTimestamp(value.recovery.recordedAt))) return false;
+  return isStrictRecord(cleanup, ['remoteStopped', 'remoteDeleted', 'tombstoneWritten']) && typeof cleanup.remoteStopped === 'boolean' && typeof cleanup.remoteDeleted === 'boolean' && typeof cleanup.tombstoneWritten === 'boolean';
+}
+
+function isStrictRecord(value: unknown, keys: readonly string[]): value is Record<string, unknown> { return typeof value === 'object' && value !== null && !Array.isArray(value) && Object.keys(value).length === keys.length && Object.keys(value).every((key) => keys.includes(key) && !/(token|secret|password|credential|key)/i.test(key)); }
+function losslessId(value: unknown): value is string { return typeof value === 'string' && /^[1-9][0-9]*$/.test(value); }
+function isUuid(value: unknown): value is string { return typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value); }
+function isTimestamp(value: unknown): value is string { return typeof value === 'string' && !Number.isNaN(Date.parse(value)); }
+function isOid(value: unknown): value is string { return typeof value === 'string' && /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(value); }
+function safeIdentifier(value: unknown): value is string { return typeof value === 'string' && !secretShaped(value) && /^[A-Za-z0-9_.-]{1,128}$/.test(value); }
+function safeDisplay(value: unknown): value is string { return typeof value === 'string' && !secretShaped(value) && /^[\x20-\x7e]{1,128}$/.test(value); }
+function safeRef(value: unknown): value is string { return typeof value === 'string' && !secretShaped(value) && /^refs\/(?:heads|tags)\/(?:[A-Za-z0-9][A-Za-z0-9._-]*)(?:\/[A-Za-z0-9][A-Za-z0-9._-]*)*$/.test(value) && !value.includes('..') && !value.split('/').some((part) => part.endsWith('.') || part.endsWith('.lock')); }
+function safeRepositoryPath(value: unknown): value is string { return typeof value === 'string' && !secretShaped(value) && value.length > 0 && !/[\0\r\n\\]/.test(value) && !value.split('/').some((part) => !part || part === '.' || part === '..'); }
+function validOperation(value: unknown): boolean { return value === null || (isStrictRecord(value, ['id', 'kind', 'startedAt', 'checkpoint']) && isUuid(value.id) && (value.kind === 'create' || value.kind === 'stop' || value.kind === 'remove') && isTimestamp(value.startedAt) && safeDisplay(value.checkpoint)); }
 
 function isCanonicalPath(value: unknown): value is string {
   return typeof value === 'string' && isAbsolute(value) && resolve(value) === value;
 }
 
 function isLocalBranchRef(value: unknown): value is string {
-  return typeof value === 'string' && /^refs\/heads\/.+/.test(value) &&
-    !/[\s~^:?*\\[]/.test(value) && ![...value].some((character) => character.charCodeAt(0) <= 0x1f) &&
-    !value.endsWith('.') && !value.endsWith('/');
+  return typeof value === 'string' && safeRef(value) && value.startsWith('refs/heads/');
 }
 
 function isCleanupState(value: unknown): boolean {
