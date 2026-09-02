@@ -1,5 +1,10 @@
+import { randomUUID } from 'node:crypto';
 import type { CommandEvent, ExecutionBackend, WorkspaceHandle, WorkspaceObservation } from './types.js';
-import type { BackendKind } from './types.js';
+import type { BackendKind, CodespacesAgentContainersConfig, ProcessRunner } from './types.js';
+import { GhCodespacesProvider } from './codespaces.js';
+import { createCodespacesWorkspace, type CodespacesCreateOutcome } from './codespaces-create.js';
+import { waitCodespacesReady } from './codespaces-readiness.js';
+import { listMetadata, type CodespacesWorkspaceMetadata } from './state.js';
 
 /** Local lifecycle hooks keep the backend boundary injectable without changing durable records. */
 export interface LocalExecutionLifecycle {
@@ -44,6 +49,81 @@ const codespacesGate: ExecutionBackend = {
   async create() { gated(); }, async observe() { gated(); }, waitReady() { return gated(); }, execute() { return gated(); }, attach() { return gated(); }, async cancel() { gated(); }, async recover() { gated(); }, async remove() { gated(); },
 };
 function gated(): never { throw new Error('Codespaces lifecycle is phase-gated and unavailable in this release.'); }
+
+export interface CodespacesExecutionBackendDependencies {
+  stateDir: string;
+  config: CodespacesAgentContainersConfig;
+  runner: ProcessRunner;
+  root: string;
+  ghVersion?: string;
+  displayNameHint?: string | null;
+}
+
+/**
+ * Real Codespaces backend behind the experimental gate. Create independently
+ * repeats all critical preflight checks rather than trusting a prior doctor run.
+ */
+export function createCodespacesExecutionBackend(deps: CodespacesExecutionBackendDependencies): ExecutionBackend {
+  const requireGate = () => { if (process.env.AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES !== '1') gated(); };
+  const provider = new GhCodespacesProvider(deps.runner);
+  return {
+    kind: 'codespaces',
+    async create(request, signal) {
+      requireGate();
+      if (request.backend !== 'codespaces' || !request.name || request.name.includes('\0')) throw new Error('Codespaces create request is invalid.');
+      const outcome = await createCodespacesWorkspace({
+        stateDir: deps.stateDir,
+        requestId: randomUUID(),
+        name: request.name,
+        config: deps.config,
+        root: deps.root,
+        runner: deps.runner,
+        provider,
+        signal,
+        ghVersion: deps.ghVersion ?? 'unknown',
+        displayNameHint: deps.displayNameHint ?? null,
+      });
+      if (outcome.outcome === 'recorded') {
+        return { kind: 'codespaces', id: outcome.metadata.workspaceId, name: outcome.metadata.remote.name, environmentId: outcome.metadata.remote.environmentId };
+      }
+      throw new Error(codespacesCreateOutcomeSummary(outcome));
+    },
+    async observe(handle) {
+      requireGate();
+      if (handle.kind !== 'codespaces') throw new Error('Backend handle mismatch: expected codespaces.');
+      const metadata = await loadCodespacesHandleRecord(deps.stateDir, handle);
+      return { backend: 'codespaces', state: metadata.lifecycle.normalized, observedAt: metadata.lifecycle.lastObservedAt };
+    },
+    async *waitReady(handle, signal) {
+      requireGate();
+      if (handle.kind !== 'codespaces') throw new Error('Backend handle mismatch: expected codespaces.');
+      const metadata = await loadCodespacesHandleRecord(deps.stateDir, handle);
+      yield* waitCodespacesReady({ stateDir: deps.stateDir, name: metadata.name, provider, config: deps.config, signal });
+    },
+    execute() { gated(); },
+    attach() { gated(); },
+    async cancel() { gated(); },
+    async recover() { gated(); },
+    async remove() { gated(); },
+  };
+}
+
+async function loadCodespacesHandleRecord(stateDir: string, handle: Extract<WorkspaceHandle, { kind: 'codespaces' }>): Promise<CodespacesWorkspaceMetadata> {
+  const records = await listMetadata(stateDir);
+  for (const entry of records) {
+    if (entry.version !== 2 || entry.backend !== 'codespaces') continue;
+    if (entry.workspaceId === handle.id || entry.remote.name === handle.name || entry.remote.codespaceId === handle.id) return entry;
+  }
+  throw new Error('No recorded Codespaces workspace matches the exact backend handle; readiness observes only exactly recorded workspaces.');
+}
+
+function codespacesCreateOutcomeSummary(outcome: codespacesCreateOutcomeType): string {
+  if (outcome.outcome === 'quarantined') return `Codespace recorded but quarantined (${outcome.reason}): ${outcome.summary}`;
+  if (outcome.outcome === 'blocked') return `Codespace create was blocked: ${outcome.reason}`;
+  return `Codespace create is ambiguous and requires manual recovery (${outcome.reason}). The resource was neither adopted nor deleted; recovery evidence is journaled under the recorded request ID ${outcome.requestId}.`;
+}
+type codespacesCreateOutcomeType = Exclude<CodespacesCreateOutcome, { outcome: 'recorded' }>;
+
 function requireOperation<T>(operation: T | undefined, name: string): T { if (!operation) throw new Error(`Local ${name} lifecycle is unavailable.`); return operation; }
 function assertHandle(handle: WorkspaceHandle, expected: 'local'): void { if (handle.kind !== expected) throw new Error(`Backend handle mismatch: expected ${expected}.`); }
 function assertRequestName(request: { name: string; backend: BackendKind }): void { if (request.backend !== 'local' || !request.name || request.name.includes('\0')) throw new Error('Workspace creation request is invalid.'); }

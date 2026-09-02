@@ -3,11 +3,11 @@ import { readFile } from 'node:fs/promises';
 import { createInterface } from 'node:readline/promises';
 import { assertDevcontainerPathCommittedOnBaseBranch, configurationDiff, hashConfig, initConfigV2, loadConfig, parseCodespacesDraft, parseConfig, redactConfig, redactDiagnostic, saveConfigAtomic, snapshotInitConfig } from './config.js';
 import { discoverProjectSetup, doctor, validateCodespacesSetup } from './setup.js';
-import type { CodespacesAgentContainersConfig } from './types.js';
+import type { CodespacesAgentContainersConfig, CodespacesConfig, ExecutionBackend, ReadinessEvent, WorkspaceHandle } from './types.js';
 import { acknowledgeUnconfirmedProcessReap, clearManualRecoveryIfCurrent, defaultStateDir, deleteMetadata, isLocalWorkspaceMetadata, listMetadata, loadManualRecovery, loadMetadata, recordManualRecovery, releaseStaleWorkspaceLock, saveMetadata, withWorkspaceLock } from './state.js';
 import { execNamedWorkspaceLifecycle } from './runtime.js';
 import { createWorkspace, findGitRoot, nodeProcessRunner, removeWorkspace } from './workspaces.js';
-import { assertBackendAvailable, resolveExecutionBackend } from './backend.js';
+import { assertBackendAvailable, createCodespacesExecutionBackend, resolveExecutionBackend } from './backend.js';
 
 export interface CliIo { input: NodeJS.ReadableStream; output: NodeJS.WritableStream; isTTY: boolean }
 const processIo: CliIo = { input: process.stdin, output: process.stdout, isTTY: Boolean(process.stdin.isTTY) };
@@ -120,12 +120,25 @@ export async function runCli(args: string[], cwd = process.cwd(), write: (messag
       }
       case 'create': {
         const name = requiredPositional(rest, 'workspace name');
-        ensureOptions(rest.slice(1), ['--base', '--backend']);
-        const root = await findGitRoot(cwd, nodeProcessRunner);
-        const config = await loadConfig(join(root, '.agent-containers.yml'));
+        ensureOptions(rest.slice(1), ['--base', '--backend', '--machine', '--geo', '--yes-cost'], ['--yes-cost']);
         const requestedBackend = optionValue(rest.slice(1), '--backend');
         if (requestedBackend !== undefined && requestedBackend !== 'local' && requestedBackend !== 'codespaces') throw new UsageError('--backend must be local or codespaces.');
-        assertLocalBackendEnabled(config, requestedBackend);
+        if (requestedBackend === 'codespaces') requireCodespacesExperimental();
+        const root = await findGitRoot(cwd, nodeProcessRunner);
+        const config = await loadConfig(join(root, '.agent-containers.yml'));
+        const backend = requestedBackend ?? (config.version === 1 ? 'local' : config.backends.default);
+        if (backend === 'codespaces') {
+          requireCodespacesExperimental();
+          if (config.version !== 2 || !config.backends.enabled.includes('codespaces')) throw new Error('Codespaces is not enabled by the strict configuration; enable it before creating a Codespace.');
+          if (!rest.slice(1).includes('--yes-cost')) throw new UsageError('Codespaces creation requires --yes-cost because it provisions a paid, billable resource.');
+          const effective = codespacesCreateConfig(config, rest.slice(1));
+          const createBackend: ExecutionBackend = createCodespacesExecutionBackend({ stateDir, config: effective, runner: nodeProcessRunner, root, displayNameHint: `agent-containers/${name}` });
+          const handle = await createBackend.create({ name, backend: 'codespaces' });
+          if (handle.kind !== 'codespaces') throw new Error('Codespaces create did not return a Codespaces handle.');
+          write(`Created Codespaces workspace ${name}; provider Codespace ${handle.name} is recorded. Readiness gates run with: agent-containers wait ${name} --for ready.`);
+          return 0;
+        }
+        assertLocalBackendEnabled(config, 'local');
         let recoveryWorktree = resolve(root, config.workspace.worktreeRoot, name);
         return withWorkspaceLock(stateDir, name, async (signal) => {
           recoveryWorktree = resolve(root, config.workspace.worktreeRoot, name);
@@ -135,15 +148,44 @@ export async function runCli(args: string[], cwd = process.cwd(), write: (messag
             await assertDevcontainerPathCommittedOnBaseBranch(config, root, nodeProcessRunner, baseBranch, 'lifecycle', signal);
           }
           let workspace: Awaited<ReturnType<typeof createWorkspace>> | undefined;
-          const backend = resolveExecutionBackend('local', { create: async () => {
+          const localBackend = resolveExecutionBackend('local', { create: async () => {
             workspace = await createWorkspace({ cwd, name, config, stateDir, runner: nodeProcessRunner, baseBranch, signal });
             return { kind: 'local' };
           } });
-          await backend.create({ name, backend: 'local' }, signal);
+          await localBackend.create({ name, backend: 'local' }, signal);
           if (!workspace) throw new Error('Local workspace creation did not return metadata.');
           write(`Created ${workspace.name} at ${workspace.worktree}`);
           return 0;
         }, { onUnconfirmedProcessReap: () => recordManualRecovery(stateDir, name, { reason: 'local-process-reap-unconfirmed', containerIds: [], worktree: recoveryWorktree }) });
+      }
+      case 'wait': {
+        const name = requiredPositional(rest, 'workspace name');
+        ensureOptions(rest.slice(1), ['--for', '--timeout'], []);
+        const forTarget = optionValue(rest.slice(1), '--for');
+        if (forTarget !== 'ready') throw new UsageError('Usage: agent-containers wait <name> --for ready [--timeout <duration>]');
+        const recorded = await loadMetadata(stateDir, name);
+        if (!recorded) throw new Error(`No Agent Containers workspace named "${name}".`);
+        if ('repoRoot' in recorded) throw new Error(`Workspace "${name}" is a local workspace; local readiness does not use the Codespaces gates.`);
+        requireCodespacesExperimental();
+        const root = await findGitRoot(cwd, nodeProcessRunner);
+        const config = await loadConfig(join(root, '.agent-containers.yml'));
+        if (config.version !== 2 || !config.backends.enabled.includes('codespaces')) throw new Error('Codespaces is not enabled by the strict configuration.');
+        const handle: WorkspaceHandle = { kind: 'codespaces', id: recorded.workspaceId, name: recorded.remote.name, environmentId: recorded.remote.environmentId };
+        const backend = createCodespacesExecutionBackend({ stateDir, config, runner: nodeProcessRunner, root });
+        let report: ReadinessEvent['report'] | undefined;
+        for await (const event of backend.waitReady(handle)) {
+          if (!('report' in event)) continue;
+          const last = event.report.gates.at(-1);
+          if (last) write(`${last.id}: ${last.state} ${last.detail}`.trim());
+          report = event.report;
+        }
+        const terminal = report?.terminal;
+        if (terminal === 'ready' || terminal === 'ready-without-setup-proof') {
+          write(`Workspace ${name} is ${terminal}.`);
+          return 0;
+        }
+        write(`Workspace ${name} did not become ready (${terminal ?? 'unknown'}). The Codespace was not modified; run ac doctor --backend codespaces --workspace ${name} for remediation.`);
+        return 1;
       }
       case 'exec':
       case 'run': {
@@ -274,7 +316,15 @@ function ensureOptions(args: string[], allowed: string[], flags: string[] = []):
 }
 
 function usage(): string {
-  return 'Usage: agent-containers <init|configure|doctor|validate|create|exec|run|recover|unlock|status|remove> [options]\n  init [--interactive] [--backends local] [--non-interactive (--from FILE|--stdin)]\n  configure --interactive | --non-interactive (--from FILE|--stdin)\n  doctor [--backend local|codespaces|all] [--workspace NAME] [--json]';
+  return 'Usage: agent-containers <init|configure|doctor|validate|create|wait|exec|run|recover|unlock|status|remove> [options]\n  init [--interactive] [--backends local] [--non-interactive (--from FILE|--stdin)]\n  configure --interactive | --non-interactive (--from FILE|--stdin)\n  doctor [--backend local|codespaces|all] [--workspace NAME] [--json]\n  create <name> [--backend local|codespaces] [--machine MACHINE] [--geo GEO] --yes-cost\n  wait <name> --for ready [--timeout <duration>]';
+}
+
+function codespacesCreateConfig(config: CodespacesAgentContainersConfig, args: string[]): CodespacesAgentContainersConfig {
+  const machine = optionValue(args, '--machine');
+  const geo = optionValue(args, '--geo');
+  if (machine === undefined && config.backends.codespaces.machine === null) throw new UsageError('A Codespaces machine is required via configuration or --machine; no implicit paid machine exists.');
+  const policy: CodespacesConfig = { ...config.backends.codespaces, machine: machine ?? config.backends.codespaces.machine, geo: geo ?? config.backends.codespaces.geo };
+  return { ...config, backends: { ...config.backends, codespaces: policy } };
 }
 
 function requireCodespacesExperimental(): void {
