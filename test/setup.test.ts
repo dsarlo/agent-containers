@@ -150,14 +150,35 @@ test('configuration rejects and redacts free-form, legacy, and split credential 
 });
 
 test('configuration rejects compound credential argv and never exposes malformed YAML source', () => {
-  for (const flag of ['--token', '--access-token', '--client-secret']) {
+  for (const flag of ['--token', '--access-token', '--client-secret', '--auth-token', '--oauth-token', '--credentials', '--private-key', '--auth-token=sentinel-secret-value', '--oauth-token=sentinel-secret-value', '--private-key=sentinel-secret-value']) {
     const candidate = structuredClone(codespaces);
-    candidate.backends.codespaces.readiness.command = ['tool', flag, 'sentinel-secret-value'];
+    candidate.backends.codespaces.readiness.command = flag.includes('=') ? ['tool', flag] : ['tool', flag, 'sentinel-secret-value'];
     assert.throws(() => parseConfig(JSON.stringify(candidate)), (error: Error) => !error.message.includes('sentinel-secret-value'));
   }
   assert.throws(() => parseConfig('commands:\n  run: --token sentinel-secret-value\n  broken: [\n'), (error: Error) => !error.message.includes('sentinel-secret-value'));
   const preview = configurationDiff(null, { ...codespaces, project: { ...codespaces.project, repository: 'token: sentinel-secret-value' } } as unknown as CodespacesAgentContainersConfig);
   assert.doesNotMatch(preview, /sentinel-secret-value/);
+});
+
+test('YAML syntax diagnostics reveal only sanitized locations for direct, file, and CLI input', async () => {
+  const sentinel = 'UNKNOWN_SOURCE_SENTINEL';
+  const malformed = `commands:\n  ${sentinel}: [\n`;
+  for (const parseSource of [() => parseConfig(malformed), () => parseCodespacesDraft(malformed)]) {
+    assert.throws(parseSource, (error: Error) => /^Invalid .*syntax at line \d+, column \d+\.$/.test(error.message) && !error.message.includes(sentinel));
+  }
+  const directory = await mkdtemp(join(tmpdir(), 'agent-containers-yaml-diagnostic-'));
+  const path = join(directory, 'bad.yml');
+  await writeFile(path, malformed);
+  await assert.rejects(() => loadConfig(path), (error: Error) => /^Invalid configuration syntax at line \d+, column \d+\.$/.test(error.message) && !error.message.includes(sentinel));
+});
+
+test('configuration previews retain nonsecret Codespaces secret policy while redacting values', () => {
+  const candidate = structuredClone(codespaces);
+  candidate.backends.codespaces.secrets = { allowedRemoteSecretNames: ['DEPLOY_TOKEN'], allowCodespaceGitCredential: true };
+  const preview = configurationDiff(null, candidate);
+  assert.match(preview, /allowedRemoteSecretNames/);
+  assert.match(preview, /DEPLOY_TOKEN/);
+  assert.match(preview, /allowCodespaceGitCredential/);
 });
 
 test('strict v2 only accepts full 40 or 64 character OIDs and rejects visibility changes', () => {
@@ -200,7 +221,7 @@ test('v2 setup drafts may omit discovered evidence, while persisted v2 configura
   assert.throws(() => parseConfig(JSON.stringify(draft)), /requires validated project.expectedOid/);
 });
 
-test('concurrent configuration saves serialize their compare-and-swap and only one writer publishes', async () => {
+test('existing files are never replaced because content-hash CAS cannot protect against independent writers', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'agent-containers-setup-race-'));
   const path = join(directory, '.agent-containers.yml');
   await writeFile(path, JSON.stringify(codespaces));
@@ -211,8 +232,9 @@ test('concurrent configuration saves serialize their compare-and-swap and only o
     saveConfigAtomic(path, codespaces, expected, { durabilityAdapter: durability }),
     saveConfigAtomic(path, alternate, expected, { durabilityAdapter: durability }),
   ]);
-  assert.equal(results.filter((result) => result.status === 'fulfilled').length, 1);
-  assert.equal(results.filter((result) => result.status === 'rejected').length, 1);
+  assert.equal(results.filter((result) => result.status === 'fulfilled').length, 0);
+  assert.equal(results.filter((result) => result.status === 'rejected').length, 2);
+  assert.equal(await readFile(path, 'utf8'), JSON.stringify(codespaces));
 });
 
 test('expected-absence contenders publish at most one configuration', async () => {
@@ -238,6 +260,16 @@ test('configuration CAS preserves a non-cooperating writer that changes the file
     beforePublish: async () => { await writeFile(path, 'external edit'); },
   }), /changed concurrently/);
   assert.equal(await readFile(path, 'utf8'), 'external edit');
+});
+
+test('no-replace publication preserves an external writer arriving after the final check', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'agent-containers-config-post-check-race-'));
+  const path = join(directory, '.agent-containers.yml');
+  await assert.rejects(() => saveConfigAtomic(path, codespaces, null, {
+    durabilityAdapter: durability,
+    afterCheckBeforePublish: async () => { await writeFile(path, 'external post-check edit'); },
+  }), /changed concurrently/);
+  assert.equal(await readFile(path, 'utf8'), 'external post-check edit');
 });
 
 test('discovery scans the resolved immutable OID rather than a moving tracking ref', async () => {

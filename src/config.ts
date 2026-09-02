@@ -1,4 +1,4 @@
-import { lstat, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { lstat, link, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { createHash, randomUUID } from 'node:crypto';
 import { basename, dirname, isAbsolute, join, posix, win32 } from 'node:path';
 import { parse } from 'yaml';
@@ -67,17 +67,16 @@ export async function initConfig(directory: string, force = false): Promise<void
 }
 
 /** Save a fully validated v2 candidate without silently replacing an existing configuration. */
-export async function initConfigV2(directory: string, config: CodespacesAgentContainersConfig, force = false): Promise<void> {
+export async function initConfigV2(directory: string, config: CodespacesAgentContainersConfig, force = false, expectedSnapshot?: string | null): Promise<void> {
   const path = join(directory, '.agent-containers.yml');
-  let expected: string | null = null;
+  let expected: string | null = expectedSnapshot ?? null;
   try {
     const entry = await lstat(path);
     if (entry.isSymbolicLink()) throw new Error(`${path} is a symlink; refusing to overwrite it.`);
     if (entry.nlink > 1) throw new Error(`${path} has multiple hard links; refusing to overwrite it.`);
     if (!force) throw new Error(`${path} already exists; use --force to overwrite it.`);
-    // Snapshot the exact generation before preview/confirmation callers reach
-    // this force path; saveConfigAtomic rechecks it under publication locking.
-    expected = hashConfig(await readFile(path, 'utf8'));
+    // Legacy callers without an onboarding snapshot still bind this generation.
+    if (expectedSnapshot === undefined) expected = hashConfig(await readFile(path, 'utf8'));
   } catch (error: unknown) {
     if (!isNodeError(error, 'ENOENT')) throw error;
   }
@@ -86,6 +85,24 @@ export async function initConfigV2(directory: string, config: CodespacesAgentCon
   }
   catch (error: unknown) {
     if (error instanceof Error && /changed concurrently/.test(error.message)) throw new Error('Configuration changed concurrently; it was created while onboarding was in progress.', { cause: error });
+    throw error;
+  }
+}
+
+export interface InitConfigSnapshot { current: AgentContainersConfig | null; expectedHash: string | null }
+
+/** Capture the force target before onboarding so preview and publication share one generation. */
+export async function snapshotInitConfig(directory: string, force: boolean): Promise<InitConfigSnapshot> {
+  const path = join(directory, '.agent-containers.yml');
+  try {
+    const entry = await lstat(path);
+    if (entry.isSymbolicLink()) throw new Error(`${path} is a symlink; refusing to overwrite it.`);
+    if (entry.nlink > 1) throw new Error(`${path} has multiple hard links; refusing to overwrite it.`);
+    if (!force) throw new Error(`${path} already exists; use --force to overwrite it.`);
+    const source = await readFile(path, 'utf8');
+    return { current: parseConfig(source), expectedHash: hashConfig(source) };
+  } catch (error: unknown) {
+    if (isNodeError(error, 'ENOENT')) return { current: null, expectedHash: null };
     throw error;
   }
 }
@@ -105,7 +122,7 @@ export async function loadConfig(path: string): Promise<AgentContainersConfig> {
 export function parseConfig(source: string): AgentContainersConfig {
   let raw: unknown;
   try { raw = parse(source); }
-  catch (error: unknown) { throw new Error(`Invalid configuration syntax: ${redactDiagnostic(error instanceof Error ? error.message : String(error))}`, { cause: error }); }
+  catch (error: unknown) { throw syntaxError('Invalid configuration syntax', error); }
   if (!isRecord(raw)) throw new Error('Invalid configuration: root must be an object');
   // Preserve v1's useful validation for incomplete legacy-looking files while
   // recognizing v2 only once its discriminating backend section is present.
@@ -142,7 +159,7 @@ export function parseConfig(source: string): AgentContainersConfig {
 export function parseCodespacesDraft(source: string): CodespacesAgentContainersConfig {
   let raw: unknown;
   try { raw = parse(source); }
-  catch (error: unknown) { throw new Error(`Invalid Codespaces setup draft syntax: ${redactDiagnostic(error instanceof Error ? error.message : String(error))}`, { cause: error }); }
+  catch (error: unknown) { throw syntaxError('Invalid Codespaces setup draft syntax', error); }
   if (!isRecord(raw) || raw.version !== 2 || raw.backends === undefined) throw new Error('Invalid Codespaces setup draft: schema version 2 is required');
   return parseV2Config(raw, false);
 }
@@ -258,6 +275,8 @@ export interface ConfigPublicationOptions {
   sleep?: (milliseconds: number) => Promise<void>;
   /** Test seam immediately before the final generation check/publication boundary. */
   beforePublish?: () => Promise<void>;
+  /** Test seam after validation and immediately before atomic publication. */
+  afterCheckBeforePublish?: () => Promise<void>;
 }
 interface ConfigLockOwner { pid: number; operation: 'configuration-publication'; token: string; createdAt: string }
 
@@ -307,7 +326,18 @@ export async function saveConfigAtomic(path: string, next: AgentContainersConfig
       if (expectedCurrentHash === null ? final !== undefined : expectedCurrentHash !== undefined && (final === undefined || hashConfig(final) !== expectedCurrentHash)) {
         throw new Error('Configuration changed concurrently; reload and review the new diff.');
       }
-      if (await adapter.publicationMode() === 'strict') {
+      await options.afterCheckBeforePublish?.();
+      if (expectedCurrentHash !== undefined) {
+        // POSIX has no atomic replace-if-content-hash primitive. Publishing an
+        // expected generation would falsely claim protection from independent
+        // writers, so constrained writes use atomic create-only publication.
+        await link(temporary, path);
+        await rm(temporary, { force: false });
+        if (await adapter.publicationMode() === 'strict') {
+          try { await adapter.syncDirectory(directory); }
+          catch (error: unknown) { throw new Error(`Configuration publication committed configuration is present but directory durability confirmation failed: ${error instanceof Error ? error.message : String(error)}. Reload and review the committed configuration before retrying.`, { cause: error }); }
+        }
+      } else if (await adapter.publicationMode() === 'strict') {
         await rename(temporary, path);
         try {
           await adapter.syncDirectory(directory);
@@ -321,7 +351,11 @@ export async function saveConfigAtomic(path: string, next: AgentContainersConfig
           throw error;
         }
       } else await adapter.moveFileWriteThrough(temporary, path);
-    } catch (error) { await rm(temporary, { force: true }); throw error; }
+    } catch (error: unknown) {
+      await rm(temporary, { force: true });
+      if (isNodeError(error, 'EEXIST')) throw new Error('Configuration changed concurrently; reload and review the new diff.', { cause: error });
+      throw error;
+    }
     return 'saved';
   } catch (error: unknown) {
     publicationError = error;
@@ -434,14 +468,15 @@ function requiredStrings(value: unknown, label: string): string[] {
 }
 
 function rejectCredentialArgv(argv: string[], label: string): void {
+  const credentialOption = /^(?:--?(?:token|access-token|auth-token|oauth-token|password|secret|client-secret|api[_-]?key|credentials?|private[-_]?key)|authorization)$/i;
   for (let index = 0; index < argv.length; index += 1) {
     const value = argv[index];
-    if (/^(?:--?(?:token|access-token|password|secret|client-secret|api[_-]?key)|authorization)$/i.test(value) || /^(?:--?(?:token|access-token|password|secret|client-secret|api[_-]?key)|authorization)=/i.test(value)) {
+    if (credentialOption.test(value) || (value.includes('=') && credentialOption.test(value.slice(0, value.indexOf('='))))) {
       throw new Error(`Invalid configuration: ${label} contains a credential option`);
     }
     // A value split from its credential flag is still a credential, even when it
     // does not independently resemble a provider token.
-    if (index > 0 && /^(?:--?(?:token|access-token|password|secret|client-secret|api[_-]?key)|authorization)$/i.test(argv[index - 1])) {
+    if (index > 0 && credentialOption.test(argv[index - 1])) {
       throw new Error(`Invalid configuration: ${label} contains a credential option`);
     }
     // curl-style headers can split both the header option and Bearer value.
@@ -463,7 +498,16 @@ function safeField(value: string): string { return /(?:token|password|secret|cre
 export function redactConfig<T>(value: T): T {
   if (Array.isArray(value)) return value.map(redactConfig) as T;
   if (!isRecord(value)) return typeof value === 'string' && secretShaped(value) ? '[redacted]' as T : value;
-  return Object.fromEntries(Object.entries(value).map(([key, item]) => [safeField(key), /(?:token|password|secret|credential|key)/i.test(key) ? '[redacted]' : redactConfig(item)])) as T;
+  return Object.fromEntries(Object.entries(value).map(([key, item]) => {
+    const policyField = key === 'secrets' || key === 'allowedRemoteSecretNames' || key === 'allowCodespaceGitCredential';
+    return [policyField ? key : safeField(key), policyField ? redactConfig(item) : /(?:token|password|secret|credential|key)/i.test(key) ? '[redacted]' : redactConfig(item)];
+  })) as T;
+}
+
+function syntaxError(prefix: string, error: unknown): Error {
+  const message = error instanceof Error ? error.message : String(error);
+  const location = /at line (\d+), column (\d+)/i.exec(message);
+  return new Error(`${prefix}${location ? ` at line ${location[1]}, column ${location[2]}` : ''}.`, { cause: error });
 }
 
 /** Never render input-derived diagnostics verbatim at a command boundary. */

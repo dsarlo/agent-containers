@@ -1,7 +1,7 @@
 import { join, resolve } from 'node:path';
 import { readFile } from 'node:fs/promises';
 import { createInterface } from 'node:readline/promises';
-import { assertDevcontainerPathCommittedOnBaseBranch, configurationDiff, hashConfig, initConfigV2, loadConfig, parseCodespacesDraft, parseConfig, redactDiagnostic, saveConfigAtomic } from './config.js';
+import { assertDevcontainerPathCommittedOnBaseBranch, configurationDiff, hashConfig, initConfigV2, loadConfig, parseCodespacesDraft, parseConfig, redactDiagnostic, saveConfigAtomic, snapshotInitConfig } from './config.js';
 import { discoverProjectSetup, doctor, validateCodespacesSetup } from './setup.js';
 import type { CodespacesAgentContainersConfig } from './types.js';
 import { acknowledgeUnconfirmedProcessReap, clearManualRecoveryIfCurrent, defaultStateDir, deleteMetadata, isLocalWorkspaceMetadata, listMetadata, loadManualRecovery, loadMetadata, recordManualRecovery, releaseStaleWorkspaceLock, saveMetadata, withWorkspaceLock } from './state.js';
@@ -29,23 +29,27 @@ export async function runCli(args: string[], cwd = process.cwd(), write: (messag
         const source = optionValue(rest, '--from');
         const stdin = rest.includes('--stdin');
         const nonInteractive = rest.includes('--non-interactive');
+        const force = rest.includes('--force');
         if ((source || stdin) && !nonInteractive) throw new UsageError('Noninteractive init imports require --non-interactive.');
         if (source && stdin) throw new UsageError('Use only one of --from FILE or --stdin.');
         if (rest.includes('--interactive')) {
           if (nonInteractive || source || stdin || rest.includes('--yes') || selection || optionValue(rest, '--default-backend')) throw new UsageError('Interactive init cannot be combined with setup mode, selection, or confirmation options.');
           if (!io.isTTY) throw new UsageError('Interactive configuration requires a TTY; use --non-interactive --stdin for unattended setup.');
-          const next = await interactiveConfig(io, root);
-          await initConfigV2(root, next, rest.includes('--force'));
+          const snapshot = await snapshotInitConfig(root, force);
+          const next = await interactiveConfig(io, root, snapshot.current);
+          await initConfigV2(root, next, force, snapshot.expectedHash);
         } else if (source || stdin) {
           if (!rest.includes('--yes')) throw new UsageError('Noninteractive init previews configuration and requires --yes to publish it.');
+          const snapshot = await snapshotInitConfig(root, force);
           const next = await loadConfigFromSource(source ? resolve(cwd, source) : undefined, stdin, io.input);
           if (next.version !== 2) throw new Error('Noninteractive init accepts strict schema-v2 nonsecret configuration only.');
           if (next.backends.enabled.includes('codespaces')) requireCodespacesExperimental();
           const validated = await withSetupEvidence(next, root);
-          write(configurationDiff(null, validated));
-          await initConfigV2(root, validated, rest.includes('--force'));
-        } else if (!selection) await initConfigV2(root, setupConfig('local'), rest.includes('--force'));
-        else await initConfigV2(root, setupConfig(selection, optionValue(rest, '--default-backend')), rest.includes('--force'));
+          write(configurationDiff(snapshot.current, validated));
+          await assertEvidenceUnchanged(validated, root);
+          await initConfigV2(root, validated, force, snapshot.expectedHash);
+        } else if (!selection) await initConfigV2(root, setupConfig('local'), force);
+        else await initConfigV2(root, setupConfig(selection, optionValue(rest, '--default-backend')), force);
         write(`Wrote ${join(root, '.agent-containers.yml')}`);
         return 0;
       }
@@ -80,6 +84,7 @@ export async function runCli(args: string[], cwd = process.cwd(), write: (messag
         }
         const validated = interactive ? next : await withSetupEvidence(next, root);
         write(configurationDiff(current, validated));
+        if (!interactive) await assertEvidenceUnchanged(validated, root);
         write((await saveConfigAtomic(path, validated, expectedCurrentHash)) === 'saved' ? `Saved ${path}` : 'No configuration changes.');
         return 0;
       }
@@ -294,6 +299,14 @@ async function withSetupEvidence(next: CodespacesAgentContainersConfig, root: st
   if (!next.backends.enabled.includes('codespaces')) return next;
   const evidence = await validateCodespacesSetup(next, root, nodeProcessRunner);
   return { ...next, project: { ...next.project, expectedOid: evidence.expectedOid }, environment: { ...next.environment, devcontainerBlobOid: evidence.devcontainerBlobOid } };
+}
+
+async function assertEvidenceUnchanged(candidate: CodespacesAgentContainersConfig, root: string): Promise<void> {
+  if (!candidate.backends.enabled.includes('codespaces')) return;
+  const observed = await validateCodespacesSetup(candidate, root, nodeProcessRunner);
+  if (observed.expectedOid !== candidate.project.expectedOid || observed.devcontainerBlobOid !== candidate.environment.devcontainerBlobOid) {
+    throw new Error('Codespaces source evidence changed after preview; review a new candidate before saving.');
+  }
 }
 
 async function loadConfigFromSource(source: string | undefined, stdin: boolean, input: NodeJS.ReadableStream): Promise<CodespacesAgentContainersConfig | import('./types.js').LocalAgentContainersConfig> {

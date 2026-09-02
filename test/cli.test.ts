@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
+import { Readable, Writable } from 'node:stream';
 import test from 'node:test';
 import { isLocalWorkspaceMetadata, loadManualRecovery, loadMetadata, recordManualRecovery, saveMetadata, setStateDurableRenameForTesting, withWorkspaceLock } from '../src/state.js';
 import { exitCodeForError, runCli } from '../src/cli.js';
@@ -54,6 +55,22 @@ test('CLI help returns success and describes public commands', async () => {
   const recoveryMessages: string[] = [];
   assert.equal(await runCli(['recover', 'safe', '--yes'], process.cwd(), (message) => recoveryMessages.push(message)), 2);
   assert.match(recoveryMessages.at(-1) ?? '', /--remote-command-stopped/);
+});
+
+test('CLI stdin YAML syntax failures expose only a generic sanitized location', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agent-containers-cli-yaml-'));
+  assert.equal(spawnSync('git', ['init', '-b', 'main'], { cwd: root }).status, 0);
+  const messages: string[] = [];
+  const sentinel = 'CLI_UNKNOWN_SOURCE_SENTINEL';
+  const code = await runCli(
+    ['init', '--non-interactive', '--stdin', '--yes'],
+    root,
+    (message) => messages.push(message),
+    { input: Readable.from([`commands:\n  ${sentinel}: [\n`]), output: new Writable({ write(_chunk, _encoding, callback) { callback(); } }), isTTY: false },
+  );
+  assert.equal(code, 1);
+  assert.match(messages.at(-1) ?? '', /^agent-containers: Invalid Codespaces setup draft syntax at line \d+, column \d+\.$/);
+  assert.doesNotMatch(messages.at(-1) ?? '', new RegExp(sentinel));
 });
 
 test('recover retires a dead guarded lifecycle lock without a manual recovery record', async (t) => {

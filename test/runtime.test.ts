@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, symlink, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, mkdtemp, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import test from 'node:test';
@@ -173,6 +173,16 @@ test('execWorkspaceLifecycle supplies durable recovery callbacks under the works
   await execWorkspaceLifecycle(metadata, ['true'], runner, async () => undefined, stateDir, async () => '{}');
   assert.equal(await loadManualRecovery(stateDir, metadata.name), undefined);
   await withWorkspaceLock(stateDir, metadata.name, async () => undefined);
+});
+
+test('execWorkspaceLifecycle rejects a durably reloaded Codespaces record before any local journal or runner side effect', async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), 'agent-containers-remote-reload-'));
+  await saveMetadata(stateDir, codespacesMetadata);
+  let runnerCalls = 0;
+  const runner: ProcessRunner = { async run() { runnerCalls += 1; return { code: 0, stdout: '', stderr: '' }; } };
+  await assert.rejects(() => execWorkspaceLifecycle(metadata, ['true'], runner, async () => undefined, stateDir, async () => '{}'), /Codespaces backend.*not implemented/i);
+  assert.equal(runnerCalls, 0);
+  await assert.rejects(() => lstat(join(stateDir, 'locks', `${metadata.name}.manual-recovery.journal`)), { code: 'ENOENT' });
 });
 
 test('execWorkspaceLifecycle reloads recorded metadata under its lock instead of persisting a stale terminal ID', async () => {

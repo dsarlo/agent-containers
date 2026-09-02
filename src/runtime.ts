@@ -29,9 +29,14 @@ const resolveSyntheticPath: PathResolver = async (path) => path;
 /** Run the remote lifecycle under its durable workspace lock and recovery guard. */
 export async function execWorkspaceLifecycle(metadata: WorkspaceMetadata, command: string[], runner: ProcessRunner, save: (metadata: LocalMetadata) => Promise<void>, stateDir: string, readConfig: ConfigReader = readDevcontainerConfig): Promise<ProcessResult> {
   assertLocalMetadata(metadata);
+  // Reject a durable backend swap before constructing any local lifecycle state.
+  const initial = await loadMetadata(stateDir, metadata.name);
+  if (!initial) throw new Error(`No Agent Containers workspace named "${metadata.name}".`);
+  assertLocalMetadata(initial);
   return withWorkspaceLock(stateDir, metadata.name, async (signal) => {
     const recorded = await loadMetadata(stateDir, metadata.name);
     if (!recorded) throw new Error(`No Agent Containers workspace named "${metadata.name}".`);
+    assertLocalMetadata(recorded);
     await requireInitializedRecoveryJournal(stateDir, metadata.name);
     return execWorkspace(
       recorded,
