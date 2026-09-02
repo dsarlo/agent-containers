@@ -207,7 +207,8 @@ export class GhCodespacesProvider {
 export interface SafeExecuteRequest { commandId: string; argv: readonly [string, ...string[]]; cwd?: string; mode: 'pipe' | 'pty'; stdin: 'closed' | 'stream' }
 export function assertSafeExecuteRequest(request: SafeExecuteRequest): void {
   if (!/^[0-9A-Za-z-]{1,128}$/.test(request.commandId)) throw new Error('commandId must be a validated durable identifier.');
-  if (!request.argv.length || request.argv.some((value) => !value || value.includes('\0'))) throw new Error('Remote argv must be nonempty and must not contain NUL.');
+  if (!request.argv.length || request.argv[0] === undefined || request.argv[0].length === 0) throw new Error('Remote argv must be nonempty and argv[0] must be nonempty.');
+  if (request.argv.some((value) => typeof value !== 'string' || value.length > 1023 || value.includes('\0'))) throw new Error('Remote argv tokens must be bounded plain strings without NUL.');
   if (request.cwd && (!/^[^\\/][^\\]*$/.test(request.cwd) || request.cwd.split('/').some((part) => !part || part === '.' || part === '..'))) throw new Error('Remote cwd must be a safe repository-relative path.');
 }
 

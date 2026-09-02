@@ -172,9 +172,18 @@ type codespacesCreateOutcomeType = Exclude<CodespacesCreateOutcome, { outcome: '
 function requireOperation<T>(operation: T | undefined, name: string): T { if (!operation) throw new Error(`Local ${name} lifecycle is unavailable.`); return operation; }
 function assertHandle(handle: WorkspaceHandle, expected: 'local'): void { if (handle.kind !== expected) throw new Error(`Backend handle mismatch: expected ${expected}.`); }
 function assertRequestName(request: { name: string; backend: BackendKind }): void { if (request.backend !== 'local' || !request.name || request.name.includes('\0')) throw new Error('Workspace creation request is invalid.'); }
-function assertRequest(request: { commandId: string; argv: readonly [string, ...string[]] }): void { if (!request.commandId || !request.argv.length || request.argv.some((value) => !value || value.includes('\0'))) throw new Error('Execution request is invalid.'); }
+/** Max byte length of a single argv token; must match the C helper's 1024-byte
+ * token bound (helper.c parse_argv) so validators never accept a token the
+ * helper would reject. Empty-string tokens ARE valid (they are safe without a
+ * shell — the helper execvp's argv directly) but argv[0] must be non-empty. */
+const MAX_ARGV_TOKEN_BYTES = 1023;
+function isValidArgv(argv: readonly string[]): boolean {
+  if (!argv.length || argv[0] === undefined || argv[0].length === 0) return false;
+  return argv.every((value) => typeof value === 'string' && value.length <= MAX_ARGV_TOKEN_BYTES && !value.includes('\0'));
+}
+function assertRequest(request: { commandId: string; argv: readonly [string, ...string[]] }): void { if (!request.commandId || !isValidArgv(request.argv)) throw new Error('Execution request is invalid.'); }
 function assertRemoteRequest(request: RemoteCommandRequest): void {
-  if (!request.commandId || !request.argv.length || request.argv.some((value) => !value || value.includes('\0'))) throw new Error('Execution request is invalid.');
+  if (!request.commandId || !isValidArgv(request.argv)) throw new Error('Execution request is invalid.');
   if (request.mode !== undefined && request.mode !== 'pipe' && request.mode !== 'pty') throw new Error('Remote execution mode must be pipe or pty.');
   if (request.cwd !== undefined && (!request.cwd || request.cwd.length > 1024 || /[\0\r\n]/.test(request.cwd))) throw new Error('Remote cwd is invalid.');
 }

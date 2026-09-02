@@ -14,7 +14,7 @@ import { loadMetadata, saveMetadata, type CodespacesWorkspaceMetadata } from '..
 import { runCli } from '../src/cli.js';
 import { nodeProcessRunner } from '../src/workspaces.js';
 import type { CodespacesAgentContainersConfig, ProcessRunner } from '../src/types.js';
-import { transportFixture } from './transport-fixtures.js';
+import { transportFixture, COMMAND_ID } from './transport-fixtures.js';
 
 const OID = '0123456789abcdef0123456789abcdef01234567';
 const BLOB = '1234567890abcdef1234567890abcdef12345678';
@@ -327,3 +327,31 @@ test('the Codespaces backend executes a durable pipe command behind the experime
 });
 
 function bytes(...values: number[]): Uint8Array { return Uint8Array.from(values); }
+
+test('backend accepts empty argv tokens and preserves them in the framed corpus end to end (N3)', async () => {
+  const previous = process.env.AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES;
+  process.env.AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES = '1';
+  try {
+    const fixture = await transportFixture();
+    fixture.helper.configure({ commandId: COMMAND_ID, outputs: [{ stream: 'stdout', bytes: bytes(60, 62, 60, 62) }], exitCode: 0 });
+    const backend = createCodespacesExecutionBackend({
+      stateDir: fixture.stateDir,
+      config: fixture.deps.config,
+      runner: fixture.runner as unknown as ProcessRunner,
+      root: fixture.fixture.root,
+      spawner: fixture.deps.spawner,
+    });
+    const handle = { kind: 'codespaces' as const, id: fixture.metadata.workspaceId, name: fixture.metadata.remote.name, environmentId: fixture.metadata.remote.environmentId };
+    const events: import('../src/types.js').CommandEvent[] = [];
+    const request = { commandId: COMMAND_ID, argv: ['sh', '-c', 'printf "<%s>" "$1"', 'x', ''] as [string, ...string[]], mode: 'pipe' as const };
+    for await (const event of backend.execute(handle, request)) events.push(event);
+    assert.deepEqual(events.at(-1), { type: 'exit', commandId: COMMAND_ID, code: 0 }, `backend execute must accept empty argv tokens (${JSON.stringify(events.map((event) => event.type))})`);
+    assert.ok(events.some((event) => event.type === 'started'), 'the backend execute path must reach the remote helper');
+    const record = fixture.helper.records.get(COMMAND_ID);
+    assert.ok(record, 'the remote helper must receive the framed argv');
+    assert.deepEqual(record.argv, [...request.argv], 'the empty argv token must be preserved without a shell interpretation');
+  } finally {
+    if (previous === undefined) delete process.env.AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES;
+    else process.env.AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES = previous;
+  }
+});
