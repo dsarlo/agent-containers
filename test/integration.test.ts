@@ -503,19 +503,27 @@ test('nodeProcessRunner reports bounded readonly cancellation when the POSIX gro
     await new Promise((resolveDelay) => setTimeout(resolveDelay, 100));
     controller.abort();
     await assert.rejects(running, /POSIX process-group reaping could not be confirmed/);
-    await new Promise((resolveDelay) => setTimeout(resolveDelay, 300));
-    assert.equal(await readFile(marker, 'utf8'), 'survived');
+    // The grandchild escapes into its own session and writes its marker on a
+    // detached timer; poll with a bounded deadline instead of racing a fixed
+    // sleep against a loaded runner.
+    let survived = '';
+    const deadline = Date.now() + 5_000;
+    while (Date.now() < deadline && survived === '') {
+      try { survived = await readFile(marker, 'utf8'); } catch { await new Promise((resolveDelay) => setTimeout(resolveDelay, 25)); }
+    }
+    assert.equal(survived, 'survived');
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
 });
 
-test('POSIX SIGTERM keeps the lifecycle lock until a cancelled child process has exited', { skip: process.platform === 'win32', timeout: 5_000 }, async () => {
+test('POSIX SIGTERM keeps the lifecycle lock until a cancelled child process has exited', { skip: process.platform === 'win32', timeout: 10_000 }, async () => {
   const stateDir = await mkdtemp(join(tmpdir(), 'agent-containers-signal-lock-'));
   const stateUrl = new URL('../src/state.js', import.meta.url).href;
   const workspacesUrl = new URL('../src/workspaces.js', import.meta.url).href;
   const reapedMarker = join(stateDir, 'child-reaped');
-  const childCommand = `const fs = require('node:fs'); process.on('SIGTERM', () => setTimeout(() => { fs.writeFileSync(${JSON.stringify(reapedMarker)}, 'reaped'); process.exit(0); }, 200)); setTimeout(() => process.exit(0), 900); setInterval(() => {}, 1000);`;
+  const readyMarker = join(stateDir, 'child-ready');
+  const childCommand = `const fs = require('node:fs'); process.on('SIGTERM', () => setTimeout(() => { fs.writeFileSync(${JSON.stringify(reapedMarker)}, 'reaped'); process.exit(0); }, 200)); fs.writeFileSync(${JSON.stringify(readyMarker)}, 'ready'); setTimeout(() => process.exit(0), 900); setInterval(() => {}, 1000);`;
   const childProgram = `
     import { withWorkspaceLock, setStateDurabilityAdapterForTesting } from ${JSON.stringify(stateUrl)};
     import { nodeProcessRunner } from ${JSON.stringify(workspacesUrl)};
@@ -539,7 +547,13 @@ test('POSIX SIGTERM keeps the lifecycle lock until a cancelled child process has
     lifecycle.once('error', rejectReady);
     lifecycle.once('exit', (code, signal) => rejectReady(new Error(`lifecycle process exited before locking (${code ?? signal})`)));
   });
-  await new Promise((resolveDelay) => setTimeout(resolveDelay, 75));
+  // Wait for the child to install its SIGTERM handler (bounded) rather than
+  // racing a fixed sleep against a loaded runner before signalling it.
+  const readyDeadline = Date.now() + 5_000;
+  while (Date.now() < readyDeadline) {
+    try { await access(readyMarker); break; } catch { await new Promise((resolveDelay) => setTimeout(resolveDelay, 25)); }
+  }
+  await access(readyMarker);
   const exited = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolveExit) => lifecycle.once('exit', (code, signal) => resolveExit({ code, signal })));
   lifecycle.kill('SIGTERM');
   try {
