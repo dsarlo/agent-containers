@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { transportFixture, COMMAND_ID, collect, helperBootstrapRunner, type TransportFixture } from './transport-fixtures.js';
-import { executeRemoteCommand, attachRemoteCommand, helperDeps } from '../src/codespaces-transport.js';
+import { executeRemoteCommand, attachRemoteCommand, cancelRemoteCommand, helperDeps } from '../src/codespaces-transport.js';
 import { bootstrapRemoteHelper } from '../src/codespaces-helper.js';
 import { loadCommandRequest, loadCommandOffsets, loadCommandStatus, loadCommandRecovery } from '../src/codespaces-command.js';
 import { loadMetadata } from '../src/state.js';
@@ -314,6 +314,61 @@ test('a pre-aborted signal cancels deterministically instead of hanging (N7)', a
   })();
   await withSettleGuard(consumption, 'pre-aborted execute did not settle');
   assert.equal(events.at(-1)?.type, 'cancel-unknown', 'a pre-aborted execute must yield a bounded cancel-unknown, never a hang');
+});
+
+test('cancel proof inspection failure records a durable unknown outcome instead of throwing (N12)', async () => {
+  const base = helperBootstrapRunner();
+  let sha256Checks = 0;
+  const runner = {
+    async run(command: string, args: string[], options?: { signal?: AbortSignal }) {
+      const remote = args.slice(args.indexOf('--') + 1).join(' ');
+      if (remote.startsWith('sha256sum ') && ++sha256Checks >= 3) return { code: 1, stdout: '', stderr: 'forced proof inspection failure' };
+      return base.run(command, args, options);
+    },
+  };
+  const fixture = await transportFixture({ runner, cancelGraceMs: 150, reconnectBudgetMs: 100 });
+  fixture.helper.configure({ commandId: COMMAND_ID, outputs: [], exitCode: null, stayRunning: true, cancelPolicy: 'verify' });
+  const signal = new AbortController();
+  const events: CommandEvent[] = [];
+  const consume = (async () => { for await (const event of executeRemoteCommand({ ...fixture.deps, signal: signal.signal }, pipeInput())) events.push(event); })();
+  await withSettleGuard((async () => {
+    while (!events.some((event) => event.type === 'started')) await new Promise((resolve) => setTimeout(resolve, 5));
+  })(), 'command did not start before proof failure test', 1000);
+  const outcome = await withSettleGuard(cancelRemoteCommand(fixture.deps, COMMAND_ID), 'proof failure cancel did not settle', 1000);
+  assert.equal(outcome.outcome, 'cancel-outcome-unknown');
+  assert.equal((await loadCommandStatus(fixture.stateDir, COMMAND_ID))?.state, 'cancel-outcome-unknown');
+  assert.ok(await loadCommandRecovery(fixture.stateDir, COMMAND_ID));
+  signal.abort();
+  await withSettleGuard(consume, 'execution did not settle after proof failure cleanup', 1000);
+});
+
+test('a pre-aborted first interrupt aborts bootstrap and records a durable unknown outcome (N7)', async () => {
+  let probeAborted = false;
+  const runner = {
+    async run(_command: string, _args: string[], options?: { signal?: AbortSignal }) {
+      return await new Promise<never>((_, reject) => {
+        const onAbort = () => {
+          probeAborted = true;
+          const error = new Error('bootstrap probe aborted');
+          error.name = 'AbortError';
+          reject(error);
+        };
+        options?.signal?.addEventListener('abort', onAbort, { once: true });
+        if (options?.signal?.aborted) onAbort();
+      });
+    },
+  };
+  const fixture = await transportFixture({ runner, cancelGraceMs: 150, reconnectBudgetMs: 100 });
+  const signal = new AbortController();
+  signal.abort();
+  const events: CommandEvent[] = [];
+  await withSettleGuard((async () => {
+    for await (const event of executeRemoteCommand({ ...fixture.deps, signal: signal.signal }, pipeInput())) events.push(event);
+  })(), 'pre-aborted bootstrap did not settle', 500);
+  assert.equal(probeAborted, true, 'the first interrupt must reach bootstrap probes');
+  assert.equal(events.at(-1)?.type, 'cancel-unknown');
+  assert.equal((await loadCommandStatus(fixture.stateDir, COMMAND_ID))?.state, 'cancel-outcome-unknown');
+  assert.ok(await loadCommandRecovery(fixture.stateDir, COMMAND_ID));
 });
 
 test('a second interrupt aborts an in-flight helper inspection probe before cancel proof settles (N13)', async () => {

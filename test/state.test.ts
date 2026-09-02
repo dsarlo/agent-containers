@@ -491,6 +491,38 @@ test('withWorkspaceLock serializes same-name lifecycle operations across contend
   assert.deepEqual(events, ['first-start', 'first-end', 'second']);
 });
 
+test('withWorkspaceLock retries a transient Windows EPERM while publishing an owned recovery lock', async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), 'agent-containers-windows-recovery-transient-'));
+  let injectedSource: string | undefined;
+  let injectedSourceAttempts = 0;
+  setStateDurableRenameForTesting(async (source, destination) => {
+    if (destination.endsWith('safe.recovery') && source.includes('.safe.recovery.')) {
+      if (!injectedSource) {
+        injectedSource = source;
+        injectedSourceAttempts += 1;
+        throw Object.assign(new Error('Windows transient directory handle'), { code: 'EPERM' });
+      }
+      if (source === injectedSource) injectedSourceAttempts += 1;
+    }
+    await rename(source, destination);
+  });
+  try {
+    let firstCanFinish!: () => void;
+    const firstMayFinish = new Promise<void>((resolve) => { firstCanFinish = resolve; });
+    let firstStarted!: () => void;
+    const firstHasStarted = new Promise<void>((resolve) => { firstStarted = resolve; });
+    const first = withWorkspaceLock(stateDir, 'safe', async () => { firstStarted(); await firstMayFinish; });
+    await firstHasStarted;
+    const second = withWorkspaceLock(stateDir, 'safe', async () => undefined);
+    await new Promise((resolve) => setTimeout(resolve, 35));
+    firstCanFinish();
+    await Promise.all([first, second]);
+    assert.equal(injectedSourceAttempts, 2, 'the still-owned staging directory must be retried once after a transient EPERM');
+  } finally {
+    setStateDurableRenameForTesting(undefined);
+  }
+});
+
 test('withWorkspaceLock retries a Windows-style EPERM only when a recovery lock was concurrently published', async () => {
   const stateDir = await mkdtemp(join(tmpdir(), 'agent-containers-windows-recovery-collision-'));
   let recoveryPublications = 0;

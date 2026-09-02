@@ -143,6 +143,7 @@ export class GhCodespacesProvider {
     const controller = new AbortController();
     const timer = options.timeoutMs ? setTimeout(() => controller.abort(), options.timeoutMs) : undefined;
     options.signal?.addEventListener('abort', () => controller.abort(), { once: true });
+    if (options.signal?.aborted) controller.abort();
     try {
       const result = await this.process.run('gh', ['codespace', 'ssh', '-c', name, '--', ...command], { ...runOptions, signal: controller.signal });
       if (result.code !== 0) throw providerError('ssh', name, result);

@@ -322,12 +322,12 @@ export async function* executeRemoteCommand(deps: RemoteTransportDependencies, i
    * interrupt that raced the generator start must still cancel deterministically. */
   if (deps.signal?.aborted) cancelRequested = true;
 
-  let offsets: CodespacesCommandOffsets;
+  let offsets: CodespacesCommandOffsets = { schemaVersion: 1, commandId, stdout: '0', stderr: '0', terminal: '0', updatedAt: now() };
   try {
     // bootstrapRemoteHelper verifies both fresh and known helpers. Keep every
     // following await within this try/finally so the first-interrupt listener
     // never survives a bootstrap, inspection, or durable-offset failure.
-    const helper = await bootstrapRemoteHelper(helperDeps(deps));
+    const helper = await bootstrapRemoteHelper(helperDeps(deps, deps.signal));
     offsets = (await loadCommandOffsets(deps.stateDir, commandId)) ?? await zeroOffsets(deps, commandId, now);
     const transportBudget = deps.reconnectBudgetMs ?? deps.config.backends.codespaces.transport.reconnectWindowSeconds * 1000;
     const deadline = Date.now() + transportBudget;
@@ -415,6 +415,11 @@ export async function* executeRemoteCommand(deps: RemoteTransportDependencies, i
       }
       if (cancelRequested) continue;
     }
+  } catch (error: unknown) {
+    if (!cancelRequested) throw error;
+    await recordUnknownOutcome(deps, commandId, requestHash, offsets, now, savedStatus, 'cancel-outcome-unknown');
+    yield { type: 'cancel-unknown', commandId };
+    return;
   } finally {
     deps.signal?.removeEventListener('abort', onAbort);
   }
@@ -694,8 +699,8 @@ async function requestRemoteCancelProof(deps: RemoteTransportDependencies, comma
     if (detached) return 'unknown';
     const verified = await waitForCancelVerified(deps, session, commandId, deadline);
     if (verified && !detached) return 'verified';
-  } catch (error: unknown) {
-    if (error instanceof Error && error.name !== 'AbortError') throw error;
+  } catch {
+    return 'unknown';
   } finally {
     session?.close();
     deps.detachSignal?.removeEventListener('abort', onDetach);
@@ -750,7 +755,7 @@ async function saveStatus(deps: RemoteTransportDependencies, status: CodespacesC
   return status;
 }
 
-export function helperDeps(deps: RemoteTransportDependencies): Parameters<typeof bootstrapRemoteHelper>[0] {
+export function helperDeps(deps: RemoteTransportDependencies, signal: AbortSignal | undefined = deps.detachSignal): Parameters<typeof bootstrapRemoteHelper>[0] {
   return {
     stateDir: deps.stateDir,
     workspaceName: deps.metadata.name,
@@ -759,7 +764,7 @@ export function helperDeps(deps: RemoteTransportDependencies): Parameters<typeof
     provider: deps.provider,
     root: deps.root,
     sshTimeoutMs: deps.sshTimeoutMs,
-    signal: deps.detachSignal,
+    signal,
     now: deps.now,
     verifyKnown: true,
   };

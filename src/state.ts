@@ -979,8 +979,27 @@ async function syncDirectory(directory: string, durability: StateDurabilityAdapt
 }
 
 async function durableRename(source: string, destination: string, directory: string, durability: StateDurabilityAdapter, afterRename?: () => void | Promise<void>): Promise<void> {
-  if (await durability.publicationMode() === 'recoverable') await durability.moveFileWriteThrough(source, destination);
-  else await (testDurableRename ?? rename)(source, destination);
+  if (await durability.publicationMode() === 'recoverable') {
+    await durability.moveFileWriteThrough(source, destination);
+  } else {
+    let error: unknown;
+    for (let attempt = 1; attempt <= 4; attempt += 1) {
+      try {
+        await (testDurableRename ?? rename)(source, destination);
+        error = undefined;
+        break;
+      } catch (caught: unknown) {
+        const transient = isNodeError(caught, 'EPERM') || isNodeError(caught, 'EBUSY') || isNodeError(caught, 'EACCES');
+        // A staging source still present and an absent destination distinguish
+        // a transient handle/share race from an ownership collision. Preserve
+        // every other failure for the caller's fail-closed lock logic.
+        if (!transient || attempt === 4 || !await pathExists(source) || await pathExists(destination)) throw caught;
+        error = caught;
+        await delay();
+      }
+    }
+    if (error) throw error;
+  }
   await afterRename?.();
   await syncDirectory(directory, durability);
 }
