@@ -362,6 +362,9 @@ export async function* executeRemoteCommand(deps: RemoteTransportDependencies, i
         }
         const openedSession = opened.session as HelperSession;
         session = openedSession;
+        // An abort can race openExecSession before `session` was assigned. Do
+        // not stream a late-opened session; return to the loop-top proof gate.
+        if (cancelRequested) { session.close(); session = undefined; continue; }
         yield { type: 'started', commandId };
         if (input.stdin === 'stream' && input.stdinSource) {
           for await (const chunk of input.stdinSource) {
@@ -674,22 +677,29 @@ async function requestRemoteCancelProof(deps: RemoteTransportDependencies, comma
   const grace = deps.cancelGraceMs ?? deps.config.backends.codespaces.transport.cancelGraceSeconds * 1000;
   const budget = deps.reconnectBudgetMs ?? deps.config.backends.codespaces.transport.reconnectWindowSeconds * 1000;
   const deadline = Date.now() + budget + grace;
+  let session: HelperSession | undefined;
+  let detached = deps.detachSignal?.aborted ?? false;
+  const onDetach = () => { detached = true; session?.close(); };
+  deps.detachSignal?.addEventListener('abort', onDetach, { once: true });
   try {
+    if (detached) return 'unknown';
     const helper = await bootstrapRemoteHelper(helperDeps(deps));
+    if (detached) return 'unknown';
     await inspectRemoteHelper(helperDeps(deps), helper.arch, helper.file);
-    const session = await openSession(deps, helper.binPath);
-    try {
-      await helloHandshake(deps, session, helper.arch);
-      await session.send(HelperFrameType.cancel, { command_id: commandId, request_hash: requestHash, workspace_id: deps.metadata.workspaceId, grace_ms: deps.cancelGraceMs ?? deps.config.backends.codespaces.transport.cancelGraceSeconds * 1000 });
-      const verified = await waitForCancelVerified(deps, session, commandId, deadline);
-      if (verified) return 'verified';
-    } finally {
-      session.close();
-    }
+    if (detached) return 'unknown';
+    session = await openSession(deps, helper.binPath);
+    if (detached) return 'unknown';
+    await helloHandshake(deps, session, helper.arch);
+    if (detached) return 'unknown';
+    await session.send(HelperFrameType.cancel, { command_id: commandId, request_hash: requestHash, workspace_id: deps.metadata.workspaceId, grace_ms: deps.cancelGraceMs ?? deps.config.backends.codespaces.transport.cancelGraceSeconds * 1000 });
+    if (detached) return 'unknown';
+    const verified = await waitForCancelVerified(deps, session, commandId, deadline);
+    if (verified && !detached) return 'verified';
   } catch (error: unknown) {
-    if (error instanceof Error && error.name !== 'AbortError') {
-      throw error;
-    }
+    if (error instanceof Error && error.name !== 'AbortError') throw error;
+  } finally {
+    session?.close();
+    deps.detachSignal?.removeEventListener('abort', onDetach);
   }
   void now;
   return 'unknown';
