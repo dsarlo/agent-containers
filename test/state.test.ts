@@ -468,6 +468,23 @@ test('withWorkspaceLock does not retry an EPERM without a published recovery-loc
   }
 });
 
+test('withWorkspaceLock retries a Windows-style EPERM while retiring its validated recovery lock', async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), 'agent-containers-windows-recovery-retirement-'));
+  let retirementAttempts = 0;
+  setStateDurableRenameForTesting(async (source, destination) => {
+    if (source.endsWith('safe.recovery') && destination.endsWith('.retired') && retirementAttempts++ === 0) {
+      throw Object.assign(new Error('Windows recovery retirement contention'), { code: 'EPERM' });
+    }
+    await rename(source, destination);
+  });
+  try {
+    await withWorkspaceLock(stateDir, 'safe', async () => undefined);
+    assert.equal(retirementAttempts, 2);
+  } finally {
+    setStateDurableRenameForTesting(undefined);
+  }
+});
+
 test('lock publication durably syncs the owner, staging directory, and locks directory in order', async () => {
   const stateDir = await mkdtemp(join(tmpdir(), 'agent-containers-lock-durability-'));
   const steps: string[] = [];

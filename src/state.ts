@@ -826,9 +826,19 @@ async function durableRename(source: string, destination: string, directory: str
 }
 
 async function moveOwnedLock(source: string, destination: string, owner: LockOwner, directory: string, durability: StateDurabilityAdapter): Promise<void> {
-  const current = await readLockOwner(source);
-  if (!sameLockOwner(current, owner)) throw new Error(`Lifecycle lock owner changed before transition; refusing to move ${source}.`);
-  await durableRename(source, destination, directory, durability);
+  for (let attempts = 0; ; attempts += 1) {
+    const current = await readLockOwner(source);
+    if (!sameLockOwner(current, owner)) throw new Error(`Lifecycle lock owner changed before transition; refusing to move ${source}.`);
+    try {
+      await durableRename(source, destination, directory, durability);
+      break;
+    } catch (error: unknown) {
+      // Windows can transiently retain a directory handle while a contender
+      // observes this recovery lock. Retry only our still-owned, unique move.
+      if (!isNodeError(error, 'EPERM') || attempts === 2 || await pathExists(destination) || !sameLockOwner(await readLockOwner(source), owner)) throw error;
+      await delay();
+    }
+  }
   const moved = await readLockOwner(destination);
   if (sameLockOwner(moved, owner)) return;
   // The recovery lock prevents a compliant contender from claiming source while
