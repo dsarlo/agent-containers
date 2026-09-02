@@ -5,7 +5,8 @@ import { fileURLToPath } from 'node:url';
 import process from 'node:process';
 
 const repository = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const output = execFileSync('npm', ['pack', '--dry-run', '--json', '--ignore-scripts'], {
+const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm';
+const output = execFileSync(npm, ['pack', '--dry-run', '--json', '--ignore-scripts'], {
   cwd: repository,
   encoding: 'utf8',
   stdio: ['ignore', 'pipe', 'pipe'],

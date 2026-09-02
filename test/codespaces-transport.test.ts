@@ -239,7 +239,10 @@ test('cancel success is reported only after the remote helper proves the process
   const consumption = (async () => {
     for await (const event of generator) events.push(event);
   })();
-  setTimeout(() => signal.abort(), 30);
+  await withSettleGuard((async () => {
+    while (!events.some((event) => event.type === 'started')) await new Promise((resolve) => setTimeout(resolve, 5));
+  })(), 'N11 command did not reach started before cancellation', 1000);
+  signal.abort();
   await withSettleGuard(consumption, 'cancel-unknown generation did not settle');
   const terminal = events.at(-1);
   assert.equal(terminal?.type, 'cancelled', `expected verified cancel, got ${JSON.stringify(events.map((event) => event.type))}`);
