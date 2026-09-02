@@ -68,6 +68,13 @@ export async function initConfig(directory: string, force = false): Promise<void
 /** Save a fully validated v2 candidate without silently replacing an existing configuration. */
 export async function initConfigV2(directory: string, config: CodespacesAgentContainersConfig): Promise<void> {
   const path = join(directory, '.agent-containers.yml');
+  try {
+    const entry = await lstat(path);
+    if (entry.isSymbolicLink()) throw new Error(`${path} is a symlink; refusing to overwrite it.`);
+    throw new Error(`${path} already exists; use ac configure to review and update it.`);
+  } catch (error: unknown) {
+    if (!isNodeError(error, 'ENOENT')) throw error;
+  }
   try { await saveConfigAtomic(path, config, null); }
   catch (error: unknown) {
     if (error instanceof Error && /changed concurrently/.test(error.message)) throw new Error('Configuration changed concurrently; it was created while onboarding was in progress.', { cause: error });

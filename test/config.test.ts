@@ -3,7 +3,7 @@ import { lstat, link, mkdtemp, readFile, symlink, writeFile } from 'node:fs/prom
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
-import { CONFIG_OUTLINE, assertDevcontainerPathCommittedOnBaseBranch, initConfig, loadConfig } from '../src/config.js';
+import { CONFIG_OUTLINE, assertDevcontainerPathCommittedOnBaseBranch, initConfig, initConfigV2, loadConfig } from '../src/config.js';
 import type { AgentContainersConfig, ProcessRunner } from '../src/types.js';
 
 test('base-branch Dev Container validation uses a safe Git path through the injected runner', async () => {
@@ -156,6 +156,15 @@ test('initConfig never overwrites a symlink, including with --force', async (t) 
   }
   await assert.rejects(() => initConfig(directory, true), /symlink/);
   assert.equal(await readFile(external, 'utf8'), 'external contents\n');
+  assert.equal((await lstat(path)).isSymbolicLink(), true);
+});
+
+test('initConfigV2 never replaces a dangling configuration symlink', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'agent-containers-config-v2-symlink-'));
+  const path = join(directory, '.agent-containers.yml');
+  await symlink(join(directory, 'missing.yml'), path);
+  const config = { version: 2 as const, workspace: { worktreeRoot: 'worktrees', baseBranch: 'main' }, project: {}, environment: { devcontainerPath: '.devcontainer/devcontainer.json' }, backends: { enabled: ['local' as const], default: 'local' as const, local: {}, codespaces: { enabled: false, machine: null, geo: 'auto', idleTimeoutMinutes: 30, retentionPeriodMinutes: 10080, maxTotal: 4, maxRunning: 2, maxCreating: 1, maxParallelCommandsPerWorkspace: 1, readiness: { providerTimeoutSeconds: 1200, sshTimeoutSeconds: 120, command: [], commandTimeoutSeconds: 600 }, transport: { reconnectWindowSeconds: 60, cancelGraceSeconds: 10, remoteLogBytesPerStream: 67108864, remoteLogRetentionHours: 168 }, ports: { allowVisibilityChanges: false, allowPublic: false }, secrets: { allowedRemoteSecretNames: [], allowCodespaceGitCredential: false } } } };
+  await assert.rejects(() => initConfigV2(directory, config), /symlink/);
   assert.equal((await lstat(path)).isSymbolicLink(), true);
 });
 
