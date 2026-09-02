@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { access, mkdtemp, rename } from 'node:fs/promises';
+import { access, lstat, mkdir, mkdtemp, rename } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, parse } from 'node:path';
 import test from 'node:test';
@@ -75,9 +75,13 @@ test('a native Windows contention result retains its machine-readable code and s
     capabilities: () => ({ regularFileSync: true, directorySync: false, writeThroughMove: true }),
     moveFileWriteThrough: async (source, destination) => {
       try {
-        await rename(source, destination);
-        return { ok: true, source, destination, method: 'move-file-write-through' };
+        await lstat(destination);
+        throw Object.assign(new Error('Windows directory collision'), { code: 'EEXIST' });
       } catch (error: unknown) {
+        if (typeof error === 'object' && error !== null && 'code' in error && error.code === 'ENOENT') {
+          await rename(source, destination);
+          return { ok: true, source, destination, method: 'move-file-write-through' };
+        }
         if (typeof error === 'object' && error !== null && 'code' in error && (error.code === 'EEXIST' || error.code === 'ENOTEMPTY')) {
           return { ok: false, source, destination, method: 'move-file-write-through', code: error.code, error: error instanceof Error ? error.message : String(error) };
         }
@@ -103,6 +107,110 @@ test('a native Windows contention result retains its machine-readable code and s
   releaseFirst();
   await Promise.all([first, second]);
   assert.deepEqual(events, ['first-start', 'first-end', 'second']);
+});
+
+test('a native recovery-lock collision retries only after its valid owner retires', async () => {
+  const stateDir = join(await mkdtemp(join(tmpdir(), 'agent-containers-windows-recovery-retirement-race-')), 'state');
+  let recoveryPublications = 0;
+  let collisionObserved!: () => void;
+  const collisionWasObserved = new Promise<void>((resolveCollision) => { collisionObserved = resolveCollision; });
+  let ownerRetired!: () => void;
+  const ownerWasRetired = new Promise<void>((resolveRetirement) => { ownerRetired = resolveRetirement; });
+  const adapter = createNativeDurabilityAdapter(binding({
+    capabilities: () => ({ regularFileSync: true, directorySync: false, writeThroughMove: true }),
+    moveFileWriteThrough: async (source, destination) => {
+      try {
+        await lstat(destination);
+      } catch (error: unknown) {
+        if (typeof error === 'object' && error !== null && 'code' in error && error.code === 'ENOENT') {
+          await rename(source, destination);
+          if (destination.endsWith('safe.recovery')) recoveryPublications += 1;
+          return { ok: true, source, destination, method: 'move-file-write-through' };
+        }
+        throw error;
+      }
+      if (destination.endsWith('safe.recovery') && recoveryPublications === 1) {
+        collisionObserved();
+        await ownerWasRetired;
+      }
+      return { ok: false, source, destination, method: 'move-file-write-through', code: 'EEXIST', error: 'Windows directory collision' };
+    },
+  }));
+  const events: string[] = [];
+  let releaseFirst!: () => void;
+  const firstMayFinish = new Promise<void>((resolveFirst) => { releaseFirst = resolveFirst; });
+  let firstStarted!: () => void;
+  const firstHasStarted = new Promise<void>((resolveFirstStarted) => { firstStarted = resolveFirstStarted; });
+  const first = withWorkspaceLock(stateDir, 'safe', async () => {
+    events.push('first-start');
+    firstStarted();
+    await firstMayFinish;
+    events.push('first-end');
+  }, { durabilityAdapter: adapter });
+  await firstHasStarted;
+  const second = withWorkspaceLock(stateDir, 'safe', async () => { events.push('second'); }, { durabilityAdapter: adapter });
+
+  await collisionWasObserved;
+  releaseFirst();
+  await first;
+  ownerRetired();
+  await second;
+
+  assert.deepEqual(events, ['first-start', 'first-end', 'second']);
+});
+
+test('a raw rename EPERM after an absent destination remains surfaced', async () => {
+  const destination = join(await mkdtemp(join(tmpdir(), 'agent-containers-windows-raw-rename-error-')), 'destination');
+  const rawRenameError = Object.assign(new Error('simulated raw rename permission denied'), { code: 'EPERM' });
+  const adapter = createNativeDurabilityAdapter(binding({
+    capabilities: () => ({ regularFileSync: true, directorySync: false, writeThroughMove: true }),
+    moveFileWriteThrough: async (source, observedDestination) => {
+      try {
+        await lstat(observedDestination);
+      } catch (error: unknown) {
+        if (typeof error === 'object' && error !== null && 'code' in error && error.code === 'ENOENT') throw rawRenameError;
+        throw error;
+      }
+      return { ok: false, source, destination: observedDestination, method: 'move-file-write-through', code: 'EEXIST', error: 'Windows directory collision' };
+    },
+  }));
+
+  await assert.rejects(
+    () => adapter.moveFileWriteThrough('source', destination),
+    (error: unknown) => error === rawRenameError,
+  );
+});
+
+test('a native collision with a malformed published recovery lock fails closed without replacing it', async () => {
+  const stateDir = join(await mkdtemp(join(tmpdir(), 'agent-containers-windows-recovery-malformed-')), 'state');
+  const recoveryPath = join(stateDir, 'locks', 'safe.recovery');
+  await mkdir(recoveryPath, { recursive: true });
+  const adapter = createNativeDurabilityAdapter(binding({
+    capabilities: () => ({ regularFileSync: true, directorySync: false, writeThroughMove: true }),
+    moveFileWriteThrough: async (source, destination) => {
+      try {
+        await lstat(destination);
+        throw Object.assign(new Error('Windows directory collision'), { code: 'EEXIST' });
+      } catch (error: unknown) {
+        if (typeof error === 'object' && error !== null && 'code' in error && error.code === 'ENOENT') {
+          await rename(source, destination);
+          return { ok: true, source, destination, method: 'move-file-write-through' };
+        }
+        if (typeof error === 'object' && error !== null && 'code' in error && (error.code === 'EEXIST' || error.code === 'ENOTEMPTY')) {
+          return { ok: false, source, destination, method: 'move-file-write-through', code: error.code, error: error instanceof Error ? error.message : String(error) };
+        }
+        throw error;
+      }
+    },
+  }));
+  let ran = false;
+
+  await assert.rejects(
+    () => withWorkspaceLock(stateDir, 'safe', async () => { ran = true; }, { timeoutMs: 0, durabilityAdapter: adapter }),
+    /malformed owner metadata/i,
+  );
+  assert.equal(ran, false, 'a malformed recovery lock cannot be adopted as lifecycle ownership');
+  assert.equal((await lstat(recoveryPath)).isDirectory(), true, 'the malformed recovery lock remains for verified manual repair');
 });
 
 test('state lifecycle fails closed before creating state or invoking its action when required durability is unavailable', async () => {
