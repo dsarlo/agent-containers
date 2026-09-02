@@ -4,7 +4,7 @@ import { createInterface } from 'node:readline/promises';
 import { assertDevcontainerPathCommittedOnBaseBranch, configurationDiff, hashConfig, initConfigV2, loadConfig, parseCodespacesDraft, parseConfig, saveConfigAtomic } from './config.js';
 import { doctor, validateCodespacesSetup } from './setup.js';
 import type { CodespacesAgentContainersConfig } from './types.js';
-import { acknowledgeUnconfirmedProcessReap, clearManualRecoveryIfCurrent, defaultStateDir, deleteMetadata, listMetadata, loadManualRecovery, loadMetadata, recordManualRecovery, releaseStaleWorkspaceLock, saveMetadata, withWorkspaceLock } from './state.js';
+import { acknowledgeUnconfirmedProcessReap, clearManualRecoveryIfCurrent, defaultStateDir, deleteMetadata, isLocalWorkspaceMetadata, listMetadata, loadManualRecovery, loadMetadata, recordManualRecovery, releaseStaleWorkspaceLock, saveMetadata, withWorkspaceLock } from './state.js';
 import { execNamedWorkspaceLifecycle } from './runtime.js';
 import { createWorkspace, findGitRoot, nodeProcessRunner, removeWorkspace } from './workspaces.js';
 import { assertBackendAvailable, resolveExecutionBackend } from './backend.js';
@@ -200,10 +200,11 @@ export async function runCli(args: string[], cwd = process.cwd(), write: (messag
         // Inspect durable identity before acquiring local lifecycle state or issuing Git/Docker commands.
         const recorded = await loadMetadata(stateDir, name);
         if (!recorded) throw new Error(`No Agent Containers workspace named "${name}".`);
-        if (!('repoRoot' in recorded)) throw new Error(`Workspace "${name}" records the Codespaces backend, which is phase-gated and cannot be removed by local cleanup.`);
+        if (!isLocalWorkspaceMetadata(recorded)) throw new Error(`Workspace "${name}" records the Codespaces backend, which is phase-gated and cannot be removed by local cleanup.`);
         await withWorkspaceLock(stateDir, name, async (signal) => {
           const metadata = await loadMetadata(stateDir, name);
           if (!metadata) throw new Error(`No Agent Containers workspace named "${name}".`);
+          if (!isLocalWorkspaceMetadata(metadata)) throw new Error(`Workspace "${name}" records the Codespaces backend, which is phase-gated and cannot be removed by local cleanup.`);
           recoveryWorktree = metadata.worktree;
           recoveryContainerIds = metadata.containerId ? [metadata.containerId] : [];
           const backend = resolveExecutionBackend('local', { remove: async () => {

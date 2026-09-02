@@ -352,7 +352,7 @@ export async function loadMetadata(stateDir: string, name: string): Promise<Work
 
 export async function saveMetadata(stateDir: string, metadata: WorkspaceMetadata): Promise<void> {
   if (!isAgentContainersWorkspace(metadata)) throw new Error('Refusing to save invalid Agent Containers workspace metadata.');
-  if (metadata.containerId !== undefined && !isCanonicalContainerId(metadata.containerId)) throw new Error('Refusing to save a non-canonical Docker container ID.');
+  if (isLocalWorkspaceMetadata(metadata) && metadata.containerId !== undefined && !isCanonicalContainerId(metadata.containerId)) throw new Error('Refusing to save a non-canonical Docker container ID.');
   const path = metadataPath(stateDir, metadata.name);
   const directory = join(stateDir, 'workspaces');
   const durability = stateDurability();

@@ -6,7 +6,7 @@ import { createHash } from 'node:crypto';
 import test from 'node:test';
 import { createNativeDurabilityAdapter } from '../src/durability.js';
 import * as state from '../src/state.js';
-import { acknowledgeUnconfirmedProcessReap, bootstrapManualRecoveryJournal, listMetadata, loadManualRecovery, loadMetadata, recordManualRecovery, releaseStaleWorkspaceLock, saveMetadata, setStateDurabilityAdapterForTesting, setStateDurableRenameForTesting, setStateJournalStagingWriteForTesting, withWorkspaceLock, type WorkspaceLockOptions, type WorkspaceMetadata } from '../src/state.js';
+import { acknowledgeUnconfirmedProcessReap, bootstrapManualRecoveryJournal, listMetadata, loadManualRecovery, loadMetadata, recordManualRecovery, releaseStaleWorkspaceLock, saveMetadata, setStateDurabilityAdapterForTesting, setStateDurableRenameForTesting, setStateJournalStagingWriteForTesting, withWorkspaceLock, type ManualRecovery, type WorkspaceLockOptions, type WorkspaceMetadata } from '../src/state.js';
 import type { ProcessRunner } from '../src/types.js';
 import type { StateDurabilityAdapter } from '../src/durability.js';
 
@@ -138,7 +138,7 @@ test('legacy recovery remains a barrier when every staged journal migration boun
   for (const boundary of ['staging write', 'staging sync', 'publication', 'journal parent sync'] as const) {
     const stateDir = await mkdtemp(join(tmpdir(), `agent-containers-legacy-migration-${boundary.replace(' ', '-')}-`));
     await mkdir(join(stateDir, 'locks'), { recursive: true });
-    const legacy = { version: 1, reason: 'operation-may-be-active', containerIds: [], worktree: metadata.worktree, createdAt: '2026-01-01T00:00:00.000Z' };
+    const legacy: Omit<ManualRecovery, 'generation'> = { version: 1, reason: 'operation-may-be-active', containerIds: [], worktree: metadata.worktree, createdAt: '2026-01-01T00:00:00.000Z' };
     await writeFile(join(stateDir, 'locks', 'safe.manual-recovery.json'), JSON.stringify(legacy));
     let fail = true;
     const adapter: StateDurabilityAdapter = {

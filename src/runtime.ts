@@ -176,7 +176,7 @@ async function recordAmbiguousUp(recordRecovery: RecoveryRecorder, metadata: Loc
 
 function isDockerContainerId(value: string): boolean { return isCanonicalContainerId(value); }
 
-async function inspectOwnedContainer(metadata: WorkspaceMetadata, containerId: string, runner: ProcessRunner, signal?: AbortSignal): Promise<boolean> {
+async function inspectOwnedContainer(metadata: LocalMetadata, containerId: string, runner: ProcessRunner, signal?: AbortSignal): Promise<boolean> {
   const inspection = await runner.run('docker', ['inspect', '--format', '{{.Id}}\n{{ index .Config.Labels "devcontainer.local_folder" }}', containerId], withSignal({ kind: 'readonly-probe' }, signal));
   return inspection.code === 0 && isOwnedContainerInspection(inspection.stdout, containerId, metadata.worktree);
 }
@@ -186,12 +186,12 @@ function isOwnedContainerInspection(output: string, containerId: string, worktre
   return extra.length === 0 && id === containerId && label === worktree;
 }
 
-async function unconfirmedReapRecovery(metadata: WorkspaceMetadata, recordRecovery: RecoveryRecorder, detail: string, containerIds: string[] = []): Promise<never> {
+async function unconfirmedReapRecovery(metadata: LocalMetadata, recordRecovery: RecoveryRecorder, detail: string, containerIds: string[] = []): Promise<never> {
   await recordRecovery({ reason: 'local-process-reap-unconfirmed', containerIds: recoveryHints(metadata, containerIds), worktree: metadata.worktree });
   throw new Error(`Local Dev Containers process reaping could not be confirmed: ${detail} Agent Containers recorded a manual-recovery block; verify the local process tree and remote container state, then explicitly acknowledge recovery before running another lifecycle operation.`);
 }
 
-function recoveryHints(metadata: WorkspaceMetadata, observed: string[]): string[] {
+function recoveryHints(metadata: LocalMetadata, observed: string[]): string[] {
   return [...new Set([metadata.containerId, ...observed].filter(isCanonicalContainerId))];
 }
 

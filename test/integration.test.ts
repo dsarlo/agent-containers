@@ -7,7 +7,7 @@ import { EventEmitter } from 'node:events';
 import test from 'node:test';
 import { createNodeProcessRunner, createWorkspace, nodeProcessRunner, PROCESS_OUTPUT_LIMIT, UnconfirmedProcessReapError } from '../src/workspaces.js';
 import { execWorkspaceLifecycle } from '../src/runtime.js';
-import type { LocalMetadata } from '../src/state.js';
+import { isLocalWorkspaceMetadata, type LocalMetadata } from '../src/state.js';
 import { isLiveIntegrationEnabled, probeLiveIntegrationPrerequisites } from '../src/live-integration.js';
 import { loadMetadata, saveMetadata } from '../src/state.js';
 
@@ -576,7 +576,8 @@ test('production execWorkspace lifecycle exposes the Git common directory inside
     const runCommonDirectoryCheck = () => execWorkspaceLifecycle(metadata, ['sh', '-lc', 'git rev-parse --git-common-dir > .agent-containers-git-common-dir'], nodeProcessRunner, async (next: LocalMetadata) => { containerId = next.containerId; }, stateDir);
     await assert.rejects(runCommonDirectoryCheck, /Initialized the durable manual-recovery journal for workspace "integration"\. No Dev Containers command was dispatched; retry this invocation before remote work can begin\./);
     await runCommonDirectoryCheck();
-    containerId = (await loadMetadata(stateDir, metadata.name))?.containerId;
+    const saved = await loadMetadata(stateDir, metadata.name);
+    if (saved && isLocalWorkspaceMetadata(saved)) containerId = saved.containerId;
     assert.match(await readFile(join(worktree, '.agent-containers-git-common-dir'), 'utf8'), /worktrees|\.git/);
   } finally {
     if (containerId) spawnSync('docker', ['rm', '-f', containerId]);

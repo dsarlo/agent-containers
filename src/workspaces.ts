@@ -338,8 +338,8 @@ export interface RemoveWorkspaceOptions {
 export async function removeWorkspace(metadata: WorkspaceMetadata, options: RemoveWorkspaceOptions, runner: ProcessRunner, save: (metadata: WorkspaceMetadata) => Promise<void>, removeMetadata: () => Promise<void>): Promise<void> {
   if (!options.confirmed) throw new Error('Refusing to remove a workspace without --yes.');
   if (!isAgentContainersWorkspace(metadata)) throw new Error('Refusing to remove metadata that is not an Agent Containers workspace.');
-  if (metadata.containerId !== undefined && !isCanonicalContainerId(metadata.containerId)) throw new Error('Refusing to inspect or remove a legacy or non-canonical recorded Docker container ID. Verify it manually and repair the metadata first.');
   if (!isLocalWorkspaceMetadata(metadata)) throw new Error(`Workspace "${metadata.name}" records the Codespaces backend, which is phase-gated and cannot be removed by local cleanup.`);
+  if (metadata.containerId !== undefined && !isCanonicalContainerId(metadata.containerId)) throw new Error('Refusing to inspect or remove a legacy or non-canonical recorded Docker container ID. Verify it manually and repair the metadata first.');
   let current: LocalMetadata = metadata;
 
   let worktreePresent = false;

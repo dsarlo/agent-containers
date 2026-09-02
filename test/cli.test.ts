@@ -5,7 +5,7 @@ import { join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import test from 'node:test';
-import { loadManualRecovery, loadMetadata, recordManualRecovery, saveMetadata, setStateDurableRenameForTesting, withWorkspaceLock } from '../src/state.js';
+import { isLocalWorkspaceMetadata, loadManualRecovery, loadMetadata, recordManualRecovery, saveMetadata, setStateDurableRenameForTesting, withWorkspaceLock } from '../src/state.js';
 import { exitCodeForError, runCli } from '../src/cli.js';
 import { nodeProcessRunner, UnconfirmedProcessReapError } from '../src/workspaces.js';
 
@@ -171,7 +171,9 @@ test('recover refuses an unconfirmed-reap quarantine whose recorded owner remain
 
   assert.equal(await runCli(['recover', 'safe', '--yes', '--remote-command-stopped'], process.cwd(), () => undefined), 1);
   assert.ok(await loadManualRecovery(stateDir, 'safe'));
-  assert.equal((await loadMetadata(stateDir, 'safe'))?.containerId, '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef');
+  const saved = await loadMetadata(stateDir, 'safe');
+  assert.ok(saved && isLocalWorkspaceMetadata(saved));
+  assert.equal(saved.containerId, '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef');
   await assert.rejects(() => withWorkspaceLock(stateDir, 'safe', async () => undefined, { timeoutMs: 0 }), /quarantined|lock/i);
 });
 
