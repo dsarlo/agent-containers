@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import test from 'node:test';
+import test, { type TestContext } from 'node:test';
 import { createHash } from 'node:crypto';
 import { readFile, readdir, access } from 'node:fs/promises';
 import { readFileSync, readdirSync } from 'node:fs';
@@ -16,8 +16,8 @@ import type { CommandEvent } from '../src/types.js';
 
 const BIN = realHelperBinaryPath();
 
-function skipIfUnsupported(): void {
-  if (!BIN) throw new Error('the real helper binary harness is only supported on linux-x64/arm64');
+function skipIfUnsupported(t: TestContext): void {
+  if (!BIN) t.skip('the real helper binary harness is only supported on linux-x64/arm64');
 }
 
 function groupKill(dataDir: string, workspaceId: string, commandId: string): void {
@@ -63,8 +63,8 @@ async function collectTerminal(client: RealHelperProcess, timeoutMs = 15000): Pr
   throw new Error(`real helper session ended without a terminal outcome (saw ${seen.map((e) => e.kind).join(',')})`);
 }
 
-test('real helper binary: hello announces the compile-time architecture (N1)', async () => {
-  skipIfUnsupported();
+test('real helper binary: hello announces the compile-time architecture (N1)', async (t: TestContext) => {
+  skipIfUnsupported(t);
   const bin = BIN as string;
   const data = await helperDataRoot();
   const client = new RealHelperProcess(bin, data);
@@ -77,8 +77,8 @@ test('real helper binary: hello announces the compile-time architecture (N1)', a
   }
 });
 
-test('real helper binary: the handshake subcommand matches the package format (N1/N2)', async () => {
-  skipIfUnsupported();
+test('real helper binary: the handshake subcommand matches the package format (N1/N2)', async (t: TestContext) => {
+  skipIfUnsupported(t);
   const bin = BIN as string;
   const data = await helperDataRoot();
   const output = await runRealHandshake(bin);
@@ -88,8 +88,8 @@ test('real helper binary: the handshake subcommand matches the package format (N
   void data;
 });
 
-test('real helper binary: execute → disconnect → attach from a nonzero offset resumes retained bytes and exact exit status (B2/N5)', async () => {
-  skipIfUnsupported();
+test('real helper binary: execute → disconnect → attach from a nonzero offset resumes retained bytes and exact exit status (B2/N5)', async (t: TestContext) => {
+  skipIfUnsupported(t);
   const bin = BIN as string;
   const data = await helperDataRoot();
   const first = new RealHelperProcess(bin, data);
@@ -135,8 +135,8 @@ test('real helper binary: execute → disconnect → attach from a nonzero offse
   }
 });
 
-test('real helper binary: PTY mode produces one merged terminal stream with \\r\\n translation and honors resize (B5)', async () => {
-  skipIfUnsupported();
+test('real helper binary: PTY mode produces one merged terminal stream with \\r\\n translation and honors resize (B5)', async (t: TestContext) => {
+  skipIfUnsupported(t);
   const bin = BIN as string;
   const data = await helperDataRoot();
   const client = new RealHelperProcess(bin, data);
@@ -176,8 +176,8 @@ test('real helper binary: PTY mode produces one merged terminal stream with \\r\
   }
 });
 
-test('real helper binary: explicit stdin half-close lets cat complete without killing the child (B4)', async () => {
-  skipIfUnsupported();
+test('real helper binary: explicit stdin half-close lets cat complete without killing the child (B4)', async (t: TestContext) => {
+  skipIfUnsupported(t);
   const bin = BIN as string;
   const data = await helperDataRoot();
   const client = new RealHelperProcess(bin, data);
@@ -201,8 +201,8 @@ test('real helper binary: explicit stdin half-close lets cat complete without ki
   }
 });
 
-test('real helper binary: transport EOF leaves the child running and the durable record running; cancel verified only after the owning server reaps (B4/B3)', async () => {
-  skipIfUnsupported();
+test('real helper binary: transport EOF leaves the child running and the durable record running; cancel verified only after the owning server reaps (B4/B3)', async (t: TestContext) => {
+  skipIfUnsupported(t);
   const bin = BIN as string;
   const data = await helperDataRoot();
   const exec = new RealHelperProcess(bin, data);
@@ -242,8 +242,8 @@ test('real helper binary: transport EOF leaves the child running and the durable
   }
 });
 
-test('real helper binary: a signal-ignoring child yields cancel-unknown, never cancelled (B3)', async () => {
-  skipIfUnsupported();
+test('real helper binary: a signal-ignoring child yields cancel-unknown, never cancelled (B3)', async (t: TestContext) => {
+  skipIfUnsupported(t);
   const bin = BIN as string;
   const data = await helperDataRoot();
   const exec = new RealHelperProcess(bin, data);
@@ -275,8 +275,8 @@ test('real helper binary: a signal-ignoring child yields cancel-unknown, never c
   }
 });
 
-test('real helper binary: a stdout-emitting child that reads stdin slowly does not deadlock (B6)', async () => {
-  skipIfUnsupported();
+test('real helper binary: a stdout-emitting child that reads stdin slowly does not deadlock (B6)', async (t: TestContext) => {
+  skipIfUnsupported(t);
   const bin = BIN as string;
   const data = await helperDataRoot();
   const client = new RealHelperProcess(bin, data);
@@ -301,8 +301,8 @@ test('real helper binary: a stdout-emitting child that reads stdin slowly does n
   }
 });
 
-test('real helper binary: empty argv tokens flow end to end with no deadlock (N3)', async () => {
-  skipIfUnsupported();
+test('real helper binary: empty argv tokens flow end to end with no deadlock (N3)', async (t: TestContext) => {
+  skipIfUnsupported(t);
   const bin = BIN as string;
   const data = await helperDataRoot();
   const client = new RealHelperProcess(bin, data);
@@ -321,8 +321,8 @@ test('real helper binary: empty argv tokens flow end to end with no deadlock (N3
   }
 });
 
-test('real helper binary: execute through the full backend transport yields the exact corpus output and exit (N2)', async () => {
-  skipIfUnsupported();
+test('real helper binary: execute through the full backend transport yields the exact corpus output and exit (N2)', async (t: TestContext) => {
+  skipIfUnsupported(t);
   const bin = BIN as string;
   const data = await helperDataRoot();
   try {
