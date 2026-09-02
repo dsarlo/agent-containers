@@ -17,10 +17,10 @@ jobs:
       matrix:
         node: [20, 22, 24]
     steps:
-      # actions/checkout v4
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-      # actions/setup-node v4
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+      # actions/checkout v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+      # actions/setup-node v5
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444
         with:
           node-version: ${{ matrix.node }}
           cache: npm
@@ -35,10 +35,10 @@ jobs:
     name: Windows Node lifecycle
     runs-on: windows-latest
     steps:
-      # actions/checkout v4
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-      # actions/setup-node v4
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+      # actions/checkout v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+      # actions/setup-node v5
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444
         with:
           node-version: 20.19.0
           cache: npm
@@ -71,10 +71,10 @@ jobs:
             artifact: win32-arm64
             publication_mode: recoverable
     steps:
-      # actions/checkout v4
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-      # actions/setup-node v4
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+      # actions/checkout v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+      # actions/setup-node v5
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444
         with:
           node-version: 20.19.0
           cache: npm
@@ -83,8 +83,8 @@ jobs:
         env:
           EXPECTED_NATIVE_PUBLICATION_MODE: ${{ matrix.publication_mode }}
       - run: npm run native:prebuild
-      # actions/upload-artifact v4
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      # actions/upload-artifact v5
+      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4
         with:
           name: native-prebuild-${{ matrix.artifact }}
           path: prebuilds
@@ -95,16 +95,16 @@ jobs:
     needs: native-durability
     runs-on: ubuntu-latest
     steps:
-      # actions/checkout v4
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-      # actions/setup-node v4
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+      # actions/checkout v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+      # actions/setup-node v5
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444
         with:
           node-version: 20.19.0
           cache: npm
       - run: npm ci
-      # actions/download-artifact v4
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+      # actions/download-artifact v5
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0
         with:
           pattern: native-prebuild-*
           path: .
@@ -112,8 +112,8 @@ jobs:
       - run: npm run native:verify-prebuilds
       - run: mkdir native-package && npm pack --pack-destination native-package
       - run: node scripts/verify-native-package-tarball.mjs native-package/*.tgz
-      # actions/upload-artifact v4
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      # actions/upload-artifact v5
+      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4
         with:
           name: native-package
           path: native-package/*.tgz
@@ -146,15 +146,15 @@ jobs:
             artifact: win32-arm64
             publication_mode: recoverable
     steps:
-      # actions/checkout v4
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-      # actions/setup-node v4
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+      # actions/checkout v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+      # actions/setup-node v5
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444
         with:
           node-version: 20.19.0
           cache: npm
-      # actions/download-artifact v4
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+      # actions/download-artifact v5
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0
         with:
           name: native-package
           path: native-package
@@ -171,10 +171,10 @@ jobs:
     name: Live Dev Containers lifecycle
     runs-on: ubuntu-latest
     steps:
-      # actions/checkout v4
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-      # actions/setup-node v4
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+      # actions/checkout v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+      # actions/setup-node v5
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444
         with:
           node-version: 20.19.0
           cache: npm
