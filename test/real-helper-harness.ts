@@ -209,7 +209,7 @@ export function realBootstrapRunner(binPath: string, remoteDigest: string): Code
       if (!args.join(' ').startsWith('codespace ssh -c ')) throw new Error(`unrouted bootstrap argv: ${JSON.stringify(args)}`);
       const remote = args.slice(args.indexOf('--') + 1);
       const argv = remote.join(' ');
-      if (argv === 'uname -m') return { code: 0, stdout: 'x86_64\n', stderr: '' };
+      if (argv === 'uname -m') return { code: 0, stdout: `${realHelperBinaryPath()?.includes('arm64') ? 'aarch64' : 'x86_64'}\n`, stderr: '' };
       if (argv === 'id -u') return { code: 0, stdout: '1000\n', stderr: '' };
       if (argv.startsWith('mkdir -p')) return { code: 0, stdout: '', stderr: '' };
       if (argv.startsWith('chmod 0700 ')) return { code: 0, stdout: '', stderr: '' };

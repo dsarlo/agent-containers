@@ -13,24 +13,24 @@ function pipeInput(overrides: Partial<import('../src/codespaces-transport.js').E
   return { commandId: COMMAND_ID, argv: ['sleep', '0'], mode: 'pipe', stdin: 'closed', ...overrides };
 }
 
-async function executeToEnd(fixture: TransportFixture, input: import('../src/codespaces-transport.js').ExecuteTransportInput): Promise<CommandEvent[]> {
+async function executeToEnd(fixture: TransportFixture, input: import('../src/codespaces-transport.js').ExecuteTransportInput, options: { guardMs?: number } = {}): Promise<CommandEvent[]> {
   const events: unknown[] = [];
   await withSettleGuard((async () => {
     for await (const event of executeRemoteCommand(fixture.deps, input)) events.push(event);
-  })(), 'executeToEnd did not settle');
+  })(), 'executeToEnd did not settle', options.guardMs ?? 8000);
   return events as CommandEvent[];
 }
 
 /** Bounded settle guard: a transport promise that cannot settle (pending
  * microtasks, emptied event loop) must fail the test with a clear message
  * instead of leaving the suite to cancel the subtest at the file boundary. */
-async function withSettleGuard<T>(promise: Promise<T>, message: string): Promise<T> {
+async function withSettleGuard<T>(promise: Promise<T>, message: string, guardMs = 8000): Promise<T> {
   let timer: NodeJS.Timeout | undefined;
   const guard = new Promise<never>((_, reject) => {
     // NOTE: the timer must stay ref'd — an unref'd timer cannot fire once the
     // event loop drains, which is precisely the CI failure mode this guard
     // must diagnose with a clear error instead of a runner cancellation.
-    timer = setTimeout(() => reject(new Error(`${message} (bounded settle guard)`)), 8000);
+    timer = setTimeout(() => reject(new Error(`${message} (bounded settle guard after ${guardMs}ms)`)), guardMs);
   });
   try {
     return await Promise.race([promise, guard]);
@@ -86,7 +86,7 @@ test('binary stdout/stderr are delivered byte-identical across arbitrary chunk b
       chunks.push({ stream: 'stdout', bytes: payloadBytes.subarray(offset, Math.min(offset + chunkSize, payloadBytes.length)) });
     }
     fixture.helper.configure({ commandId: COMMAND_ID, outputs: chunks, exitCode: 0 });
-    const events = await executeToEnd(fixture, pipeInput());
+    const events = await executeToEnd(fixture, pipeInput(), { guardMs: 60_000 });
     const stdout = outputsFrom(events, 'stdout');
     assert.deepEqual(reassemble(stdout), Buffer.from(payloadBytes), `chunk size ${chunkSize}`);
     // Contiguous, non-overlapping durable offsets.

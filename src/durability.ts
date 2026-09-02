@@ -82,15 +82,56 @@ export function createNativeDurabilityAdapter(binding: NativeDurabilityBinding):
       await assertPathResult(binding, path, 'directory');
     },
     async moveFileWriteThrough(source: string, destination: string): Promise<void> {
-      const result = await binding.moveFileWriteThrough(source, destination);
-      if (!result.ok) {
-        const error = new Error(result.error ?? `Native write-through move failed for ${source} -> ${destination}.`);
-        const code = result.windowsError === 'ERROR_ACCESS_DENIED' ? 'EPERM' : result.code;
-        if (code) Object.assign(error, { code });
-        throw error;
+      /* Windows rename-over races (antivirus scans, share-delete contention) surface as
+       * transient EPERM/EBUSY; retry with backoff so durable publication is not lost to a
+       * scanner holding the destination open. Fail closed after the bounded attempts. */
+      let error: unknown;
+      for (let attempt = 1; attempt <= 4; attempt += 1) {
+        try {
+          await moveFileWriteThroughOnce(binding, source, destination);
+          return;
+        } catch (caught: unknown) {
+          const code = (caught as NodeJS.ErrnoException | undefined)?.code;
+          if (code !== 'EPERM' && code !== 'EBUSY' && code !== 'EACCES') throw caught;
+          error = caught;
+          await new Promise((resolve) => setTimeout(resolve, 25 * attempt));
+        }
       }
+      throw error;
     },
     async moveFileNoReplaceWriteThrough(source: string, destination: string): Promise<void> {
+      /* Windows rename-over races (antivirus scans, share-delete contention) surface as
+       * transient EPERM/EBUSY; retry with backoff so first publication is not lost to a
+       * scanner holding the destination open. Fail closed after the bounded attempts. */
+      let error: unknown;
+      for (let attempt = 1; attempt <= 4; attempt += 1) {
+        try {
+          await moveFileNoReplaceWriteThroughOnce(binding, source, destination);
+          return;
+        } catch (caught: unknown) {
+          const code = (caught as NodeJS.ErrnoException | undefined)?.code;
+          if (code !== 'EPERM' && code !== 'EBUSY' && code !== 'EACCES') throw caught;
+          error = caught;
+          await new Promise((resolve) => setTimeout(resolve, 25 * attempt));
+        }
+      }
+      throw error;
+    },
+  };
+}
+
+async function moveFileWriteThroughOnce(binding: NativeDurabilityBinding, source: string, destination: string): Promise<void> {
+  if (!('moveFileWriteThrough' in binding) || typeof binding.moveFileWriteThrough !== 'function') throw new Error('Native write-through publication is unavailable; refusing state publication.');
+  const result = await binding.moveFileWriteThrough(source, destination);
+  if (!result.ok) {
+    const error = new Error(result.error ?? `Native write-through move failed for ${source} -> ${destination}.`);
+    const code = result.windowsError === 'ERROR_ACCESS_DENIED' ? 'EPERM' : result.code;
+    if (code) Object.assign(error, { code });
+    throw error;
+  }
+}
+
+async function moveFileNoReplaceWriteThroughOnce(binding: NativeDurabilityBinding, source: string, destination: string): Promise<void> {
       if (!('moveFileNoReplaceWriteThrough' in binding) || typeof binding.moveFileNoReplaceWriteThrough !== 'function') throw new Error('Native write-through no-replace publication is unavailable; refusing first state publication.');
       const result = await binding.moveFileNoReplaceWriteThrough(source, destination);
       if (!result.ok) {
@@ -99,8 +140,6 @@ export function createNativeDurabilityAdapter(binding: NativeDurabilityBinding):
         if (code) Object.assign(error, { code });
         throw error;
       }
-    },
-  };
 }
 
 function publicationMode(capabilities: NativeDurabilityCapabilities): StatePublicationMode {
