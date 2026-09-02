@@ -14,6 +14,7 @@ import { loadMetadata, saveMetadata, type CodespacesWorkspaceMetadata } from '..
 import { runCli } from '../src/cli.js';
 import { nodeProcessRunner } from '../src/workspaces.js';
 import type { CodespacesAgentContainersConfig, ProcessRunner } from '../src/types.js';
+import { transportFixture } from './transport-fixtures.js';
 
 const OID = '0123456789abcdef0123456789abcdef01234567';
 const BLOB = '1234567890abcdef1234567890abcdef12345678';
@@ -126,6 +127,7 @@ test('doctor runs the same bounded provisioned-runtime probes only for exactly r
     'codespaces.runtime.creation-logs',
     'codespaces.runtime.ssh',
     'codespaces.runtime.readiness-command',
+    'codespaces.runtime.helper',
   ]);
   const provisioned = report.checks.filter((check) => check.id === 'codespaces.workspace.metadata' || check.id.startsWith('codespaces.runtime.'));
   assert.ok(provisioned.every((check) => check.phase === 'provisioned-runtime' && ['ready', 'action-required', 'unsupported'].includes(check.state)));
@@ -286,3 +288,42 @@ test('no token-shaped fixture appears in any persisted file or captured readines
   const metadata = await loadMetadata(stateDir, 'issue-9');
   assert.ok(metadata && metadata.version === 2 && metadata.backend === 'codespaces');
 });
+
+test('the Codespaces backend executes a durable pipe command behind the experimental gate', async () => {
+  const fixture = await transportFixture();
+  const previous = process.env.AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES;
+  try {
+    process.env.AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES = '1';
+    fixture.helper.configure({ commandId: 'cmd-backend-x', outputs: [{ stream: 'stdout', bytes: bytes(1, 2, 3) }], exitCode: 7 });
+    const backend = createCodespacesExecutionBackend({
+      stateDir: fixture.stateDir, config: fixture.deps.config, runner: fixture.runner,
+      root: fixture.fixture.root, spawner: fixture.deps.spawner,
+    });
+    const handle = { kind: 'codespaces' as const, id: fixture.metadata.workspaceId, name: fixture.metadata.remote.name, environmentId: fixture.metadata.remote.environmentId };
+    const events: Array<import('../src/types.js').CommandEvent> = [];
+    for await (const event of backend.execute(handle, { commandId: 'cmd-backend-x', argv: ['echo', 'hi'], mode: 'pipe' })) events.push(event);
+    assert.ok(events.some((event) => event.type === 'accepted'), 'durable command is accepted');
+    const terminal = events.at(-1);
+    assert.deepEqual(terminal, { type: 'exit', commandId: 'cmd-backend-x', code: 7 });
+    assert.deepEqual(Buffer.concat(events.filter((event) => event.type === 'stdout').map((event) => Buffer.from((event as { bytes: Uint8Array }).bytes))), Buffer.from([1, 2, 3]));
+    // The backend cancel path proves the process group before returning.
+    fixture.helper.configure({ commandId: 'cmd-backend-y', outputs: [], exitCode: null, stayRunning: true, cancelPolicy: 'verify' });
+    const commandId = 'cmd-backend-y';
+    const started: Array<import('../src/types.js').CommandEvent> = [];
+    const controller = new AbortController();
+    const run = backend.execute(handle, { commandId, argv: ['sleep', '9'], mode: 'pipe' }, controller.signal);
+    const waiting = (async () => {
+      for await (const event of run) started.push(event);
+    })();
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    await backend.cancel(handle, commandId);
+    controller.abort();
+    await waiting;
+    assert.equal(started.at(-1)?.type, 'cancelled', `verified cancel must report cancelled (${JSON.stringify(started.map((event) => event.type))})`);
+  } finally {
+    if (previous === undefined) delete process.env.AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES;
+    else process.env.AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES = previous;
+  }
+});
+
+function bytes(...values: number[]): Uint8Array { return Uint8Array.from(values); }

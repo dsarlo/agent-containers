@@ -3,6 +3,8 @@ import { runReadinessProbes, readinessGateDoctorChecks } from './codespaces-read
 import { parseConfig } from './config.js';
 import { isCanonicalContainerId, loadManualRecovery, loadMetadata, type CodespacesWorkspaceMetadata } from './state.js';
 import { getProductionStateDurabilityAdapter } from './durability.js';
+import { helperArchForUname, helperRoot, inspectRemoteHelper, loadHelperManifest } from './codespaces-helper.js';
+import { redactSecretDiagnostic } from './secrets.js';
 import type { AgentContainersConfig, BackendKind, BackendSelection, DoctorCheck, DoctorReport, ProcessResult, ProcessRunner, SetupState } from './types.js';
 
 export interface CodespacesSetupEvidence { repository: string; requestedRef: string; expectedOid: string; devcontainerPath: string; devcontainerBlobOid: string }
@@ -171,6 +173,7 @@ async function codespacesChecks(config: AgentContainersConfig, runner: ProcessRu
         const report = await observe(() => runReadinessProbes({ stateDir: options.stateDir!, name: options.workspaceName!, provider, config: v2, loadMetadata }));
         if (report.error) workspaceChecks.push(action('codespaces.workspace.runtime', 'Provisioned-runtime readiness probes could not complete; no repair or restart was attempted.', 'provisioned-runtime'));
         else workspaceChecks.push(...readinessGateDoctorChecks(record, report.value));
+        workspaceChecks.push(await remoteHelperDoctorCheck(provider, record));
       }
     }
   }
@@ -190,6 +193,32 @@ async function codespacesChecks(config: AgentContainersConfig, runner: ProcessRu
     ...workspaceChecks,
   ];
 }
+/**
+ * Read-only provisioned-runtime helper check: verifies the exact recorded
+ * Codespace's installed helper digest/owner/mode/path/protocol against the
+ * package-owned pinned artifact. Never copies, never repairs, and never falls
+ * back to an arbitrary download.
+ */
+async function remoteHelperDoctorCheck(provider: GhCodespacesProvider, record: CodespacesWorkspaceMetadata): Promise<DoctorCheck> {
+  const root = helperRoot();
+  try {
+    const manifest = await loadHelperManifest(root);
+    if (!manifest.artifactsStaged) {
+      return action('codespaces.runtime.helper', 'The package-owned remote helper artifacts are not staged in this package; execution is unavailable until the pinned helper-artifacts build stages them. Doctor performs read-only checks only.', 'provisioned-runtime');
+    }
+    const uname = (await provider.remoteSshProbe(record.remote.name, ['uname', '-m'], {})).trim();
+    const arch = helperArchForUname(uname);
+    if (!arch) return action('codespaces.runtime.helper', `The remote architecture ${uname} has no package-owned helper artifact; execution is unsupported.`, 'provisioned-runtime');
+    await inspectRemoteHelper({
+      stateDir: '', workspaceName: record.name, workspaceId: record.workspaceId, remoteName: record.remote.name,
+      provider, root, verifyKnown: true,
+    }, arch, `agent-containers-helper-${arch}`);
+    return { ...ready('codespaces.runtime.helper', 'The installed remote helper matches the package-owned pinned artifact (digest, owner, mode, path, and protocol).'), phase: 'provisioned-runtime' };
+  } catch (error: unknown) {
+    return action('codespaces.runtime.helper', `The remote helper is not verified for this exact recorded Codespace (${redactSecretDiagnostic(error instanceof Error ? error.message : String(error))}); doctor performs read-only verification only and never installs or repairs it.`, 'provisioned-runtime');
+  }
+}
+
 function boundedRunner(runner: ProcessRunner, options: DoctorOptions): ProcessRunner {
   return { run: async (command, args, runOptions) => {
     if (options.abortSignal?.aborted) throw new Error('Doctor operation aborted.');
