@@ -24,6 +24,8 @@ export interface MockCommandBehavior {
   stayRunning?: boolean;
   /** Pause between output frames to exercise socket backpressure. */
   sendOutputDelayMs?: number;
+  /** Reported helper_arch in hello-ok (default 'x86_64'); used to cross-check N1. */
+  helperArch?: string;
 }
 
 export interface MockCommandRecord {
@@ -45,9 +47,11 @@ export class MockRemoteHelper {
   readonly records = new Map<string, MockCommandRecord>();
   readonly resizes: Array<{ commandId: string; cols: number; rows: number }> = [];
   protocol = 1;
+  helperArch = 'x86_64';
 
   configure(behavior: MockCommandBehavior): void {
     this.behaviors.set(behavior.commandId, behavior);
+    if (behavior.helperArch) this.helperArch = behavior.helperArch;
   }
 
   begin(record: MockCommandRecord): void {
@@ -175,16 +179,16 @@ async function serveSession(helper: MockRemoteHelper, session: MockSshSession, a
   session.destroy();
 }
 
-async function sendHello(session: MockSshSession, protocol: number): Promise<void> {
+async function sendHello(session: MockSshSession, protocol: number, arch: string): Promise<void> {
   await session.sendJson(HelperFrameType.helloOk, {
-    protocol, helper_version: '0.1.0', helper_arch: 'x86_64', remote_boot_id: MOCK_BOOT_ID, helper_pid: 4242,
+    protocol, helper_version: '0.1.0', helper_arch: arch, remote_boot_id: MOCK_BOOT_ID, helper_pid: 4242,
   });
 }
 
 async function handleRequest(helper: MockRemoteHelper, session: MockSshSession, frame: HelperFrame): Promise<void> {
   switch (frame.type) {
     case HelperFrameType.hello:
-      await sendHello(session, helper.protocol);
+      await sendHello(session, helper.protocol, helper.helperArch);
       break;
     case HelperFrameType.exec: {
       const request = parseJson<{ command_id: string; request_hash: string; argv: string[]; mode?: 'pipe' | 'pty' }>(frame.payload);
@@ -240,6 +244,10 @@ async function handleRequest(helper: MockRemoteHelper, session: MockSshSession, 
       await session.sendJson(HelperFrameType.cancelVerified, { command_id: request.command_id, cancelled_at: cancelledAt });
       break;
     }
+    case HelperFrameType.stdinEof:
+      /* Client half-close of stdin (B4): the child keeps running detached from
+       * the stream. The mock has no live child, so it is a no-op. */
+      break;
     case HelperFrameType.resize: {
       const request = parseJson<{ command_id?: string; cols?: number; rows?: number }>(frame.payload);
       if (!request.command_id || !Number.isInteger(request.cols) || !Number.isInteger(request.rows)) {

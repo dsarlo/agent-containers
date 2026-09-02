@@ -71,6 +71,7 @@ export type RemoteHelperEvent =
   | { kind: 'status'; commandId: string; state: string; exitCode: number | null; stdoutOffset: bigint; stderrOffset: bigint; terminalOffset: bigint }
   | { kind: 'exit'; commandId: string; code: number | null; exitedAt: string }
   | { kind: 'cancel-verified'; commandId: string; cancelledAt: string }
+  | { kind: 'cancel-unknown'; commandId: string; detail: string }
   | { kind: 'error'; commandId: string | null; message: string };
 
 export function decodeHelperEvent(frame: HelperFrame): RemoteHelperEvent {
@@ -110,6 +111,10 @@ export function decodeHelperEvent(frame: HelperFrame): RemoteHelperEvent {
       const value = decodeFramedJson<{ command_id?: unknown; cancelled_at?: unknown }>(frame);
       if (typeof value.command_id !== 'string' || typeof value.cancelled_at !== 'string') throw new Error('Helper cancel-verified event is incomplete; cancellation cannot be claimed.');
       return { kind: 'cancel-verified', commandId: value.command_id, cancelledAt: value.cancelled_at };
+    }
+    case HelperFrameType.cancelUnknown: {
+      const value = decodeFramedJson<{ command_id?: unknown; message?: unknown }>(frame);
+      return { kind: 'cancel-unknown', commandId: typeof value.command_id === 'string' ? value.command_id : '', detail: typeof value.message === 'string' ? value.message : 'cancellation could not be proven remotely' };
     }
     case HelperFrameType.error: {
       const value = decodeFramedJson<{ command_id?: unknown; message?: unknown }>(frame);
@@ -301,15 +306,11 @@ export async function* executeRemoteCommand(deps: RemoteTransportDependencies, i
   let savedStatus = (await loadCommandStatus(deps.stateDir, commandId)) ?? statusRecord(commandId, now, 'accepted');
   savedStatus = await saveStatus(deps, savedStatus);
 
-  const helper = await bootstrapRemoteHelper(helperDeps(deps));
-  await inspectRemoteHelper(helperDeps(deps), helper.arch, helper.file);
-
-  let offsets = (await loadCommandOffsets(deps.stateDir, commandId)) ?? await zeroOffsets(deps, commandId, now);
-  const transportBudget = deps.reconnectBudgetMs ?? deps.config.backends.codespaces.transport.reconnectWindowSeconds * 1000;
-  const deadline = Date.now() + transportBudget;
+  /* Register the abort listener BEFORE any async I/O so a first interrupt is
+   * never missed in a busy event loop; cancel proof then routes through the
+   * recorded owning process group (B3). */
   let cancelRequested = false;
   let session: HelperSession | undefined;
-
   const onAbort = () => {
     if (cancelRequested) return;
     cancelRequested = true;
@@ -317,6 +318,13 @@ export async function* executeRemoteCommand(deps: RemoteTransportDependencies, i
     session?.close();
   };
   deps.signal?.addEventListener('abort', onAbort, { once: true });
+
+  const helper = await bootstrapRemoteHelper(helperDeps(deps));
+  await inspectRemoteHelper(helperDeps(deps), helper.arch, helper.file);
+
+  let offsets = (await loadCommandOffsets(deps.stateDir, commandId)) ?? await zeroOffsets(deps, commandId, now);
+  const transportBudget = deps.reconnectBudgetMs ?? deps.config.backends.codespaces.transport.reconnectWindowSeconds * 1000;
+  const deadline = Date.now() + transportBudget;
 
   try {
     let attempt = 0;
@@ -357,7 +365,16 @@ export async function* executeRemoteCommand(deps: RemoteTransportDependencies, i
             if (chunk.length > MAX_STDIN_FRAME_BYTES) throw new Error('A user stdin chunk exceeded the bounded frame size; refusing the oversized chunk.');
             await session.send(HelperFrameType.stdin, chunk);
           }
-          session.endStdin();
+        }
+        /* Half-close stdin with an explicit protocol frame so the child keeps
+         * running detached from the stream (spec 9.4). This is never a transport
+         * half-close of the connection itself (B4). If the remote helper already
+         * closed the transport, the queued output is still drained below and
+         * the loss is handled by the reconnect loop, not by discarding bytes. */
+        try {
+          await session.send(HelperFrameType.stdinEof, { command_id: commandId, request_hash: requestHash });
+        } catch (error: unknown) {
+          if (!(error instanceof TransportLostError)) throw error;
         }
         if (input.mode === 'pty' && input.resizeSource) {
           void forwardResizes(session, commandId, input.resizeSource);
@@ -420,8 +437,8 @@ export async function* attachRemoteCommand(deps: RemoteTransportDependencies, co
     let session: HelperSession | undefined;
     try {
       session = await openSession(deps, helper.binPath);
-      await helloHandshake(deps, session);
-      await session.send(HelperFrameType.attach, { command_id: commandId, request_hash: requestHash, stdout_offset: offsets.stdout, stderr_offset: offsets.stderr, terminal_offset: offsets.terminal });
+      await helloHandshake(deps, session, helper.arch);
+      await session.send(HelperFrameType.attach, { command_id: commandId, request_hash: requestHash, stdout_offset: offsets.stdout, stderr_offset: offsets.stderr, terminal_offset: offsets.terminal, workspace_id: deps.metadata.workspaceId, grace_ms: deps.cancelGraceMs ?? deps.config.backends.codespaces.transport.cancelGraceSeconds * 1000 });
       const streaming = yield* streamSession(deps, now, commandId, requestHash, session, offsets);
       session = undefined;
       offsets = streaming.offsets;
@@ -478,7 +495,7 @@ interface OpenExecSessionResult {
 async function openExecSession(deps: RemoteTransportDependencies, helper: RemoteHelperBootstrapResult, commandId: string, requestHash: string, input: ExecuteTransportInput, _offsets: CodespacesCommandOffsets, now: () => string): Promise<OpenExecSessionResult> {
   if (deps.signal?.aborted) return { kind: 'aborted' };
   const session = await openSession(deps, helper.binPath);
-  await helloHandshake(deps, session);
+  await helloHandshake(deps, session, helper.arch);
   await session.send(HelperFrameType.exec, {
     command_id: commandId,
     request_hash: requestHash,
@@ -487,6 +504,8 @@ async function openExecSession(deps: RemoteTransportDependencies, helper: Remote
     mode: input.mode,
     cols: input.mode === 'pty' ? (input.cols ?? 80) : undefined,
     rows: input.mode === 'pty' ? (input.rows ?? 24) : undefined,
+    workspace_id: deps.metadata.workspaceId,
+    grace_ms: deps.cancelGraceMs ?? deps.config.backends.codespaces.transport.cancelGraceSeconds * 1000,
     retention_bytes: deps.config.backends.codespaces.transport.remoteLogBytesPerStream,
     retention_hours: deps.config.backends.codespaces.transport.remoteLogRetentionHours,
   });
@@ -496,13 +515,15 @@ async function openExecSession(deps: RemoteTransportDependencies, helper: Remote
 async function openAttachSession(deps: RemoteTransportDependencies, helper: RemoteHelperBootstrapResult, commandId: string, requestHash: string, input: ExecuteTransportInput, offsets: CodespacesCommandOffsets, now: () => string): Promise<OpenExecSessionResult> {
   if (deps.signal?.aborted) return { kind: 'aborted' };
   const session = await openSession(deps, helper.binPath);
-  await helloHandshake(deps, session);
+  await helloHandshake(deps, session, helper.arch);
   await session.send(HelperFrameType.attach, {
     command_id: commandId,
     request_hash: requestHash,
     stdout_offset: offsets.stdout,
     stderr_offset: offsets.stderr,
     terminal_offset: offsets.terminal,
+    workspace_id: deps.metadata.workspaceId,
+    grace_ms: deps.cancelGraceMs ?? deps.config.backends.codespaces.transport.cancelGraceSeconds * 1000,
   });
   return acknowledgeStarted(deps, session, commandId, requestHash, now, true);
 }
@@ -540,13 +561,18 @@ function drainStderr(child: FramedChildProcess): void {
   });
 }
 
-async function helloHandshake(deps: RemoteTransportDependencies, session: HelperSession): Promise<void> {
+async function helloHandshake(deps: RemoteTransportDependencies, session: HelperSession, expectedArch: 'linux-x64' | 'linux-arm64'): Promise<void> {
   await session.send(HelperFrameType.hello, { protocol: HELPER_PROTOCOL_VERSION, vendor: 'agent-containers' });
   const event = await session.nextEvent();
   if (event === null) throw new TransportLostError('The remote helper did not complete the protocol handshake before closing.');
   if (event.kind !== 'hello-ok') throw new Error('The remote helper did not confirm the package protocol handshake; execution is blocked.');
   if (event.protocol !== HELPER_PROTOCOL_VERSION) {
     throw new Error(`Remote helper protocol ${event.protocol} does not match the pinned package protocol ${HELPER_PROTOCOL_VERSION}; execution is blocked.`);
+  }
+  const observedArch = event.helperArch;
+  const expectedArchName = expectedArch === 'linux-x64' ? 'x86_64' : 'aarch64';
+  if (observedArch !== expectedArchName) {
+    throw new Error(`Remote helper architecture ${redactSecretDiagnostic(observedArch)} does not match the package-owned artifact ${expectedArchName}; execution is blocked.`);
   }
   void deps;
 }
@@ -639,8 +665,8 @@ async function requestRemoteCancelProof(deps: RemoteTransportDependencies, comma
     await inspectRemoteHelper(helperDeps(deps), helper.arch, helper.file);
     const session = await openSession(deps, helper.binPath);
     try {
-      await helloHandshake(deps, session);
-      await session.send(HelperFrameType.cancel, { command_id: commandId, request_hash: requestHash });
+      await helloHandshake(deps, session, helper.arch);
+      await session.send(HelperFrameType.cancel, { command_id: commandId, request_hash: requestHash, workspace_id: deps.metadata.workspaceId, grace_ms: deps.cancelGraceMs ?? deps.config.backends.codespaces.transport.cancelGraceSeconds * 1000 });
       const verified = await waitForCancelVerified(deps, session, commandId, deadline);
       if (verified) return 'verified';
     } finally {
@@ -670,6 +696,7 @@ async function waitForCancelVerified(deps: RemoteTransportDependencies, session:
       }
       if (event === null) return false;
       if (event.kind === 'cancel-verified') return true;
+      if (event.kind === 'cancel-unknown') return false;
       if (event.kind === 'error' || event.kind === 'rejected') return false;
       if (cancelDetach.aborted) return false;
     }

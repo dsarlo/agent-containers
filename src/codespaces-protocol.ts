@@ -19,6 +19,7 @@ export const HelperFrameType = {
   cancel: 0x04,
   resize: 0x05,
   stdin: 0x06,
+  stdinEof: 0x07,
   helloOk: 0x81,
   rejected: 0x82,
   started: 0x83,
@@ -27,6 +28,7 @@ export const HelperFrameType = {
   exit: 0x86,
   cancelVerified: 0x87,
   error: 0x88,
+  cancelUnknown: 0x89,
 } as const;
 
 export const OutputStream = { stdout: 0, stderr: 1, terminal: 2 } as const;

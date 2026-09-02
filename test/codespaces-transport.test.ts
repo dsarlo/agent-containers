@@ -286,6 +286,14 @@ test('a helper protocol mismatch on the serve handshake blocks execution fail-cl
   assert.ok(status === undefined || status.state !== 'exited', 'no stopped/exit outcome may be recorded when the handshake is blocked');
 });
 
+test('a helper architecture mismatch on the serve handshake blocks execution fail-closed (N1)', async () => {
+  const fixture = await transportFixture();
+  fixture.helper.configure({ commandId: COMMAND_ID, helperArch: 'aarch64', outputs: [{ stream: 'stdout', bytes: bytes(1, 2) }], exitCode: 0 });
+  await assert.rejects(() => executeToEnd(fixture, pipeInput()), /architecture/);
+  const status = await loadCommandStatus(fixture.stateDir, COMMAND_ID);
+  assert.ok(status === undefined || status.state !== 'exited', 'no stopped/exit outcome may be recorded when the helper architecture disagrees with the package-owned artifact');
+});
+
 test('PTY mode delivers one deterministic merged terminal stream and forwards resize events (P1)', async () => {
   const first = new Uint8Array([27, 91, 49, 109, 72, 101, 108, 108, 111]);
   const second = new Uint8Array([27, 91, 48, 109, 10, 0, 255]);
