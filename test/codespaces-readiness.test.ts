@@ -6,10 +6,16 @@ import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { waitCodespacesReady, runReadinessProbes, readinessGateDoctorChecks, type CodespacesReadinessDependencies, type ReadinessReport } from '../src/codespaces-readiness.js';
 import { GhCodespacesProvider } from '../src/codespaces.js';
-import { saveMetadata, type CodespacesWorkspaceMetadata } from '../src/state.js';
+import { recordCreateIntent } from '../src/codespaces-ops.js';
+import { loadMetadata, saveMetadata, type CodespacesWorkspaceMetadata } from '../src/state.js';
 import type { CodespacesAgentContainersConfig, ProcessRunner } from '../src/types.js';
 
 const OID = '0123456789abcdef0123456789abcdef01234567';
+const BLOB = '1234567890abcdef1234567890abcdef12345678';
+
+function codespacesRecord(metadata: Awaited<ReturnType<typeof loadMetadata>>): CodespacesWorkspaceMetadata | undefined {
+  return metadata && metadata.version === 2 && metadata.backend === 'codespaces' ? metadata : undefined;
+}
 
 function configFixture(): CodespacesAgentContainersConfig {
   return {
@@ -64,6 +70,14 @@ async function probeContext(options: ProbeOptions = {}) {
   const stateDir = await mkdtemp(join(tmpdir(), 'agent-containers-ready-'));
   const metadata = recordedWorkspace();
   await saveMetadata(stateDir, metadata, { expectedGeneration: null });
+  await recordCreateIntent(stateDir, {
+    schemaVersion: 1, requestId: '00000000-0000-4000-8000-0000000000aa', name: 'issue-9', createdAt: '2026-09-02T12:00:00.000Z',
+    control: { githubHost: 'github.com', actorId: '1', actorLogin: 'octo', ghVersion: '2.52.0' },
+    repository: { id: '42', owner: 'octo', name: 'agent-containers' },
+    source: { requestedRef: 'refs/heads/main', expectedOid: OID, devcontainerPath: '.devcontainer/devcontainer.json', devcontainerBlobOid: BLOB },
+    capacity: { machine: 'basicLinux32gb', geo: null, idleTimeoutMinutes: 30, retentionPeriodMinutes: 10080, displayNameHint: null },
+    state: 'identity-verified', providerCorrelationId: null, providerError: null, providerResource: null, updatedAt: '2026-09-02T12:00:00.000Z', recoveryContext: null,
+  }, { expectAbsent: true });
   const dispatch: string[][] = [];
   const run: ProcessRunner['run'] = async (command, args) => {
     dispatch.push(args);
@@ -238,4 +252,89 @@ test('waitCodespacesReady yields one readable event per gate and the terminal re
   const terminal = events.at(-1);
   assert.equal(terminal?.report.terminal, 'ready-without-setup-proof');
   assert.equal(events.filter((event) => event.type === 'readiness').length, 9);
+});
+
+test('readiness durably persists a settled ready-without-setup-proof observation (B1)', async () => {
+  const { deps } = await probeContext();
+  const report = await runReadinessProbes(deps);
+  assert.equal(report.terminal, 'ready-without-setup-proof');
+  const settled = codespacesRecord(await loadMetadata(deps.stateDir, 'issue-9'));
+  assert.ok(settled, 'durable metadata must still exist after readiness settles');
+  assert.equal(settled.lifecycle.normalized, 'ready-without-setup-proof');
+  assert.equal(settled.lifecycle.providerRawState, 'Running');
+  assert.ok(Date.parse(settled.lifecycle.lastObservedAt) >= Date.parse('2026-09-02T12:00:00.000Z'), 'lastObservedAt advances when the terminal is observed');
+});
+
+test('terminal provider block persists a conservative stopped observation (B1)', async () => {
+  const { deps } = await probeContext({ get: () => resourceFixture({ state: 'Stopped' }) });
+  const report = await runReadinessProbes(deps);
+  assert.equal(report.terminal, 'blocked');
+  const settled = codespacesRecord(await loadMetadata(deps.stateDir, 'issue-9'));
+  assert.ok(settled, 'durable metadata must still exist after a terminal block');
+  assert.equal(settled.lifecycle.normalized, 'stopped');
+  assert.equal(settled.lifecycle.providerRawState, 'Stopped');
+});
+
+test('repository-identity mismatch redacts credential-bearing remote probe output (N2)', async () => {
+  const leaked = 'ghp_' + 'abcdefghijklmnopqrstuvwxyz123456';
+  const remoteUrl = `https://x-access-token:${leaked}@github.com/octo/attacker.git`;
+  const key = 'gh codespace ssh -c bookish-space-parakeet -- git -C /workspaces/agent-containers remote get-url origin';
+  const { deps } = await probeContext({ ssh: { [key]: `${remoteUrl}\n` } });
+  const report = await runReadinessProbes(deps);
+  assert.equal(report.terminal, 'blocked');
+  const identity = report.gates.find((gate) => gate.id === 'repository-identity');
+  assert.ok(identity && identity.state === 'blocked');
+  const serialized = JSON.stringify(report);
+  assert.ok(!serialized.includes(leaked), 'the PAT must never appear in the readiness report');
+  assert.ok(!serialized.includes('x-access-token'), 'the credential-bearing URL must be redacted from the report');
+  const checks = readinessGateDoctorChecks(recordedWorkspace(), report);
+  const doctorRendered = JSON.stringify(checks);
+  assert.ok(!doctorRendered.includes(leaked), 'the PAT must never appear in doctor output');
+  assert.ok(!doctorRendered.includes('x-access-token'), 'the credential-bearing URL must be redacted from doctor output');
+});
+
+test('matching-but-corrupt create intent fails closed and blocks readiness (N4)', async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), 'agent-containers-ready-'));
+  await saveMetadata(stateDir, recordedWorkspace(), { expectedGeneration: null });
+  await mkdir(join(stateDir, 'codespaces', 'ops'), { recursive: true });
+  await writeFile(join(stateDir, 'codespaces', 'ops', '00000000-0000-4000-8000-0000000000dd.json'), '{broken', 'utf8');
+  const run: ProcessRunner['run'] = async () => ({ code: 0, stdout: '', stderr: '' });
+  const deps: CodespacesReadinessDependencies = { stateDir, name: 'issue-9', provider: new GhCodespacesProvider({ run }), config: configFixture() };
+  const report = await runReadinessProbes(deps);
+  assert.equal(report.terminal, 'blocked');
+  assert.equal(report.gates[0]?.id, 'create-recorded');
+  assert.match(report.gates[0]?.detail, /corrupt|unreadable|invalid|intent/i);
+});
+
+test('blank create intent JSON fails closed and blocks readiness (N4)', async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), 'agent-containers-ready-'));
+  await saveMetadata(stateDir, recordedWorkspace(), { expectedGeneration: null });
+  await mkdir(join(stateDir, 'codespaces', 'ops'), { recursive: true });
+  await writeFile(join(stateDir, 'codespaces', 'ops', '00000000-0000-4000-8000-0000000000dd.json'), '', 'utf8');
+  const run: ProcessRunner['run'] = async () => ({ code: 0, stdout: '', stderr: '' });
+  const deps: CodespacesReadinessDependencies = { stateDir, name: 'issue-9', provider: new GhCodespacesProvider({ run }), config: configFixture() };
+  const report = await runReadinessProbes(deps);
+  assert.equal(report.terminal, 'blocked');
+  assert.match(report.gates[0]?.detail, /corrupt|unreadable|invalid|intent/i);
+});
+
+test('creation-log gate failure is a bounded diagnostic that never blocks ready (N5)', async () => {
+  const { deps } = await probeContext({ logs: { code: 1, stderr: 'logs endpoint unavailable' } });
+  const report = await runReadinessProbes(deps);
+  assert.equal(report.terminal, 'ready-without-setup-proof');
+  const logs = report.gates.find((gate) => gate.id === 'creation-logs');
+  assert.ok(logs);
+  assert.equal(logs.state, 'blocked');
+  assert.match(logs.detail, /diagnostic only/);
+});
+
+test('a skipped runtime-ready gate never claims doctor ready without evidence (N6)', async () => {
+  const { deps } = await probeContext();
+  const report = await runReadinessProbes(deps);
+  assert.equal(report.terminal, 'ready-without-setup-proof');
+  const checks = readinessGateDoctorChecks(recordedWorkspace(), report);
+  const command = checks.find((check) => check.id === 'codespaces.runtime.readiness-command');
+  assert.ok(command, 'the readiness-command doctor check must exist');
+  assert.equal(command.state, 'action-required');
+  assert.ok((command.remediation ?? []).length > 0, 'remediation must guide the operator to prove post-create readiness');
 });

@@ -163,6 +163,9 @@ export async function runCli(args: string[], cwd = process.cwd(), write: (messag
         ensureOptions(rest.slice(1), ['--for', '--timeout'], []);
         const forTarget = optionValue(rest.slice(1), '--for');
         if (forTarget !== 'ready') throw new UsageError('Usage: agent-containers wait <name> --for ready [--timeout <duration>]');
+        const timeoutValue = optionValue(rest.slice(1), '--timeout');
+        const timeoutMs = timeoutValue !== undefined ? parseWaitTimeout(timeoutValue) : undefined;
+        const deadlineSignal = timeoutMs === undefined ? undefined : AbortSignal.timeout(timeoutMs);
         const recorded = await loadMetadata(stateDir, name);
         if (!recorded) throw new Error(`No Agent Containers workspace named "${name}".`);
         if ('repoRoot' in recorded) throw new Error(`Workspace "${name}" is a local workspace; local readiness does not use the Codespaces gates.`);
@@ -173,7 +176,7 @@ export async function runCli(args: string[], cwd = process.cwd(), write: (messag
         const handle: WorkspaceHandle = { kind: 'codespaces', id: recorded.workspaceId, name: recorded.remote.name, environmentId: recorded.remote.environmentId };
         const backend = createCodespacesExecutionBackend({ stateDir, config, runner: nodeProcessRunner, root });
         let report: ReadinessEvent['report'] | undefined;
-        for await (const event of backend.waitReady(handle)) {
+        for await (const event of backend.waitReady(handle, deadlineSignal)) {
           if (!('report' in event)) continue;
           const last = event.report.gates.at(-1);
           if (last) write(`${last.id}: ${last.state} ${last.detail}`.trim());
@@ -300,6 +303,18 @@ function optionValue(args: string[], option: string): string | undefined {
   if (index < 0) return undefined;
   if (!args[index + 1] || args[index + 1].startsWith('-')) throw new UsageError(`${option} requires a value.`);
   return args[index + 1];
+}
+
+/** Parse an overall wait duration (bare seconds or ms/s/m/h units) into milliseconds. */
+function parseWaitTimeout(value: string): number {
+  const match = /^(\d+(?:\.\d+)?)(ms|s|m|h)?$/.exec(value.trim());
+  if (!match) throw new UsageError('--timeout must be a duration such as 30s, 5m, or 1h (or bare seconds).');
+  const amount = Number(match[1]);
+  const unit = match[2] ?? 's';
+  const multiplier = unit === 'ms' ? 1 : unit === 'm' ? 60_000 : unit === 'h' ? 3_600_000 : 1_000;
+  const total = amount * multiplier;
+  if (!Number.isSafeInteger(total) || total < 1 || total > 24 * 3_600_000) throw new UsageError('--timeout must be between 1ms and 24h.');
+  return Math.round(total);
 }
 
 function ensureOnly(args: string[], allowed: string[]): void {

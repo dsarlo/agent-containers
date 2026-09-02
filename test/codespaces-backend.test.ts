@@ -9,7 +9,7 @@ import { createCodespacesWorkspace } from '../src/codespaces-create.js';
 import { runReadinessProbes, type CodespacesReadinessDependencies } from '../src/codespaces-readiness.js';
 import { doctor } from '../src/setup.js';
 import { GhCodespacesProvider } from '../src/codespaces.js';
-import { loadCreateIntent } from '../src/codespaces-ops.js';
+import { loadCreateIntent, recordCreateIntent } from '../src/codespaces-ops.js';
 import { loadMetadata, saveMetadata, type CodespacesWorkspaceMetadata } from '../src/state.js';
 import { runCli } from '../src/cli.js';
 import { nodeProcessRunner } from '../src/workspaces.js';
@@ -39,14 +39,14 @@ function configFixture(): CodespacesAgentContainersConfig {
   };
 }
 
-function resourceFixture(): Record<string, unknown> {
+function resourceFixture(overrides: Partial<Record<string, unknown>> = {}): Record<string, unknown> {
   return {
     id: '9876543210', display_name: 'bookish-space-parakeet', name: 'bookish-space-parakeet', environment_id: 'env-8f1c1f0e',
     owner: { id: 1, login: 'octo' }, repository_id: 42,
     repository: { id: 42, name: 'agent-containers', owner: { id: 1, login: 'octo' } },
     billing_owner: { id: 1, login: 'octo' }, machine_name: 'basicLinux32gb', location: 'East US', geo: 'EastUs',
     created_at: '2026-09-02T12:00:00Z', state: 'Running',
-    git_status: { sha: OID, ref: 'main' }, devcontainer_path: '.devcontainer/devcontainer.json', idle_timeout_minutes: 30,
+    git_status: { sha: OID, ref: 'main' }, devcontainer_path: '.devcontainer/devcontainer.json', idle_timeout_minutes: 30, ...overrides,
   };
 }
 
@@ -89,6 +89,17 @@ function recordedWorkspace(): CodespacesWorkspaceMetadata {
   };
 }
 
+async function recordIssue9Intent(stateDir: string, requestId = '00000000-0000-4000-8000-0000000000cc'): Promise<void> {
+  await recordCreateIntent(stateDir, {
+    schemaVersion: 1, requestId, name: 'issue-9', createdAt: '2026-09-02T12:00:00.000Z',
+    control: { githubHost: 'github.com', actorId: '1', actorLogin: 'octo', ghVersion: '2.52.0' },
+    repository: { id: '42', owner: 'octo', name: 'agent-containers' },
+    source: { requestedRef: 'refs/heads/main', expectedOid: OID, devcontainerPath: '.devcontainer/devcontainer.json', devcontainerBlobOid: BLOB },
+    capacity: { machine: 'basicLinux32gb', geo: null, idleTimeoutMinutes: 30, retentionPeriodMinutes: 10080, displayNameHint: null },
+    state: 'identity-verified', providerCorrelationId: null, providerError: null, providerResource: null, updatedAt: '2026-09-02T12:00:00.000Z', recoveryContext: null,
+  }, { expectAbsent: true });
+}
+
 test('Codespaces execution backend stays phase-gated without the experimental environment flag', async () => {
   const previous = process.env.AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES;
   delete process.env.AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES;
@@ -105,6 +116,7 @@ test('Codespaces execution backend stays phase-gated without the experimental en
 test('doctor runs the same bounded provisioned-runtime probes only for exactly recorded workspaces', async () => {
   const stateDir = join(await mkdtemp(join(tmpdir(), 'agent-containers-backend-')), 'state');
   await saveMetadata(stateDir, recordedWorkspace(), { expectedGeneration: null });
+  await recordIssue9Intent(stateDir);
   const report = await doctor(configFixture(), 'codespaces', readinessRunner(), '/repo', { stateDir, workspaceName: 'issue-9' });
   const ids = report.checks.filter((check) => check.id.startsWith('codespaces.runtime.')).map((check) => check.id);
   assert.deepEqual(ids, [
@@ -159,6 +171,7 @@ test('CLI wait reports each independent readiness gate and ready-without-setup-p
   const xdg = await mkdtemp(join(tmpdir(), 'agent-containers-cli-wait-xdg-'));
   const stateDir = join(xdg, 'agent-containers');
   await saveMetadata(stateDir, recordedWorkspace(), { expectedGeneration: null });
+  await recordIssue9Intent(stateDir);
   const root = await mkdtemp(join(tmpdir(), 'agent-containers-cli-root-'));
   await writeFile(join(root, '.agent-containers.yml'), `${JSON.stringify(configFixture(), null, 2)}\n`);
   const original = nodeProcessRunner.run;
@@ -177,6 +190,58 @@ test('CLI wait reports each independent readiness gate and ready-without-setup-p
     assert.ok(messages.some((message) => /repository-identity: passed/.test(message)), 'each gate is reported independently');
     assert.ok(messages.some((message) => /ssh-ready: passed/.test(message)));
     assert.match(messages.at(-1) ?? '', /ready-without-setup-proof/);
+  } finally {
+    nodeProcessRunner.run = original;
+    if (previous === undefined) delete process.env.AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES;
+    else process.env.AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES = previous;
+    if (previousState === undefined) delete process.env.XDG_STATE_HOME;
+    else process.env.XDG_STATE_HOME = previousState;
+  }
+});
+
+test('creating A then settling readiness admits B without occupying the creating slot (B1)', async () => {
+  const stateDir = join(await mkdtemp(join(tmpdir(), 'agent-containers-backend-')), 'state');
+  const runner = readinessRunner();
+  const a = await createCodespacesWorkspace({ stateDir, requestId: '00000000-0000-4000-8000-0000000000aa', name: 'issue-9', config: configFixture(), root: '/repo', runner, provider: new GhCodespacesProvider(runner), ghVersion: '2.52.0' });
+  assert.equal(a.outcome, 'recorded');
+  if (a.outcome !== 'recorded') return;
+  assert.equal(a.metadata.lifecycle.normalized, 'provisioning');
+  const readiness = await runReadinessProbes({ stateDir, name: 'issue-9', provider: new GhCodespacesProvider(runner), config: configFixture() });
+  assert.equal(readiness.terminal, 'ready-without-setup-proof');
+  const settled = await loadMetadata(stateDir, 'issue-9');
+  assert.ok(settled && settled.version === 2 && settled.backend === 'codespaces');
+  assert.equal(settled.lifecycle.normalized, 'ready-without-setup-proof', 'readiness must durably settle the creating workspace');
+  const b = await createCodespacesWorkspace({ stateDir, requestId: '00000000-0000-4000-8000-0000000000bb', name: 'issue-10', config: configFixture(), root: '/repo', runner, provider: new GhCodespacesProvider(runner), ghVersion: '2.52.0' });
+  assert.equal(b.outcome, 'recorded', 'the settled workspace must not hold the single creating slot');
+});
+
+test('CLI wait honors --timeout as an overall deadline and returns the timeout outcome (N1)', async () => {
+  const xdg = await mkdtemp(join(tmpdir(), 'agent-containers-cli-wait-timeout-xdg-'));
+  const stateDir = join(xdg, 'agent-containers');
+  await saveMetadata(stateDir, recordedWorkspace(), { expectedGeneration: null });
+  await recordIssue9Intent(stateDir);
+  const root = await mkdtemp(join(tmpdir(), 'agent-containers-cli-root-'));
+  await writeFile(join(root, '.agent-containers.yml'), `${JSON.stringify(configFixture(), null, 2)}\n`);
+  const original = nodeProcessRunner.run;
+  nodeProcessRunner.run = async (command, args, options) => {
+    if (command === 'git' && args[0] === 'rev-parse' && args[1] === '--show-toplevel') return { code: 0, stdout: `${root}\n`, stderr: '' };
+    if (command === 'gh' && /^\/user\/codespaces\/[A-Za-z0-9-]+$/.test(args.at(-1) ?? '')) return { code: 0, stdout: JSON.stringify(resourceFixture({ state: 'Starting' })), stderr: '' };
+    if (command === 'gh' && args[0] === 'codespace' && args[1] === 'ssh') return { code: 0, stdout: '', stderr: '' };
+    if (command === 'gh' && args[0] === 'codespace' && args[1] === 'logs') return { code: 0, stdout: 'build line\n', stderr: '' };
+    return readinessRunner().run(command, args, options);
+  };
+  const previous = process.env.AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES;
+  const previousState = process.env.XDG_STATE_HOME;
+  const messages: string[] = [];
+  const started = Date.now();
+  try {
+    process.env.AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES = '1';
+    process.env.XDG_STATE_HOME = xdg;
+    const code = await runCli(['wait', 'issue-9', '--for', 'ready', '--timeout', '300ms'], root, (message) => messages.push(message));
+    const elapsed = Date.now() - started;
+    assert.equal(code, 1, messages.join('\n'));
+    assert.match(messages.at(-1) ?? '', /did not become ready \(timeout\)/);
+    assert.ok(elapsed < 5000, `wait --timeout must bound the overall wait (${elapsed}ms)`);
   } finally {
     nodeProcessRunner.run = original;
     if (previous === undefined) delete process.env.AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES;
