@@ -27,8 +27,10 @@ async function executeToEnd(fixture: TransportFixture, input: import('../src/cod
 async function withSettleGuard<T>(promise: Promise<T>, message: string): Promise<T> {
   let timer: NodeJS.Timeout | undefined;
   const guard = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new Error(`${message} (bounded settle guard)`)), 15000);
-    if (typeof timer.unref === 'function') timer.unref();
+    // NOTE: the timer must stay ref'd — an unref'd timer cannot fire once the
+    // event loop drains, which is precisely the CI failure mode this guard
+    // must diagnose with a clear error instead of a runner cancellation.
+    timer = setTimeout(() => reject(new Error(`${message} (bounded settle guard)`)), 8000);
   });
   try {
     return await Promise.race([promise, guard]);
