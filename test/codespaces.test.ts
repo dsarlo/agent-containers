@@ -47,8 +47,9 @@ test('provider requires the observed Codespace name to equal the exact requested
 });
 
 test('provider diagnostics redact URLs, query strings, and credential-shaped values', async () => {
-  const provider = new GhCodespacesProvider({ async run() { return { code: 1, stdout: '', stderr: 'GET https://api.example.test/path?token=abc Authorization: Bearer secret-value ghp_abcdefghijklmnopqrstuvwxyz123456' }; } });
-  await assert.rejects(() => provider.actor(), (error: Error) => !error.message.includes('https://') && !error.message.includes('secret-value') && !error.message.includes('ghp_'));
+  const sentinel = 'PROVIDER_SECRET_SENTINEL';
+  const provider = new GhCodespacesProvider({ async run() { return { code: 1, stdout: '', stderr: `GET https://api.example.test/path?token=abc Authorization: Bearer secret-value sh -c 'tool --auth-token ${sentinel}' ghp_abcdefghijklmnopqrstuvwxyz123456` }; } });
+  await assert.rejects(() => provider.actor(), (error: Error) => !error.message.includes('https://') && !error.message.includes('secret-value') && !error.message.includes(sentinel) && !error.message.includes('ghp_'));
 });
 
 test('provider rejects credential-shaped selectors and response metadata before disclosure', async () => {
@@ -58,6 +59,8 @@ test('provider rejects credential-shaped selectors and response metadata before 
   await assert.rejects(() => provider.get(`sk-${'x'.repeat(24)}`), (error: Error) => !error.message.includes('x'.repeat(24)));
   await assert.rejects(() => provider.resolveRef(`owner/${sentinel}`, 'refs/heads/main'), (error: Error) => !error.message.includes(sentinel));
   await assert.rejects(() => provider.machines('owner/repo', `Authorization=${sentinel}`), (error: Error) => !error.message.includes(sentinel));
+  await assert.rejects(() => provider.resolveRef('owner/repo', `refs/heads/main--auth-token=${sentinel}`), (error: Error) => !error.message.includes(sentinel));
+  await assert.rejects(() => provider.resolveRef('owner/repo', 'refs/heads/main.lock'), /unsafe/);
   assert.deepEqual(calls, []);
   const hostile = new GhCodespacesProvider({ async run() { return { code: 0, stdout: JSON.stringify({ id: '1', login: sentinel }), stderr: '' }; } });
   await assert.rejects(() => hostile.actor(), (error: Error) => !error.message.includes(sentinel));

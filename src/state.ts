@@ -1,6 +1,6 @@
-import { lstat, mkdir, open, readdir, readFile, rename, rm, type FileHandle } from 'node:fs/promises';
+import { link, lstat, mkdir, open, readdir, readFile, rename, rm, type FileHandle } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { dirname, isAbsolute, join, resolve } from 'node:path';
+import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { randomUUID, createHash } from 'node:crypto';
 import { isValidWorkspaceName, validateWorkspaceName } from './names.js';
 import { getProductionStateDurabilityAdapter, type StateDurabilityAdapter } from './durability.js';
@@ -354,6 +354,8 @@ export async function loadMetadata(stateDir: string, name: string): Promise<Work
 export interface MetadataSaveOptions {
   /** `null` requires absence; a generation binds an update to the observed record. */
   expectedGeneration?: string | null;
+  /** Test seam after comparison and immediately before the no-replace boundary. */
+  afterCheckBeforePublish?: () => Promise<void>;
 }
 
 /** A stable generation suitable for an expected-generation metadata publication. */
@@ -381,8 +383,39 @@ export async function saveMetadata(stateDir: string, metadata: WorkspaceMetadata
       throw new Error(`Metadata for ${metadata.name} has immutable backend/resource identity; refusing replacement.`);
     }
     const temporaryPath = join(directory, `.${metadata.name}.${randomUUID()}.tmp`);
-    await durableReplace(temporaryPath, path, directory, `${JSON.stringify(metadata, null, 2)}\n`, durability);
+    if (options.expectedGeneration === null) {
+      await durableCreate(temporaryPath, path, directory, `${JSON.stringify(metadata, null, 2)}\n`, durability, options.afterCheckBeforePublish);
+    } else {
+      await options.afterCheckBeforePublish?.();
+      await durableReplace(temporaryPath, path, directory, `${JSON.stringify(metadata, null, 2)}\n`, durability);
+    }
   });
+}
+
+/** Publish first metadata generation without replacing a concurrent destination. */
+async function durableCreate(temporaryPath: string, path: string, directory: string, content: string, durability: StateDurabilityAdapter, afterCheckBeforePublish?: () => Promise<void>): Promise<void> {
+  let file: FileHandle | undefined;
+  try {
+    file = await open(temporaryPath, 'wx', 0o600);
+    await file.writeFile(content, 'utf8');
+    await file.close();
+    file = undefined;
+    await durability.syncFile(temporaryPath);
+    await afterCheckBeforePublish?.();
+    if (await durability.publicationMode() === 'recoverable') {
+      if (!durability.moveFileNoReplaceWriteThrough) throw new Error('Native write-through no-replace publication is unavailable; refusing first metadata publication.');
+      await durability.moveFileNoReplaceWriteThrough(temporaryPath, path);
+    } else {
+      await link(temporaryPath, path);
+      await rm(temporaryPath, { force: false });
+      await durability.syncDirectory(directory);
+    }
+  } catch (error: unknown) {
+    await file?.close();
+    await rm(temporaryPath, { force: true });
+    if (isNodeError(error, 'EEXIST')) throw new Error(`Metadata for ${basename(path, '.json')} changed concurrently; it was created while this operation was in progress.`, { cause: error });
+    throw error;
+  }
 }
 
 function sameMetadataIdentity(current: WorkspaceMetadata, next: WorkspaceMetadata): boolean {
@@ -497,8 +530,8 @@ function isUuid(value: unknown): value is string { return typeof value === 'stri
 function isTimestamp(value: unknown): value is string { return typeof value === 'string' && !Number.isNaN(Date.parse(value)); }
 function isOid(value: unknown): value is string { return typeof value === 'string' && /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(value); }
 function safeIdentifier(value: unknown): value is string { return typeof value === 'string' && !secretShaped(value) && /^[A-Za-z0-9_.-]{1,128}$/.test(value); }
-function safeDisplay(value: unknown): value is string { return typeof value === 'string' && !secretShaped(value) && value.length > 0 && value.length <= 512 && !/[\0\r\n]/.test(value); }
-function safeRef(value: unknown): value is string { return typeof value === 'string' && !secretShaped(value) && value.length <= 512 && /^refs\/(?:heads|tags)\/[A-Za-z0-9._/-]+$/.test(value) && !value.includes('..') && !value.endsWith('.'); }
+function safeDisplay(value: unknown): value is string { return typeof value === 'string' && !secretShaped(value) && /^[\x20-\x7e]{1,128}$/.test(value); }
+function safeRef(value: unknown): value is string { return typeof value === 'string' && !secretShaped(value) && /^refs\/(?:heads|tags)\/(?:[A-Za-z0-9][A-Za-z0-9._-]*)(?:\/[A-Za-z0-9][A-Za-z0-9._-]*)*$/.test(value) && !value.includes('..') && !value.split('/').some((part) => part.endsWith('.') || part.endsWith('.lock')); }
 function safeRepositoryPath(value: unknown): value is string { return typeof value === 'string' && !secretShaped(value) && value.length > 0 && !/[\0\r\n\\]/.test(value) && !value.split('/').some((part) => !part || part === '.' || part === '..'); }
 function validOperation(value: unknown): boolean { return value === null || (isStrictRecord(value, ['id', 'kind', 'startedAt', 'checkpoint']) && isUuid(value.id) && (value.kind === 'create' || value.kind === 'stop' || value.kind === 'remove') && isTimestamp(value.startedAt) && safeDisplay(value.checkpoint)); }
 
@@ -507,9 +540,7 @@ function isCanonicalPath(value: unknown): value is string {
 }
 
 function isLocalBranchRef(value: unknown): value is string {
-  return typeof value === 'string' && /^refs\/heads\/.+/.test(value) &&
-    !/[\s~^:?*\\[]/.test(value) && ![...value].some((character) => character.charCodeAt(0) <= 0x1f) &&
-    !value.endsWith('.') && !value.endsWith('/');
+  return typeof value === 'string' && safeRef(value) && value.startsWith('refs/heads/');
 }
 
 function isCleanupState(value: unknown): boolean {

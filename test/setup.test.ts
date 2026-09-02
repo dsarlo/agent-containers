@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, readFile, rename, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -161,6 +161,20 @@ test('configuration rejects compound credential argv and never exposes malformed
   assert.doesNotMatch(preview, /sentinel-secret-value/);
 });
 
+test('configuration classifier rejects embedded shell credential flags and strict ref selectors without revealing values', () => {
+  const sentinel = 'CONFIG_SECRET_SENTINEL';
+  for (const command of [`sh -c 'tool --auth-token ${sentinel}'`, `tool --oauth-token=${sentinel}`, `tool --credentials ${sentinel}`, `tool --private-key ${sentinel}`]) {
+    const legacy = { version: 1, workspace: { worktreeRoot: 'worktrees', baseBranch: 'main' }, environment: { devcontainerPath: '.devcontainer/devcontainer.json' }, commands: { run: command } };
+    assert.throws(() => parseConfig(JSON.stringify(legacy)), (error: Error) => !error.message.includes(sentinel));
+    assert.doesNotMatch(configurationDiff(null, legacy as never), new RegExp(sentinel));
+  }
+  for (const ref of [`refs/heads/main--auth-token=${sentinel}`, 'refs/heads/main.lock', 'main']) {
+    const candidate = structuredClone(codespaces);
+    candidate.project.ref = ref;
+    assert.throws(() => parseConfig(JSON.stringify(candidate)), (error: Error) => !error.message.includes(sentinel));
+  }
+});
+
 test('configuration rejects authorization and bearer assignment keys before validating commands or unknown keys', () => {
   for (const key of ['Authorization=SETUP_KEY_SENTINEL', 'authorization=Bearer SETUP_KEY_SENTINEL', 'AUTH=SETUP_KEY_SENTINEL', 'bearer=SETUP_KEY_SENTINEL']) {
     const legacy = { version: 1, workspace: { worktreeRoot: 'worktrees', baseBranch: 'main' }, environment: { devcontainerPath: '.devcontainer/devcontainer.json' }, commands: { [key]: '' } };
@@ -254,6 +268,30 @@ test('doctor treats malformed, checksum-invalid, and unreadable recovery journal
       assert.equal(recovery?.state, 'action-required');
       assert.match(recovery?.summary ?? '', /manual recovery journal is unreadable or corrupt/i);
       assert.equal(report.checks.find((check) => check.id === 'local.workspace.runtime'), undefined);
+    }
+  } finally { setStateDurabilityAdapterForTesting(undefined); }
+});
+
+test('doctor independently reports corrupt metadata and recovery without a stopped or ready runtime claim', async () => {
+  const stateDir = join(await mkdtemp(join(tmpdir(), 'agent-containers-doctor-corrupt-metadata-')), 'state');
+  const root = '/repo';
+  setStateDurabilityAdapterForTesting(durability);
+  try {
+    for (const metadata of ['malformed', 'schema-invalid', 'unreadable'] as const) for (const recovery of ['valid', 'corrupt'] as const) {
+      await mkdir(join(stateDir, 'workspaces'), { recursive: true });
+      const metadataPath = join(stateDir, 'workspaces', 'safe.json');
+      if (metadata === 'unreadable') await mkdir(metadataPath);
+      else await writeFile(metadataPath, metadata === 'malformed' ? '{not metadata}' : '{}');
+      await mkdir(join(stateDir, 'locks'), { recursive: true });
+      const journal = join(stateDir, 'locks', 'safe.manual-recovery.journal');
+      if (recovery === 'valid') await recordManualRecovery(stateDir, 'safe', { reason: 'operation-may-be-active', containerIds: [], worktree: `${root}/worktrees/safe` });
+      else await writeFile(journal, '{not journal}\n');
+      const report = await doctor({ version: 1, workspace: { worktreeRoot: 'worktrees', baseBranch: 'main' }, environment: { devcontainerPath: '.devcontainer/devcontainer.json' }, commands: {} }, 'local', { async run(_command, args) { return { code: 0, stdout: args[0] === 'rev-parse' ? `${root}\n` : '--relative-paths\n', stderr: '' }; } }, root, { stateDir, workspaceName: 'safe' });
+      assert.equal(report.checks.find((check) => check.id === 'local.workspace.metadata')?.state, 'action-required');
+      assert.equal(report.checks.find((check) => check.id === 'local.workspace.recovery')?.state, 'action-required');
+      assert.equal(report.checks.find((check) => check.id === 'local.workspace.runtime'), undefined);
+      await rm(metadataPath, { recursive: true, force: true });
+      await rm(journal, { force: true });
     }
   } finally { setStateDurabilityAdapterForTesting(undefined); }
 });

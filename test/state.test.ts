@@ -94,6 +94,46 @@ test('metadata expected generation and immutable identity reject stale or cross-
   await assert.rejects(() => saveMetadata(stateDir, { ...metadata, repoRoot: '/other-repository' }), /immutable backend\/resource identity/);
 });
 
+test('metadata expected absence is a durable no-replace boundary in strict and recoverable publication modes', async () => {
+  for (const mode of ['strict', 'recoverable'] as const) {
+    const stateDir = await mkdtemp(join(tmpdir(), `agent-containers-metadata-no-replace-${mode}-`));
+    const external: WorkspaceMetadata = { ...metadata, createdAt: '2026-02-01T00:00:00.000Z' };
+    const adapter: StateDurabilityAdapter = mode === 'strict' ? testDurabilityAdapter : {
+      ...testDurabilityAdapter,
+      publicationMode: async () => 'recoverable',
+      moveFileWriteThrough: async (source, destination) => { await rename(source, destination); },
+      moveFileNoReplaceWriteThrough: async (source, destination) => {
+        try { await lstat(destination); const error = new Error('exists'); Object.assign(error, { code: 'EEXIST' }); throw error; }
+        catch (error: unknown) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+        await rename(source, destination);
+      },
+    };
+    setStateDurabilityAdapterForTesting(adapter);
+    try {
+      await assert.rejects(() => saveMetadata(stateDir, metadata, {
+        expectedGeneration: null,
+        afterCheckBeforePublish: async () => {
+          await mkdir(join(stateDir, 'workspaces'), { recursive: true });
+          await writeFile(join(stateDir, 'workspaces', 'safe.json'), `${JSON.stringify(external)}\n`);
+        },
+      }), /changed concurrently/);
+      assert.equal(await readFile(join(stateDir, 'workspaces', 'safe.json'), 'utf8'), `${JSON.stringify(external)}\n`);
+    } finally { setStateDurabilityAdapterForTesting(testDurabilityAdapter); }
+  }
+});
+
+test('metadata rejects credential-shaped refs and display fields before persistence', async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), 'agent-containers-metadata-secret-'));
+  const sentinel = 'METADATA_SECRET_SENTINEL';
+  for (const candidate of [
+    { ...metadata, baseRef: `refs/heads/main--auth-token=${sentinel}` },
+    { ...metadata, baseRef: 'refs/heads/main.lock' },
+    { version: 2, backend: 'codespaces', name: 'safe', workspaceId: '11111111-1111-4111-8111-111111111111', createdAt: '2026-01-01T00:00:00.000Z', control: { githubHost: 'github.com', actorId: '1', actorLogin: `sh -c 'tool --auth-token ${sentinel}'`, ghVersion: '2.0.0' }, repository: { id: '2', owner: 'owner', name: 'repo' }, source: { requestedRef: 'refs/heads/main', expectedOid: '0123456789012345678901234567890123456789', effectiveBranch: 'agent-containers/safe', devcontainerPath: '.devcontainer/devcontainer.json', devcontainerBlobOid: 'abcdefabcdefabcdefabcdefabcdefabcdefabcd' }, remote: { codespaceId: '3', name: 'safe-codespace', environmentId: 'env', ownerId: '1', ownerLogin: 'octo', billableOwnerId: '1', machine: 'basic', geo: 'WestUs2', createdAt: '2026-01-01T00:00:00.000Z' }, lifecycle: { desired: 'ready', normalized: 'ready', providerRawState: 'ready', lastObservedAt: '2026-01-01T00:00:00.000Z', activeOperation: null }, recovery: null, cleanup: { remoteStopped: false, remoteDeleted: false, tombstoneWritten: false } },
+  ] as WorkspaceMetadata[]) {
+    await assert.rejects(() => saveMetadata(stateDir, candidate), (error: Error) => !error.message.includes(sentinel));
+  }
+});
+
 test('listMetadata reads in bounded batches and returns deterministic workspace-name order', async () => {
   const stateDir = await mkdtemp(join(tmpdir(), 'agent-containers-list-metadata-'));
   for (const name of ['zeta', 'alpha', 'middle']) await saveMetadata(stateDir, { ...metadata, name, branch: `agent-containers/${name}`, worktree: join(worktreeRoot, name) });

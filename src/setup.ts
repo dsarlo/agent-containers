@@ -96,32 +96,34 @@ async function localChecks(config: AgentContainersConfig, runner: ProcessRunner,
   try { await getProductionStateDurabilityAdapter().assertStateWriteSupport(); } catch { durabilityReady = false; }
   const workspaceChecks: DoctorCheck[] = [];
   if (options.workspaceName && options.stateDir) {
-    const metadata = await attemptValue(() => loadMetadata(options.stateDir!, options.workspaceName!));
-    if (!metadata) workspaceChecks.push(action('local.workspace.metadata', `No local workspace metadata exists for ${options.workspaceName}.`, 'provisioned-runtime'));
-    else if (!('repoRoot' in metadata)) workspaceChecks.push(action('local.workspace.metadata', `Workspace ${options.workspaceName} belongs to the phase-gated Codespaces backend.`, 'provisioned-runtime'));
+    const metadata = await observe(() => loadMetadata(options.stateDir!, options.workspaceName!));
+    const recovery = await observe(() => loadManualRecovery(options.stateDir!, options.workspaceName!));
+    if (metadata.error) workspaceChecks.push(action('local.workspace.metadata', `Local workspace metadata for ${options.workspaceName} is unreadable or corrupt; recovery is required before treating the provisioned runtime as stopped.`, 'provisioned-runtime'));
+    else if (!metadata.value) workspaceChecks.push(action('local.workspace.metadata', `No local workspace metadata exists for ${options.workspaceName}.`, 'provisioned-runtime'));
+    else if (!('repoRoot' in metadata.value)) workspaceChecks.push(action('local.workspace.metadata', `Workspace ${options.workspaceName} belongs to the phase-gated Codespaces backend.`, 'provisioned-runtime'));
     else {
       const currentRoot = await attempt(runner, 'git', ['rev-parse', '--show-toplevel'], root);
-      if (currentRoot?.code !== 0 || currentRoot.stdout.trim() !== metadata.repoRoot) {
+      if (currentRoot?.code !== 0 || currentRoot.stdout.trim() !== metadata.value.repoRoot) {
         workspaceChecks.push(action('local.workspace.metadata', `Workspace ${options.workspaceName} belongs to a different repository root.`, 'provisioned-runtime'));
       } else {
         workspaceChecks.push({ ...ready('local.workspace.metadata', `Local workspace metadata for ${options.workspaceName} is valid.`), phase: 'provisioned-runtime' });
-        let recovery;
-        let recoveryUnreadable = false;
-        try { recovery = await loadManualRecovery(options.stateDir!, options.workspaceName!); }
-        catch { recoveryUnreadable = true; }
-        if (recoveryUnreadable) workspaceChecks.push(action('local.workspace.recovery', 'Manual recovery journal is unreadable or corrupt; recovery is required before treating the provisioned runtime as stopped.', 'provisioned-runtime'));
-        else if (recovery) workspaceChecks.push(action('local.workspace.recovery', `Local workspace may still be active because durable manual recovery is required (${recovery.reason}). Run ac recover ${options.workspaceName} --yes --remote-command-stopped after verifying remote state.`, 'provisioned-runtime'));
-        else if (!metadata.containerId) workspaceChecks.push(action('local.workspace.runtime', 'Local workspace is stopped; no recorded Dev Container is running.', 'provisioned-runtime'));
-       else if (!isCanonicalContainerId(metadata.containerId)) {
-         workspaceChecks.push(action('local.workspace.runtime', 'Recorded container identity is not a canonical full Docker ID; refusing runtime probe.', 'provisioned-runtime'));
-       } else {
-         const inspected = await attempt(runner, 'docker', ['inspect', '--format', '{{.Id}}\n{{index .Config.Labels "devcontainer.local_folder"}}\n{{.State.Running}}', metadata.containerId], root);
-         const [id, worktree, running] = inspected?.stdout.trim().split('\n') ?? [];
-         workspaceChecks.push(inspected?.code === 0 && id === metadata.containerId && worktree === metadata.worktree && running === 'true'
-          ? { ...ready('local.workspace.runtime', `Recorded Dev Container ${metadata.containerId} is running.`), phase: 'provisioned-runtime' }
-          : action('local.workspace.runtime', `Recorded Dev Container ${metadata.containerId} is stopped or cannot be inspected.`, 'provisioned-runtime'));
-      }
-      }
+        if (recovery.error) workspaceChecks.push(action('local.workspace.recovery', 'Manual recovery journal is unreadable or corrupt; recovery is required before treating the provisioned runtime as stopped.', 'provisioned-runtime'));
+        else if (recovery.value) workspaceChecks.push(action('local.workspace.recovery', `Local workspace may still be active because durable manual recovery is required (${recovery.value.reason}). Run ac recover ${options.workspaceName} --yes --remote-command-stopped after verifying remote state.`, 'provisioned-runtime'));
+        else if (!metadata.value.containerId) workspaceChecks.push(action('local.workspace.runtime', 'Local workspace is stopped; no recorded Dev Container is running.', 'provisioned-runtime'));
+        else if (!isCanonicalContainerId(metadata.value.containerId)) {
+          workspaceChecks.push(action('local.workspace.runtime', 'Recorded container identity is not a canonical full Docker ID; refusing runtime probe.', 'provisioned-runtime'));
+        } else {
+          const inspected = await attempt(runner, 'docker', ['inspect', '--format', '{{.Id}}\n{{index .Config.Labels "devcontainer.local_folder"}}\n{{.State.Running}}', metadata.value.containerId], root);
+          const [id, worktree, running] = inspected?.stdout.trim().split('\n') ?? [];
+          workspaceChecks.push(inspected?.code === 0 && id === metadata.value.containerId && worktree === metadata.value.worktree && running === 'true'
+           ? { ...ready('local.workspace.runtime', `Recorded Dev Container ${metadata.value.containerId} is running.`), phase: 'provisioned-runtime' }
+           : action('local.workspace.runtime', `Recorded Dev Container ${metadata.value.containerId} is stopped or cannot be inspected.`, 'provisioned-runtime'));
+       }
+       }
+     }
+    if (metadata.error || !metadata.value || !('repoRoot' in metadata.value) || recovery.error || recovery.value) {
+      if (recovery.error) workspaceChecks.push(action('local.workspace.recovery', 'Manual recovery journal is unreadable or corrupt; recovery is required before treating the provisioned runtime as stopped.', 'provisioned-runtime'));
+      else if (recovery.value) workspaceChecks.push(action('local.workspace.recovery', `Local workspace may still be active because durable manual recovery is required (${recovery.value.reason}). Run ac recover ${options.workspaceName} --yes --remote-command-stopped after verifying remote state.`, 'provisioned-runtime'));
     }
   }
   return [
@@ -196,6 +198,7 @@ function boundedRunner(runner: ProcessRunner, options: DoctorOptions): ProcessRu
 }
 async function attempt(runner: ProcessRunner, command: string, args: string[], cwd: string): Promise<ProcessResult | undefined> { try { return await runner.run(command, args, { cwd }); } catch { return undefined; } }
 async function attemptValue<T>(operation: () => Promise<T>): Promise<T | undefined> { try { return await operation(); } catch { return undefined; } }
+async function observe<T>(operation: () => Promise<T>): Promise<{ value: T; error?: undefined } | { value?: undefined; error: true }> { try { return { value: await operation() }; } catch { return { error: true }; } }
 function result(id: string, ok: boolean, yes: string, no: string): DoctorCheck { return ok ? ready(id, yes) : action(id, no); }
 function ready(id: string, summary: string): DoctorCheck { return { id, backend: id.startsWith('local.') ? 'local' : 'codespaces', phase: 'pre-provision', state: 'ready', summary, remediation: [] }; }
 function action(id: string, summary: string, phase: 'pre-provision' | 'provisioned-runtime' = 'pre-provision'): DoctorCheck { return { id, backend: id.startsWith('local.') ? 'local' : 'codespaces', phase, state: 'action-required', summary, remediation: [`Correct ${id} prerequisite.`, `Run ac doctor --backend ${id.startsWith('local.') ? 'local' : 'codespaces'} again.`] }; }

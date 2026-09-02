@@ -235,7 +235,7 @@ function parseV2Config(input: Record<string, unknown>, requireEvidence = true): 
   if ((backends.default !== 'local' && backends.default !== 'codespaces') || !enabled.includes(backends.default)) throw new Error('Invalid configuration: backends.default must be enabled');
   const codespaces = parseCodespaces(backends.codespaces);
   if (codespaces.enabled !== enabled.includes('codespaces')) throw new Error('Invalid configuration: codespaces.enabled must agree with backends.enabled');
-  const config: CodespacesAgentContainersConfig = { version: 2, workspace: { worktreeRoot: requiredString(workspace.worktreeRoot, 'workspace.worktreeRoot'), baseBranch: requiredString(workspace.baseBranch, 'workspace.baseBranch') }, project: { repository: repository(project.repository), ref: optionalString(project.ref, 'project.ref'), expectedOid: optionalOid(project.expectedOid, 'project.expectedOid') }, environment: { devcontainerPath: requiredString(environment.devcontainerPath, 'environment.devcontainerPath'), devcontainerBlobOid: optionalOid(environment.devcontainerBlobOid, 'environment.devcontainerBlobOid') }, backends: { enabled: [...enabled] as ('local' | 'codespaces')[], default: backends.default as 'local' | 'codespaces', local: {}, codespaces } };
+  const config: CodespacesAgentContainersConfig = { version: 2, workspace: { worktreeRoot: requiredString(workspace.worktreeRoot, 'workspace.worktreeRoot'), baseBranch: requiredString(workspace.baseBranch, 'workspace.baseBranch') }, project: { repository: repository(project.repository), ref: optionalRef(project.ref, 'project.ref'), expectedOid: optionalOid(project.expectedOid, 'project.expectedOid') }, environment: { devcontainerPath: requiredString(environment.devcontainerPath, 'environment.devcontainerPath'), devcontainerBlobOid: optionalOid(environment.devcontainerBlobOid, 'environment.devcontainerBlobOid') }, backends: { enabled: [...enabled] as ('local' | 'codespaces')[], default: backends.default as 'local' | 'codespaces', local: {}, codespaces } };
   if (enabled.includes('codespaces') && !config.project.repository) throw new Error('Invalid configuration: project.repository is required when Codespaces is enabled');
   if (enabled.includes('codespaces') && !config.project.ref) throw new Error('Invalid configuration: project.ref is required when Codespaces is enabled');
   if (requireEvidence && enabled.includes('codespaces') && (!config.project.expectedOid || !config.environment.devcontainerBlobOid)) throw new Error('Invalid configuration: Codespaces requires validated project.expectedOid and environment.devcontainerBlobOid evidence');
@@ -463,7 +463,12 @@ function requiredString(value: unknown, label: string): string {
   if (secretShaped(value)) throw new Error(`Invalid configuration: ${label} contains a secret-shaped value`);
   return value;
 }
-function optionalString(value: unknown, label: string): string | undefined { return value === undefined ? undefined : requiredString(value, label); }
+function optionalRef(value: unknown, label: string): string | undefined {
+  if (value === undefined) return undefined;
+  const ref = requiredString(value, label);
+  if (!isStrictGitRef(ref)) throw new Error(`Invalid configuration: ${label} must be a strict Git ref`);
+  return ref;
+}
 function optionalOid(value: unknown, label: string): string | undefined { if (value === undefined) return undefined; const oid = requiredString(value, label); if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(oid)) throw new Error(`Invalid configuration: ${label} must be a full Git object ID`); return oid; }
 function repository(value: unknown): string | undefined { if (value === undefined) return undefined; const result = requiredString(value, 'project.repository'); if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(result)) throw new Error('Invalid configuration: project.repository must be OWNER/REPOSITORY'); return result; }
 function requiredBoolean(value: unknown, label: string): boolean { if (typeof value !== 'boolean') throw new Error(`Invalid configuration: ${label} must be boolean`); return value; }
@@ -521,6 +526,10 @@ export function redactDiagnostic(value: string): string {
 
 function nonEmptyString(value: unknown): value is string {
   return typeof value === 'string' && value.trim().length > 0;
+}
+function isStrictGitRef(value: string): boolean {
+  return /^refs\/(?:heads|tags)\/(?:[A-Za-z0-9][A-Za-z0-9._-]*)(?:\/[A-Za-z0-9][A-Za-z0-9._-]*)*$/.test(value) &&
+    !value.includes('..') && !value.split('/').some((part) => part.endsWith('.') || part.endsWith('.lock'));
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
