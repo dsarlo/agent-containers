@@ -1,6 +1,6 @@
 import { GhCodespacesProvider } from './codespaces.js';
 import { parseConfig } from './config.js';
-import { isCanonicalContainerId, loadMetadata } from './state.js';
+import { isCanonicalContainerId, loadManualRecovery, loadMetadata } from './state.js';
 import { getProductionStateDurabilityAdapter } from './durability.js';
 import type { AgentContainersConfig, BackendKind, BackendSelection, DoctorCheck, DoctorReport, ProcessResult, ProcessRunner, SetupState } from './types.js';
 
@@ -105,7 +105,9 @@ async function localChecks(config: AgentContainersConfig, runner: ProcessRunner,
         workspaceChecks.push(action('local.workspace.metadata', `Workspace ${options.workspaceName} belongs to a different repository root.`, 'provisioned-runtime'));
       } else {
         workspaceChecks.push({ ...ready('local.workspace.metadata', `Local workspace metadata for ${options.workspaceName} is valid.`), phase: 'provisioned-runtime' });
-        if (!metadata.containerId) workspaceChecks.push(action('local.workspace.runtime', 'Local workspace is stopped; no recorded Dev Container is running.', 'provisioned-runtime'));
+        const recovery = await attemptValue(() => loadManualRecovery(options.stateDir!, options.workspaceName!));
+        if (recovery) workspaceChecks.push(action('local.workspace.recovery', `Local workspace may still be active because durable manual recovery is required (${recovery.reason}). Run ac recover ${options.workspaceName} --yes --remote-command-stopped after verifying remote state.`, 'provisioned-runtime'));
+        else if (!metadata.containerId) workspaceChecks.push(action('local.workspace.runtime', 'Local workspace is stopped; no recorded Dev Container is running.', 'provisioned-runtime'));
        else if (!isCanonicalContainerId(metadata.containerId)) {
          workspaceChecks.push(action('local.workspace.runtime', 'Recorded container identity is not a canonical full Docker ID; refusing runtime probe.', 'provisioned-runtime'));
        } else {

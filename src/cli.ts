@@ -36,7 +36,9 @@ export async function runCli(args: string[], cwd = process.cwd(), write: (messag
           if (nonInteractive || source || stdin || rest.includes('--yes') || selection || optionValue(rest, '--default-backend')) throw new UsageError('Interactive init cannot be combined with setup mode, selection, or confirmation options.');
           if (!io.isTTY) throw new UsageError('Interactive configuration requires a TTY; use --non-interactive --stdin for unattended setup.');
           const snapshot = await snapshotInitConfig(root, force);
-          const next = await interactiveConfig(io, root, snapshot.current);
+          const draft = await interactiveConfig(io, root, snapshot.current);
+          const next = await withSetupEvidence(draft, root);
+          await assertEvidenceUnchanged(next, root);
           await initConfigV2(root, next, force, snapshot.expectedHash);
         } else if (source || stdin) {
           if (!rest.includes('--yes')) throw new UsageError('Noninteractive init previews configuration and requires --yes to publish it.');
@@ -82,9 +84,9 @@ export async function runCli(args: string[], cwd = process.cwd(), write: (messag
           write(configurationDiff(current, preview));
           throw new UsageError('Noninteractive configure requires --yes after reviewing the preview; no changes were made.');
         }
-        const validated = interactive ? next : await withSetupEvidence(next, root);
+        const validated = await withSetupEvidence(next, root);
         write(configurationDiff(current, validated));
-        if (!interactive) await assertEvidenceUnchanged(validated, root);
+        await assertEvidenceUnchanged(validated, root);
         write((await saveConfigAtomic(path, validated, expectedCurrentHash)) === 'saved' ? `Saved ${path}` : 'No configuration changes.');
         return 0;
       }
@@ -120,14 +122,14 @@ export async function runCli(args: string[], cwd = process.cwd(), write: (messag
       case 'create': {
         const name = requiredPositional(rest, 'workspace name');
         ensureOptions(rest.slice(1), ['--base', '--backend']);
-        let recoveryWorktree = cwd;
+        const root = await findGitRoot(cwd, nodeProcessRunner);
+        const config = await loadConfig(join(root, '.agent-containers.yml'));
+        const requestedBackend = optionValue(rest.slice(1), '--backend');
+        if (requestedBackend !== undefined && requestedBackend !== 'local' && requestedBackend !== 'codespaces') throw new UsageError('--backend must be local or codespaces.');
+        assertLocalBackendEnabled(config, requestedBackend);
+        let recoveryWorktree = resolve(root, config.workspace.worktreeRoot, name);
         return withWorkspaceLock(stateDir, name, async (signal) => {
-          const root = await findGitRoot(cwd, nodeProcessRunner, signal, 'lifecycle');
-          const config = await loadConfig(join(root, '.agent-containers.yml'));
           recoveryWorktree = resolve(root, config.workspace.worktreeRoot, name);
-          const requestedBackend = optionValue(rest.slice(1), '--backend');
-          if (requestedBackend !== undefined && requestedBackend !== 'local' && requestedBackend !== 'codespaces') throw new UsageError('--backend must be local or codespaces.');
-          assertLocalBackendEnabled(config, requestedBackend);
           const baseBranch = optionValue(rest.slice(1), '--base');
           await assertDevcontainerPathCommittedOnBaseBranch(config, root, nodeProcessRunner, undefined, 'lifecycle', signal);
           if (baseBranch && baseBranch !== config.workspace.baseBranch) {
@@ -279,10 +281,10 @@ function requireCodespacesExperimental(): void {
 
 function assertLocalBackendEnabled(config: import('./types.js').AgentContainersConfig, requestedBackend?: string): void {
   const backend = requestedBackend ?? (config.version === 1 ? 'local' : config.backends.default);
-  if (config.version === 2 && !config.backends.enabled.includes('local')) throw new Error('Local execution is unavailable because local is disabled; Codespaces lifecycle is not implemented in this release.');
   if (backend === 'codespaces') {
     try { assertBackendAvailable('codespaces'); } catch { throw new Error('Codespaces is selected but lifecycle is phase-gated. Select --backend local when local is enabled.'); }
   }
+  if (config.version === 2 && !config.backends.enabled.includes('local')) throw new Error('Local execution is unavailable because local is disabled; Codespaces lifecycle is not implemented in this release.');
 }
 
 function setupConfig(selection: string, defaultBackend?: string): CodespacesAgentContainersConfig {
@@ -350,8 +352,7 @@ async function interactiveConfig(io: CliIo, root: string, current: import('./typ
       settings.secrets.allowedRemoteSecretNames = listPrompt(await ask(prompt, `Allowed remote secret names (names only, comma-separated) [${settings.secrets.allowedRemoteSecretNames.join(',')}]: `, settings.secrets.allowedRemoteSecretNames.join(',')));
       settings.secrets.allowCodespaceGitCredential = booleanPrompt(await ask(prompt, `Allow Codespaces Git credential [${settings.secrets.allowCodespaceGitCredential ? 'yes' : 'no'}]: `, settings.secrets.allowCodespaceGitCredential ? 'yes' : 'no'), 'Allow Codespaces Git credential');
     }
-    let validated = parseCodespacesDraft(JSON.stringify(candidate));
-    if (validated.backends.enabled.includes('codespaces')) validated = await withSetupEvidence(validated, root);
+    const validated = parseCodespacesDraft(JSON.stringify(candidate));
     io.output.write(configurationDiff(current, validated) + '\nNo workspace, key, secret, or GitHub setting will be created or changed.\n');
     if ((await ask(prompt, 'Save this nonsecret configuration? [yes/no]: ', 'no')).toLowerCase() !== 'yes') throw new Error('Configuration cancelled; no changes were made.');
     return validated;

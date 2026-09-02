@@ -3,7 +3,7 @@ import { lstat, link, mkdtemp, readFile, stat, symlink, writeFile } from 'node:f
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
-import { CONFIG_OUTLINE, assertDevcontainerPathCommittedOnBaseBranch, hashConfig, initConfig, initConfigV2, loadConfig, parseCodespacesDraft, saveConfigAtomic, snapshotInitConfig } from '../src/config.js';
+import { CONFIG_OUTLINE, assertDevcontainerPathCommittedOnBaseBranch, hashConfig, initConfig, initConfigV2, loadConfig, parseCodespacesDraft, parseConfig, saveConfigAtomic, snapshotInitConfig } from '../src/config.js';
 import type { AgentContainersConfig, ProcessRunner } from '../src/types.js';
 
 test('base-branch Dev Container validation uses a safe Git path through the injected runner', async () => {
@@ -239,6 +239,18 @@ test('Codespaces setup rejects secret-shaped freeform values before preview or p
     backends: { enabled: ['codespaces'], default: 'codespaces', local: {}, codespaces: { enabled: true, machine: null, geo: 'auto', idleTimeoutMinutes: 30, retentionPeriodMinutes: 10080, maxTotal: 4, maxRunning: 2, maxCreating: 1, maxParallelCommandsPerWorkspace: 1, readiness: { providerTimeoutSeconds: 1200, sshTimeoutSeconds: 120, command: ['curl', 'Authorization: Bearer ghp_abcdefghijklmnopqrstuvwxyz1234567890'], commandTimeoutSeconds: 600 }, transport: { reconnectWindowSeconds: 60, cancelGraceSeconds: 10, remoteLogBytesPerStream: 67108864, remoteLogRetentionHours: 168 }, ports: { allowVisibilityChanges: false, allowPublic: false }, secrets: { allowedRemoteSecretNames: [], allowCodespaceGitCredential: false } } },
   };
   assert.throws(() => parseCodespacesDraft(JSON.stringify(candidate)), /secret-shaped/i);
+});
+
+test('Codespaces secret policy rejects token-shaped identifiers before persistence while retaining capability names', () => {
+  const candidate = { version: 2, workspace: { worktreeRoot: 'worktrees', baseBranch: 'main' }, project: { repository: 'owner/repo', ref: 'refs/heads/main' }, environment: { devcontainerPath: '.devcontainer/devcontainer.json' }, backends: { enabled: ['codespaces'], default: 'codespaces', local: {}, codespaces: { enabled: true, machine: null, geo: 'auto', idleTimeoutMinutes: 30, retentionPeriodMinutes: 10080, maxTotal: 4, maxRunning: 2, maxCreating: 1, maxParallelCommandsPerWorkspace: 1, readiness: { providerTimeoutSeconds: 1200, sshTimeoutSeconds: 120, command: [], commandTimeoutSeconds: 600 }, transport: { reconnectWindowSeconds: 60, cancelGraceSeconds: 10, remoteLogBytesPerStream: 1, remoteLogRetentionHours: 1 }, ports: { allowVisibilityChanges: false, allowPublic: false }, secrets: { allowedRemoteSecretNames: ['DEPLOY_TOKEN'], allowCodespaceGitCredential: false } } } };
+  assert.doesNotThrow(() => parseCodespacesDraft(JSON.stringify(candidate)));
+  candidate.backends.codespaces.secrets.allowedRemoteSecretNames = ['github_pat_abcdefghijklmnopqrstuvwxyz1234567890'];
+  assert.throws(() => parseCodespacesDraft(JSON.stringify(candidate)), (error: Error) => !error.message.includes('github_pat_'));
+});
+
+test('legacy command names reject credential-shaped identifiers without exposing them', () => {
+  const key = 'github_pat_abcdefghijklmnopqrstuvwxyz1234567890';
+  assert.throws(() => parseConfig(`version: 1\ncommands:\n  ${key}: npm test\n`), (error: Error) => !error.message.includes(key));
 });
 
 test('Codespaces setup rejects split curl Authorization headers without exposing their value', () => {

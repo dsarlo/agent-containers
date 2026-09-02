@@ -213,7 +213,8 @@ function validateConfig(config: LocalAgentContainersConfig): string[] {
   if (!nonEmptyString(config.workspace.baseBranch)) errors.push('workspace.baseBranch must be a non-empty string');
   if (!nonEmptyString(config.environment.devcontainerPath)) errors.push('environment.devcontainerPath must be a non-empty string');
   for (const [name, command] of Object.entries(config.commands)) {
-    if (!nonEmptyString(command)) errors.push(`commands.${name} must be a non-empty string`);
+    if (secretShaped(name)) errors.push('commands.[redacted] must not use a secret-shaped command name');
+    else if (!nonEmptyString(command)) errors.push(`commands.${safeField(name)} must be a non-empty string`);
     else if (secretShaped(command)) errors.push(`commands.${safeField(name)} contains a secret-shaped value`);
   }
   return errors;
@@ -254,7 +255,7 @@ function parseCodespaces(input: Record<string, unknown>): CodespacesAgentContain
   rejectUnknownKeys(secrets, ['allowedRemoteSecretNames', 'allowCodespaceGitCredential'], 'backends.codespaces.secrets');
   const result = { enabled: requiredBoolean(input.enabled, 'codespaces.enabled'), machine: input.machine === null ? null : requiredString(input.machine, 'codespaces.machine'), geo: requiredString(input.geo, 'codespaces.geo'), idleTimeoutMinutes: requiredInteger(input.idleTimeoutMinutes, 'idleTimeoutMinutes', 5, 240), retentionPeriodMinutes: requiredInteger(input.retentionPeriodMinutes, 'retentionPeriodMinutes', 1, 43200), maxTotal: requiredInteger(input.maxTotal, 'maxTotal', 1), maxRunning: requiredInteger(input.maxRunning, 'maxRunning', 1), maxCreating: requiredInteger(input.maxCreating, 'maxCreating', 1), maxParallelCommandsPerWorkspace: requiredInteger(input.maxParallelCommandsPerWorkspace, 'maxParallelCommandsPerWorkspace', 1), readiness: { providerTimeoutSeconds: requiredInteger(readiness.providerTimeoutSeconds, 'providerTimeoutSeconds', 1), sshTimeoutSeconds: requiredInteger(readiness.sshTimeoutSeconds, 'sshTimeoutSeconds', 1), command: requiredStrings(readiness.command, 'readiness.command'), commandTimeoutSeconds: requiredInteger(readiness.commandTimeoutSeconds, 'commandTimeoutSeconds', 1) }, transport: { reconnectWindowSeconds: requiredInteger(transport.reconnectWindowSeconds, 'reconnectWindowSeconds', 1), cancelGraceSeconds: requiredInteger(transport.cancelGraceSeconds, 'cancelGraceSeconds', 1), remoteLogBytesPerStream: requiredInteger(transport.remoteLogBytesPerStream, 'remoteLogBytesPerStream', 1), remoteLogRetentionHours: requiredInteger(transport.remoteLogRetentionHours, 'remoteLogRetentionHours', 1) }, ports: { allowVisibilityChanges: requiredBoolean(ports.allowVisibilityChanges, 'ports.allowVisibilityChanges'), allowPublic: requiredBoolean(ports.allowPublic, 'ports.allowPublic') }, secrets: { allowedRemoteSecretNames: requiredStrings(secrets.allowedRemoteSecretNames, 'secrets.allowedRemoteSecretNames'), allowCodespaceGitCredential: requiredBoolean(secrets.allowCodespaceGitCredential, 'secrets.allowCodespaceGitCredential') } };
   if (result.maxRunning > result.maxTotal || result.maxCreating > result.maxTotal || result.ports.allowPublic || result.ports.allowVisibilityChanges) throw new Error('Invalid configuration: capacity limits must not exceed maxTotal and public ports or visibility changes are unsupported');
-  if (new Set(result.secrets.allowedRemoteSecretNames).size !== result.secrets.allowedRemoteSecretNames.length || result.secrets.allowedRemoteSecretNames.some((name) => !/^[A-Za-z_][A-Za-z0-9_]*$/.test(name))) throw new Error('Invalid configuration: remote secret capabilities must be unique environment names');
+  if (new Set(result.secrets.allowedRemoteSecretNames).size !== result.secrets.allowedRemoteSecretNames.length || result.secrets.allowedRemoteSecretNames.some((name) => !/^[A-Za-z_][A-Za-z0-9_]*$/.test(name) || secretShaped(name))) throw new Error('Invalid configuration: remote secret capabilities must be unique nonsecret environment names');
   rejectCredentialArgv(result.readiness.command, 'backends.codespaces.readiness.command');
   return result;
 }
@@ -328,11 +329,17 @@ export async function saveConfigAtomic(path: string, next: AgentContainersConfig
       }
       await options.afterCheckBeforePublish?.();
       if (expectedCurrentHash !== undefined) {
-        // POSIX has no atomic replace-if-content-hash primitive. Publishing an
-        // expected generation would falsely claim protection from independent
-        // writers, so constrained writes use atomic create-only publication.
-        await link(temporary, path);
-        await rm(temporary, { force: false });
+        // The durable lock serializes cooperating Agent Containers writers.
+        // Independent writers are checked above, but POSIX has no external
+        // content-CAS after that final observation.
+        if (expectedCurrentHash === null && await adapter.publicationMode() === 'recoverable') {
+          if (!adapter.moveFileNoReplaceWriteThrough) throw new Error('Native write-through no-replace publication is unavailable; refusing first configuration publication.');
+          await adapter.moveFileNoReplaceWriteThrough(temporary, path);
+        } else if (expectedCurrentHash === null) {
+          await link(temporary, path);
+          await rm(temporary, { force: false });
+        } else if (await adapter.publicationMode() === 'strict') await rename(temporary, path);
+        else await adapter.moveFileWriteThrough(temporary, path);
         if (await adapter.publicationMode() === 'strict') {
           try { await adapter.syncDirectory(directory); }
           catch (error: unknown) { throw new Error(`Configuration publication committed configuration is present but directory durability confirmation failed: ${error instanceof Error ? error.message : String(error)}. Reload and review the committed configuration before retrying.`, { cause: error }); }
@@ -494,7 +501,7 @@ function secretShaped(value: string): boolean {
   return /(?:-----BEGIN [A-Z ]*PRIVATE KEY-----|\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|glpat-[A-Za-z0-9_-]{20,}|sk-[A-Za-z0-9_-]{20,})\b|\bauthorization\s*:\s*bearer(?:\s+\S+)?|\b(?:access[-_]?token|client[-_]?secret|token|password|secret|api[_-]?key)\s*[:=]\s*\S+)/i.test(value);
 }
 
-function safeField(value: string): string { return /(?:token|password|secret|credential|key)/i.test(value) ? '[redacted]' : value; }
+function safeField(value: string): string { return secretShaped(value) || /(?:token|password|secret|credential|key)/i.test(value) ? '[redacted]' : value; }
 export function redactConfig<T>(value: T): T {
   if (Array.isArray(value)) return value.map(redactConfig) as T;
   if (!isRecord(value)) return typeof value === 'string' && secretShaped(value) ? '[redacted]' as T : value;

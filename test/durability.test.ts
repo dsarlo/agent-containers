@@ -69,6 +69,15 @@ test('native Windows access-denied move failures map to EPERM', async () => {
   );
 });
 
+test('native Windows first-publication adapter uses a no-replace write-through operation', async () => {
+  let called = false;
+  const adapter = createNativeDurabilityAdapter(binding({
+    moveFileNoReplaceWriteThrough: (source, destination) => { called = true; return { ok: true, source, destination, method: 'move-file-write-through' }; },
+  }));
+  await adapter.moveFileNoReplaceWriteThrough?.('/state/source', '/state/destination');
+  assert.equal(called, true);
+});
+
 test('a native Windows contention result retains its machine-readable code and serializes lifecycle locks', async () => {
   const stateDir = join(await mkdtemp(join(tmpdir(), 'agent-containers-windows-contention-')), 'state');
   const adapter = createNativeDurabilityAdapter(binding({

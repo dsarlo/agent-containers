@@ -8,6 +8,7 @@ import { discoverProjectSetup, doctor, validateCodespacesSetup } from '../src/se
 import type { CodespacesAgentContainersConfig, ProcessRunner } from '../src/types.js';
 import type { StateDurabilityAdapter } from '../src/durability.js';
 import { resolveExecutionBackend } from '../src/backend.js';
+import { recordManualRecovery, saveMetadata, setStateDurabilityAdapterForTesting } from '../src/state.js';
 
 const codespaces: CodespacesAgentContainersConfig = { version: 2, workspace: { worktreeRoot: 'worktrees', baseBranch: 'main' }, project: { repository: 'owner/repo', ref: 'refs/heads/main', expectedOid: '0123456789012345678901234567890123456789' }, environment: { devcontainerPath: '.devcontainer/devcontainer.json', devcontainerBlobOid: 'abcdefabcdefabcdefabcdefabcdefabcdefabcd' }, backends: { enabled: ['codespaces'], default: 'codespaces', local: {}, codespaces: { enabled: true, machine: null, geo: 'auto', idleTimeoutMinutes: 30, retentionPeriodMinutes: 10080, maxTotal: 4, maxRunning: 2, maxCreating: 1, maxParallelCommandsPerWorkspace: 1, readiness: { providerTimeoutSeconds: 1200, sshTimeoutSeconds: 120, command: [], commandTimeoutSeconds: 600 }, transport: { reconnectWindowSeconds: 60, cancelGraceSeconds: 10, remoteLogBytesPerStream: 67108864, remoteLogRetentionHours: 168 }, ports: { allowVisibilityChanges: false, allowPublic: false }, secrets: { allowedRemoteSecretNames: [], allowCodespaceGitCredential: false } } } };
 const durability: StateDurabilityAdapter = { publicationMode: async () => 'strict', assertStateWriteSupport: async () => undefined, syncFile: async () => undefined, syncDirectory: async () => undefined, moveFileWriteThrough: async () => undefined };
@@ -211,6 +212,23 @@ test('doctor reports persisted immutable evidence drift as action-required', asy
   assert.equal(report.checks.find((check) => check.id === 'codespaces.devcontainer')?.state, 'action-required');
 });
 
+test('local doctor reports a no-container workspace with every manual recovery reason as possibly active', async () => {
+  const stateDir = join(await mkdtemp(join(tmpdir(), 'agent-containers-doctor-recovery-')), 'state');
+  const root = '/repo';
+  setStateDurabilityAdapterForTesting(durability);
+  try {
+    for (const reason of ['operation-may-be-active', 'remote-exec-interrupted', 'devcontainer-up-ambiguous', 'local-process-reap-unconfirmed'] as const) {
+      const name = `safe-${reason.replaceAll('-', '').slice(0, 12)}`;
+      await saveMetadata(stateDir, { version: 1, name, repoRoot: root, worktree: `${root}/worktrees/${name}`, branch: `agent-containers/${name}`, baseRef: 'refs/heads/main', devcontainerPath: '.devcontainer/devcontainer.json', createdAt: '2026-01-01T00:00:00.000Z' });
+      await recordManualRecovery(stateDir, name, { reason, containerIds: [], worktree: `${root}/worktrees/${name}` });
+      const report = await doctor({ version: 1, workspace: { worktreeRoot: 'worktrees', baseBranch: 'main' }, environment: { devcontainerPath: '.devcontainer/devcontainer.json' }, commands: {} }, 'local', { async run(_command, args) { return { code: 0, stdout: args[0] === 'rev-parse' ? `${root}\n` : '--relative-paths\n', stderr: '' }; } }, root, { stateDir, workspaceName: name });
+      const recovery = report.checks.find((check) => check.id === 'local.workspace.recovery');
+      assert.equal(recovery?.state, 'action-required');
+      assert.match(recovery?.summary ?? '', /may still be active/);
+    }
+  } finally { setStateDurabilityAdapterForTesting(undefined); }
+});
+
 test('v2 setup drafts may omit discovered evidence, while persisted v2 configurations may not', () => {
   const draft = structuredClone(codespaces);
   delete draft.project.expectedOid;
@@ -221,7 +239,7 @@ test('v2 setup drafts may omit discovered evidence, while persisted v2 configura
   assert.throws(() => parseConfig(JSON.stringify(draft)), /requires validated project.expectedOid/);
 });
 
-test('existing files are never replaced because content-hash CAS cannot protect against independent writers', async () => {
+test('cooperating expected-generation writers replace exactly one unchanged configuration', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'agent-containers-setup-race-'));
   const path = join(directory, '.agent-containers.yml');
   await writeFile(path, JSON.stringify(codespaces));
@@ -232,9 +250,9 @@ test('existing files are never replaced because content-hash CAS cannot protect 
     saveConfigAtomic(path, codespaces, expected, { durabilityAdapter: durability }),
     saveConfigAtomic(path, alternate, expected, { durabilityAdapter: durability }),
   ]);
-  assert.equal(results.filter((result) => result.status === 'fulfilled').length, 0);
-  assert.equal(results.filter((result) => result.status === 'rejected').length, 2);
-  assert.equal(await readFile(path, 'utf8'), JSON.stringify(codespaces));
+  assert.equal(results.filter((result) => result.status === 'fulfilled').length, 1);
+  assert.equal(results.filter((result) => result.status === 'rejected').length, 1);
+  assert.ok((await readFile(path, 'utf8')).includes('"machine"'));
 });
 
 test('expected-absence contenders publish at most one configuration', async () => {
@@ -262,7 +280,7 @@ test('configuration CAS preserves a non-cooperating writer that changes the file
   assert.equal(await readFile(path, 'utf8'), 'external edit');
 });
 
-test('no-replace publication preserves an external writer arriving after the final check', async () => {
+test('expected-absence publication preserves an external writer arriving after the final check', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'agent-containers-config-post-check-race-'));
   const path = join(directory, '.agent-containers.yml');
   await assert.rejects(() => saveConfigAtomic(path, codespaces, null, {
@@ -402,6 +420,7 @@ test('configuration lock release preserves a replacement owner in recoverable Wi
         await writeFile(join(lock, 'owner.json'), JSON.stringify({ pid: 99, operation: 'configuration-publication', token: 'replacement', createdAt: '2026-01-01T00:00:00.000Z' }));
       }
     },
+    moveFileNoReplaceWriteThrough: async (source, destination) => { await rename(source, destination); },
   };
   assert.equal(await saveConfigAtomic(path, codespaces, null, { durabilityAdapter: recoverable }), 'saved');
   assert.match(await readFile(join(lock, 'owner.json'), 'utf8'), /replacement/);
