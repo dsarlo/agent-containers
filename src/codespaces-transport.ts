@@ -760,6 +760,7 @@ export function helperDeps(deps: RemoteTransportDependencies): Parameters<typeof
     provider: deps.provider,
     root: deps.root,
     sshTimeoutMs: deps.sshTimeoutMs,
+    signal: deps.detachSignal,
     now: deps.now,
     verifyKnown: true,
   };

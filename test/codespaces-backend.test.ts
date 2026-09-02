@@ -326,6 +326,34 @@ test('the Codespaces backend executes a durable pipe command behind the experime
   }
 });
 
+test('backend forwards a second interrupt so a pending cancel proof records unknown promptly (N13)', async () => {
+  const fixture = await transportFixture({ cancelGraceMs: 60_000, reconnectBudgetMs: 60_000 });
+  const previous = process.env.AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES;
+  try {
+    process.env.AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES = '1';
+    const commandId = 'cmd-backend-second-interrupt';
+    fixture.helper.configure({ commandId, outputs: [], exitCode: null, stayRunning: true, cancelPolicy: 'verify', cancelProofDelayMs: 60_000 });
+    const backend = createCodespacesExecutionBackend({ stateDir: fixture.stateDir, config: fixture.deps.config, runner: fixture.runner, root: fixture.fixture.root, spawner: fixture.deps.spawner });
+    const handle = { kind: 'codespaces' as const, id: fixture.metadata.workspaceId, name: fixture.metadata.remote.name, environmentId: fixture.metadata.remote.environmentId };
+    const first = new AbortController();
+    const second = new AbortController();
+    const events: import('../src/types.js').CommandEvent[] = [];
+    const consume = (async () => { for await (const event of backend.execute(handle, { commandId, argv: ['sleep', '9'], mode: 'pipe' }, first.signal, second.signal)) events.push(event); })();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    first.abort();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    second.abort();
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      await Promise.race([consume, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error('second interrupt did not preempt the cancel proof')), 1000); })]);
+    } finally { if (timer) clearTimeout(timer); }
+    assert.equal(events.at(-1)?.type, 'cancel-unknown');
+  } finally {
+    if (previous === undefined) delete process.env.AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES;
+    else process.env.AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES = previous;
+  }
+});
+
 function bytes(...values: number[]): Uint8Array { return Uint8Array.from(values); }
 
 test('backend accepts empty argv tokens and preserves them in the framed corpus end to end (N3)', async () => {

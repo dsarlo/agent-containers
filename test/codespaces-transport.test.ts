@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { transportFixture, COMMAND_ID, type TransportFixture } from './transport-fixtures.js';
+import { transportFixture, COMMAND_ID, helperBootstrapRunner, type TransportFixture } from './transport-fixtures.js';
 import { executeRemoteCommand, attachRemoteCommand } from '../src/codespaces-transport.js';
 import { loadCommandRequest, loadCommandOffsets, loadCommandStatus, loadCommandRecovery } from '../src/codespaces-command.js';
 import { loadMetadata } from '../src/state.js';
@@ -310,6 +310,45 @@ test('a pre-aborted signal cancels deterministically instead of hanging (N7)', a
   })();
   await withSettleGuard(consumption, 'pre-aborted execute did not settle');
   assert.equal(events.at(-1)?.type, 'cancel-unknown', 'a pre-aborted execute must yield a bounded cancel-unknown, never a hang');
+});
+
+test('a second interrupt aborts an in-flight helper inspection probe before cancel proof settles (N13)', async () => {
+  const base = helperBootstrapRunner();
+  let stallInspection = false;
+  let probeAborted = false;
+  const runner = {
+    async run(command: string, args: string[], options?: { signal?: AbortSignal }) {
+      const remote = args.slice(args.indexOf('--') + 1).join(' ');
+      if (stallInspection && remote.startsWith('sha256sum ')) {
+        return await new Promise<never>((_, reject) => {
+          const onAbort = () => {
+            probeAborted = true;
+            const error = new Error('inspection aborted');
+            error.name = 'AbortError';
+            reject(error);
+          };
+          options?.signal?.addEventListener('abort', onAbort, { once: true });
+          if (options?.signal?.aborted) onAbort();
+        });
+      }
+      return base.run(command, args, options);
+    },
+  };
+  const fixture = await transportFixture({ runner, cancelGraceMs: 60_000, reconnectBudgetMs: 60_000 });
+  fixture.helper.configure({ commandId: COMMAND_ID, outputs: [], exitCode: null, stayRunning: true, cancelPolicy: 'verify', cancelProofDelayMs: 60_000 });
+  const first = new AbortController();
+  const second = new AbortController();
+  const events: CommandEvent[] = [];
+  const consume = (async () => { for await (const event of executeRemoteCommand({ ...fixture.deps, signal: first.signal, detachSignal: second.signal }, pipeInput())) events.push(event); })();
+  for (let attempt = 0; attempt < 20 && !events.some((event) => event.type === 'started'); attempt += 1) await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.ok(events.some((event) => event.type === 'started'), 'initial execution must be live before testing post-abort inspection');
+  stallInspection = true;
+  first.abort();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  second.abort();
+  await withSettleGuard(consume, 'second interrupt did not abort helper inspection', 1000);
+  assert.equal(probeAborted, true, 'detach signal must reach the controlled inspection probe');
+  assert.equal(events.at(-1)?.type, 'cancel-unknown');
 });
 
 test('a helper protocol mismatch on the serve handshake blocks execution fail-closed (N14)', async () => {

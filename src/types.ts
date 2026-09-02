@@ -62,7 +62,7 @@ export interface ExecutionBackend {
   create(request: { name: string; backend: BackendKind }, signal?: AbortSignal): Promise<WorkspaceHandle>;
   observe(handle: WorkspaceHandle, signal?: AbortSignal): Promise<WorkspaceObservation>;
   waitReady(handle: WorkspaceHandle, signal?: AbortSignal): AsyncIterable<WorkspaceObservation | ReadinessEvent>;
-  execute(handle: WorkspaceHandle, request: RemoteCommandRequest, signal?: AbortSignal): AsyncIterable<CommandEvent>;
+  execute(handle: WorkspaceHandle, request: RemoteCommandRequest, signal?: AbortSignal, detachSignal?: AbortSignal): AsyncIterable<CommandEvent>;
   attach(handle: WorkspaceHandle, commandId: string, signal?: AbortSignal): AsyncIterable<CommandEvent>;
   cancel(handle: WorkspaceHandle, commandId: string, signal?: AbortSignal): Promise<void>;
   recover(handle: WorkspaceHandle, signal?: AbortSignal): Promise<void>;

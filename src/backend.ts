@@ -104,7 +104,7 @@ export function createCodespacesExecutionBackend(deps: CodespacesExecutionBacken
       const metadata = await loadCodespacesHandleRecord(deps.stateDir, handle);
       yield* waitCodespacesReady({ stateDir: deps.stateDir, name: metadata.name, provider, config: deps.config, signal });
     },
-    async *execute(handle, request, signal) {
+    async *execute(handle, request, signal, detachSignal) {
       requireGate();
       if (handle.kind !== 'codespaces') throw new Error('Backend handle mismatch: expected codespaces.');
       assertRemoteRequest(request);
@@ -112,7 +112,7 @@ export function createCodespacesExecutionBackend(deps: CodespacesExecutionBacken
       const logger = (input: Parameters<typeof recordCodespacesEvent>[1]) => recordCodespacesEvent(deps.stateDir, input);
       yield* executeRemoteCommand({
         stateDir: deps.stateDir, metadata, provider, root: deps.root, config: deps.config,
-        spawner: deps.spawner ?? createNodeSshSpawner(), signal, logger,
+        spawner: deps.spawner ?? createNodeSshSpawner(), signal, detachSignal, logger,
       }, {
         commandId: request.commandId,
         argv: request.argv,

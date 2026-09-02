@@ -71,6 +71,7 @@ export class MockSshSession {
   private failure: Error | null = null;
   private inputEnded = false;
   private closed = false;
+  private readonly closeWaiters: Array<() => void> = [];
 
   constructor(
     readonly input: NodeJS.ReadableStream,
@@ -126,8 +127,17 @@ export class MockSshSession {
     await this.write(encodeFrame(HelperFrameType.output, encodeOutputEvent(code, offset, bytes)));
   }
 
+  get isClosed(): boolean { return this.closed; }
+
+  async untilClosed(): Promise<void> {
+    if (this.closed) return;
+    await new Promise<void>((resolve) => this.closeWaiters.push(resolve));
+  }
+
   destroy(): void {
+    if (this.closed) return;
     this.closed = true;
+    while (this.closeWaiters.length > 0) (this.closeWaiters.shift() as () => void)();
     try { this.output.end(); } catch { /* closed */ }
   }
 }
@@ -237,7 +247,15 @@ async function handleRequest(helper: MockRemoteHelper, session: MockSshSession, 
       if (policy === 'never') {
         return;
       }
-      if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay));
+      if (delay > 0) {
+        await new Promise<void>((resolve) => {
+          const timer = setTimeout(resolve, delay);
+          void session.untilClosed().then(() => { clearTimeout(timer); resolve(); });
+        });
+        // A transport cancellation preempts the synthetic proof; never retain
+        // this mock timer or emit a proof into a closed session.
+        if (session.isClosed) return;
+      }
       record.exited = true;
       record.exitCode = 130;
       const cancelledAt = new Date().toISOString();

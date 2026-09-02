@@ -77,6 +77,8 @@ export interface RemoteHelperBootstrapDependencies {
   /** Package root containing native/helper/manifest.json and bin artifacts. */
   root: string;
   sshTimeoutMs?: number;
+  /** Cancels controlled remote helper bootstrap/inspection probes. */
+  signal?: AbortSignal;
   now?: () => string;
   /** When a matching helper bootstrap record exists, verify instead of copying. */
   verifyKnown?: boolean;
@@ -241,7 +243,7 @@ export async function bootstrapRemoteHelper(deps: RemoteHelperBootstrapDependenc
   const now = deps.now ?? (() => new Date().toISOString());
   const known = await loadLocalHelperBootstrap(deps.stateDir, deps.workspaceName);
   if (deps.verifyKnown && known && known.sha256 && known.protocolVersion === HELPER_PROTOCOL_VERSION && known.arch) {
-    inspectRemoteHelper(deps, known.arch, known.file);
+    await inspectRemoteHelper(deps, known.arch, known.file);
     return knownResult(known, now());
   }
   const uname = await probeUname(deps);
@@ -302,12 +304,12 @@ export async function inspectRemoteHelper(deps: RemoteHelperBootstrapDependencie
 }
 
 async function probeUname(deps: RemoteHelperBootstrapDependencies): Promise<string> {
-  const output = await deps.provider.remoteSshProbe(deps.remoteName, ['uname', '-m'], { timeoutMs: deps.sshTimeoutMs });
+  const output = await deps.provider.remoteSshProbe(deps.remoteName, ['uname', '-m'], { timeoutMs: deps.sshTimeoutMs, signal: deps.signal });
   return output.trim();
 }
 
 async function runFixed(deps: RemoteHelperBootstrapDependencies, argv: readonly string[], options: { input?: Uint8Array } = {}): Promise<string> {
-  return deps.provider.remoteCommand(deps.remoteName, argv as readonly string[], { timeoutMs: deps.sshTimeoutMs, input: options.input });
+  return deps.provider.remoteCommand(deps.remoteName, argv as readonly string[], { timeoutMs: deps.sshTimeoutMs, input: options.input, signal: deps.signal });
 }
 
 async function verifyFileOnRemote(deps: RemoteHelperBootstrapDependencies, path: string, artifact: HelperArtifact): Promise<void> {
