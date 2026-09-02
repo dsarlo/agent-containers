@@ -189,13 +189,18 @@ jobs:
           node-version: 20.19.0
           cache: npm
       - run: npm ci
-      - name: Install the arm64 cross compiler
-        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
-      - name: Verify committed static Linux helper pins before any rebuild
-        run: npm run verify:native-helper-packaging-contract
-      - run: npm run test:native-helper-packaging-contract
-      - name: Rebuild static Linux helpers outside the repository and compare committed pins
-        run: CC=gcc CC_ARM64=aarch64-linux-gnu-gcc npm run verify:helper-reproducible
+      - name: Build the pinned helper toolchain
+        run: docker build --pull=false --tag agent-containers-helper-toolchain:ci --file native/helper/Dockerfile.toolchain .
+      - name: Rebuild static Linux helpers in the pinned toolchain and compare committed pins
+        shell: bash
+        run: |
+          set -euo pipefail
+          cid="$(docker create -v "$GITHUB_WORKSPACE:/workspace:ro" agent-containers-helper-toolchain:ci sh -lc 'set -e; mkdir /out; make -C /workspace/native/helper BIN_DIR=/out')"
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          docker start -a "$cid"
+          mkdir -p .helper-rebuild
+          docker cp "$cid:/out/." .helper-rebuild/
+          AGENT_CONTAINERS_HELPER_REBUILD_DIR=.helper-rebuild npm run verify:helper-reproducible
       - run: npm run verify:native-helper-packaging-contract
       - run: npm run test:native-helper-packaging-contract
       # actions/upload-artifact v5

@@ -20,6 +20,7 @@ const manifest = JSON.parse(await readFile(resolve(helperDir, 'manifest.json'), 
 const helperC = await readFile(resolve(helperDir, 'helper.c'), 'utf8');
 const protocolTs = await readFile(resolve(repository, 'src', 'codespaces-protocol.ts'), 'utf8');
 const buildHelper = await readFile(resolve(repository, 'scripts', 'build-helper.mjs'), 'utf8');
+const toolchainDockerfile = await readFile(resolve(helperDir, 'Dockerfile.toolchain'), 'utf8');
 const workflow = await readFile(resolve(repository, '.github', 'workflows', 'ci.yml'), 'utf8');
 
 function digest(bytes) {
@@ -110,13 +111,25 @@ for (const script of ['build:helper', 'verify:helper-reproducible', 'verify:nati
 assert.match(packageJson.scripts['build:helper'], /build-helper\.mjs/, 'build:helper must run the reproducible builder');
 assert.match(packageJson.scripts['verify:helper-reproducible'], /verify-reproducible/, 'the reproducibility gate must compare an isolated build without repinning committed artifacts');
 assert.match(packageJson.scripts['verify:native-helper-packaging-contract'], /verify-native-helper-packaging-contract\.mjs/, 'verify:native-helper-packaging-contract must run the make-free verifier');
+assert.match(buildHelper, /AGENT_CONTAINERS_HELPER_REBUILD_DIR/, 'the comparison command must accept a pinned-toolchain output directory instead of rebuilding with the host compiler');
 
-// CI must validate committed pins before it compiles anything, then compare a
-// clean outside-tree rebuild. It must never repin the reviewed artifacts.
+// Toolchain provenance is part of the artifact pin: Bookworm base digest and
+// exact compiler/header packages produce the committed helper ELF bytes.
+assert.match(toolchainDockerfile, /^FROM debian@sha256:[0-9a-f]{64}$/m, 'helper toolchain must pin the Debian base image by digest');
+for (const packagePin of ['gcc=4:12.2.0-3', 'gcc-aarch64-linux-gnu=4:12.2.0-3', 'libc6-dev=2.36-9+deb12u14', 'libc6-dev-arm64-cross=2.36-8cross1', 'make=4.3-4.1']) {
+  assert.ok(toolchainDockerfile.includes(packagePin), `helper toolchain must pin ${packagePin}`);
+}
+
+// CI must validate committed pins before it compiles anything, then build the
+// immutable toolchain and compare a clean outside-tree rebuild. It must never
+// repin the reviewed artifacts or use the runner's arbitrary compiler.
 assert.doesNotMatch(workflow, /npm run build:helper/, 'ci must not repin committed helper artifacts before validation');
 const committedPinCheck = workflow.indexOf('npm run verify:native-helper-packaging-contract');
-const reproducibleCheck = workflow.indexOf('npm run verify:helper-reproducible');
-assert.ok(committedPinCheck >= 0 && reproducibleCheck > committedPinCheck, 'ci must verify committed helper pins before the isolated reproducibility rebuild');
+const toolchainBuild = workflow.indexOf('docker build --pull=false');
+const reproducibleCheck = workflow.indexOf('AGENT_CONTAINERS_HELPER_REBUILD_DIR=.helper-rebuild npm run verify:helper-reproducible');
+assert.ok(committedPinCheck >= 0 && toolchainBuild > committedPinCheck && reproducibleCheck > toolchainBuild, 'ci must verify committed helper pins before rebuilding under the pinned toolchain');
+assert.match(workflow, /Dockerfile\.toolchain/, 'ci must build the repository-owned pinned helper toolchain');
+assert.match(workflow, /docker create -v "\$GITHUB_WORKSPACE:\/workspace:ro"/, 'ci must compile helper sources from a read-only checkout');
 assert.match(workflow, /test:native-helper-packaging-contract/, 'ci quality must run the helper packaging negative test');
 assert.match(workflow, /actions\/upload-artifact@[0-9a-f]{40}/, 'ci must upload the pinned helper artifacts with an immutable action SHA');
 

@@ -12,6 +12,7 @@ const verifier = resolve(repository, 'scripts/verify-native-helper-packaging-con
 const fixtureRoot = await mkdtemp(join(tmpdir(), 'agent-containers-native-helper-contract-'));
 
 const filesToMirror = [
+  ['native/helper/Dockerfile.toolchain'],
   ['native/helper/manifest.json'],
   ['native/helper/helper.c'],
   ['native/helper/Makefile'],
@@ -141,6 +142,14 @@ try {
         const pkg = JSON.parse(await readFile(path, 'utf8'));
         delete pkg.scripts['verify:native-helper-packaging-contract'];
         await writeFile(path, `${JSON.stringify(pkg, null, 2)}\n`, 'utf8');
+      },
+    },
+    {
+      name: 'helper CI rebuilds with an arbitrary host compiler instead of the pinned toolchain',
+      mutate: async (root) => {
+        const path = join(root, '.github', 'workflows', 'ci.yml');
+        const workflow = await readFile(path, 'utf8');
+        await writeFile(path, workflow.replace(/docker build --pull=false/, 'CC=gcc CC_ARM64=aarch64-linux-gnu-gcc'));
       },
     },
     {

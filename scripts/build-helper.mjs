@@ -121,10 +121,11 @@ export async function verify() {
 /** Build outside the repository and compare the output to the committed pins. */
 export async function verifyReproducible() {
   const manifest = await verify();
-  const temporaryRoot = await mkdtemp(join(tmpdir(), 'agent-containers-helper-rebuild-'));
-  const outputDir = join(temporaryRoot, 'bin');
+  const suppliedOutputDir = process.env.AGENT_CONTAINERS_HELPER_REBUILD_DIR;
+  const temporaryRoot = suppliedOutputDir ? undefined : await mkdtemp(join(tmpdir(), 'agent-containers-helper-rebuild-'));
+  const outputDir = suppliedOutputDir ? resolve(suppliedOutputDir) : join(temporaryRoot, 'bin');
   try {
-    await build(outputDir);
+    if (!suppliedOutputDir) await build(outputDir);
     for (const [arch, file] of Object.entries(archArtifacts)) {
       const bytes = await readFile(join(outputDir, file));
       const entry = manifest.architectures[arch];
@@ -133,7 +134,7 @@ export async function verifyReproducible() {
       }
     }
   } finally {
-    await rm(temporaryRoot, { recursive: true, force: true });
+    if (temporaryRoot) await rm(temporaryRoot, { recursive: true, force: true });
   }
 }
 
