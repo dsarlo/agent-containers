@@ -6,7 +6,7 @@ import { createHash } from 'node:crypto';
 import test from 'node:test';
 import { createNativeDurabilityAdapter } from '../src/durability.js';
 import * as state from '../src/state.js';
-import { acknowledgeUnconfirmedProcessReap, bootstrapManualRecoveryJournal, listMetadata, loadManualRecovery, loadMetadata, recordManualRecovery, releaseStaleWorkspaceLock, saveMetadata, setStateDurabilityAdapterForTesting, setStateDurableRenameForTesting, setStateJournalStagingWriteForTesting, withWorkspaceLock, type ManualRecovery, type WorkspaceLockOptions, type WorkspaceMetadata } from '../src/state.js';
+import { acknowledgeUnconfirmedProcessReap, bootstrapManualRecoveryJournal, listMetadata, loadManualRecovery, loadMetadata, metadataGeneration, recordManualRecovery, releaseStaleWorkspaceLock, saveMetadata, setStateDurabilityAdapterForTesting, setStateDurableRenameForTesting, setStateJournalStagingWriteForTesting, withWorkspaceLock, type ManualRecovery, type WorkspaceLockOptions, type WorkspaceMetadata } from '../src/state.js';
 import type { ProcessRunner } from '../src/types.js';
 import type { StateDurabilityAdapter } from '../src/durability.js';
 
@@ -68,10 +68,11 @@ test('metadata accepts an explicit v2 local backend and requires a complete stri
     lifecycle: { desired: 'ready' as const, normalized: 'provisioning', providerRawState: 'Provisioning', lastObservedAt: '2026-01-01T00:00:00.000Z', activeOperation: null }, recovery: null,
     cleanup: { remoteStopped: false, remoteDeleted: false, tombstoneWritten: false },
   };
-  await saveMetadata(stateDir, codespaces);
-  assert.deepEqual(await loadMetadata(stateDir, 'safe'), codespaces);
-  await assert.rejects(() => saveMetadata(stateDir, { ...codespaces, worktree: '/repo' } as never), /invalid/);
-  await assert.rejects(() => saveMetadata(stateDir, { ...codespaces, token: 'secret' } as never), /invalid/);
+  const remoteStateDir = await mkdtemp(join(tmpdir(), 'agent-containers-state-remote-'));
+  await saveMetadata(remoteStateDir, codespaces);
+  assert.deepEqual(await loadMetadata(remoteStateDir, 'safe'), codespaces);
+  await assert.rejects(() => saveMetadata(remoteStateDir, { ...codespaces, worktree: '/repo' } as never), /invalid/);
+  await assert.rejects(() => saveMetadata(remoteStateDir, { ...codespaces, token: 'secret' } as never), /invalid/);
 });
 
 test('metadata writes are atomic and never expose a predictable temporary file', async () => {
@@ -81,6 +82,16 @@ test('metadata writes are atomic and never expose a predictable temporary file',
   assert.deepEqual(JSON.parse(content), metadata);
   await writeFile(join(stateDir, 'workspaces', '.safe.json.tmp'), 'partial');
   assert.deepEqual(JSON.parse(await readFile(join(stateDir, 'workspaces', 'safe.json'), 'utf8')), metadata);
+});
+
+test('metadata expected generation and immutable identity reject stale or cross-backend replacement', async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), 'agent-containers-metadata-cas-'));
+  await saveMetadata(stateDir, metadata, { expectedGeneration: null });
+  const observed = await loadMetadata(stateDir, 'safe');
+  assert.ok(observed);
+  await saveMetadata(stateDir, { ...metadata, containerId: 'a'.repeat(64) }, { expectedGeneration: metadataGeneration(observed) });
+  await assert.rejects(() => saveMetadata(stateDir, { ...metadata, containerId: 'b'.repeat(64) }, { expectedGeneration: metadataGeneration(observed) }), /changed concurrently/);
+  await assert.rejects(() => saveMetadata(stateDir, { ...metadata, repoRoot: '/other-repository' }), /immutable backend\/resource identity/);
 });
 
 test('listMetadata reads in bounded batches and returns deterministic workspace-name order', async () => {

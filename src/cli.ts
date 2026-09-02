@@ -2,7 +2,7 @@ import { join, resolve } from 'node:path';
 import { readFile } from 'node:fs/promises';
 import { createInterface } from 'node:readline/promises';
 import { assertDevcontainerPathCommittedOnBaseBranch, configurationDiff, hashConfig, initConfigV2, loadConfig, parseCodespacesDraft, parseConfig, saveConfigAtomic } from './config.js';
-import { doctor, validateCodespacesSetup } from './setup.js';
+import { discoverProjectSetup, doctor, validateCodespacesSetup } from './setup.js';
 import type { CodespacesAgentContainersConfig } from './types.js';
 import { acknowledgeUnconfirmedProcessReap, clearManualRecoveryIfCurrent, defaultStateDir, deleteMetadata, isLocalWorkspaceMetadata, listMetadata, loadManualRecovery, loadMetadata, recordManualRecovery, releaseStaleWorkspaceLock, saveMetadata, withWorkspaceLock } from './state.js';
 import { execNamedWorkspaceLifecycle } from './runtime.js';
@@ -22,7 +22,7 @@ export async function runCli(args: string[], cwd = process.cwd(), write: (messag
     const stateDir = defaultStateDir();
     switch (command) {
       case 'init': {
-        ensureOptions(rest, ['--backends', '--default-backend', '--interactive', '--non-interactive', '--from', '--stdin', '--yes'], ['--interactive', '--non-interactive', '--stdin', '--yes']);
+        ensureOptions(rest, ['--backends', '--default-backend', '--interactive', '--non-interactive', '--from', '--stdin', '--yes', '--force'], ['--interactive', '--non-interactive', '--stdin', '--yes', '--force']);
         const root = await findGitRoot(cwd, nodeProcessRunner);
         const selection = optionValue(rest, '--backends');
         if (selection === 'codespaces' || selection === 'both') requireCodespacesExperimental();
@@ -35,7 +35,7 @@ export async function runCli(args: string[], cwd = process.cwd(), write: (messag
           if (nonInteractive || source || stdin || rest.includes('--yes') || selection || optionValue(rest, '--default-backend')) throw new UsageError('Interactive init cannot be combined with setup mode, selection, or confirmation options.');
           if (!io.isTTY) throw new UsageError('Interactive configuration requires a TTY; use --non-interactive --stdin for unattended setup.');
           const next = await interactiveConfig(io, root);
-          await initConfigV2(root, next);
+          await initConfigV2(root, next, rest.includes('--force'));
         } else if (source || stdin) {
           if (!rest.includes('--yes')) throw new UsageError('Noninteractive init previews configuration and requires --yes to publish it.');
           const next = await loadConfigFromSource(source ? resolve(cwd, source) : undefined, stdin, io.input);
@@ -43,9 +43,9 @@ export async function runCli(args: string[], cwd = process.cwd(), write: (messag
           if (next.backends.enabled.includes('codespaces')) requireCodespacesExperimental();
           const validated = await withSetupEvidence(next, root);
           write(configurationDiff(null, validated));
-          await initConfigV2(root, validated);
-        } else if (!selection) await initConfigV2(root, setupConfig('local'));
-        else await initConfigV2(root, setupConfig(selection, optionValue(rest, '--default-backend')));
+          await initConfigV2(root, validated, rest.includes('--force'));
+        } else if (!selection) await initConfigV2(root, setupConfig('local'), rest.includes('--force'));
+        else await initConfigV2(root, setupConfig(selection, optionValue(rest, '--default-backend')), rest.includes('--force'));
         write(`Wrote ${join(root, '.agent-containers.yml')}`);
         return 0;
       }
@@ -164,6 +164,8 @@ export async function runCli(args: string[], cwd = process.cwd(), write: (messag
         if (!rest.includes('--yes') || !rest.includes('--remote-command-stopped')) {
           throw new UsageError('Usage: agent-containers recover <name> --yes --remote-command-stopped');
         }
+        const recorded = await loadMetadata(stateDir, name);
+        if (recorded && !isLocalWorkspaceMetadata(recorded)) throw new Error(`Workspace "${name}" records the Codespaces backend, which is phase-gated and cannot be recovered by local cleanup.`);
         // Bind this acknowledgement to the exact barrier visible before waiting
         // behind another lifecycle. A later lifecycle must never be cleared by it.
         const acknowledged = await loadManualRecovery(stateDir, name);
@@ -180,6 +182,8 @@ export async function runCli(args: string[], cwd = process.cwd(), write: (messag
         const name = requiredPositional(rest, 'workspace name');
         ensureOnly(rest.slice(1), ['--yes']);
         if (!rest.includes('--yes')) throw new UsageError('Usage: agent-containers unlock <name> --yes');
+        const recorded = await loadMetadata(stateDir, name);
+        if (recorded && !isLocalWorkspaceMetadata(recorded)) throw new Error(`Workspace "${name}" records the Codespaces backend, which is phase-gated and cannot be unlocked by local cleanup.`);
         await releaseStaleWorkspaceLock(stateDir, name);
         write(`Released stale lifecycle lock for ${name}`);
         return 0;
@@ -219,6 +223,10 @@ export async function runCli(args: string[], cwd = process.cwd(), write: (messag
         throw new UsageError(usage());
     }
   } catch (error: unknown) {
+    if (args[0] === 'doctor' && args.includes('--json')) {
+      write(JSON.stringify({ schemaVersion: 1, selectedBackends: [], overall: 'action-required', checks: [{ id: 'configuration', backend: 'local', phase: 'pre-provision', state: 'action-required', summary: 'Configuration or invocation prerequisites could not be verified; no runtime probes were attempted.', remediation: ['Correct the prerequisite.', 'Run ac doctor again.'] }] }, null, 2));
+      return 1;
+    }
     write(`agent-containers: ${error instanceof Error ? error.message : String(error)}`);
     return error instanceof UsageError ? 2 : exitCodeForError(error) ?? 1;
   }
@@ -298,17 +306,19 @@ async function interactiveConfig(io: CliIo, root: string, current: import('./typ
   const prompt = createInterface({ input: io.input, output: io.output, terminal: io.isTTY });
   try {
     io.output.write('Agent Containers Codespaces setup. Enter cancel at any prompt to leave configuration unchanged. Do not enter tokens, keys, or secret values.\n');
-    const prior = current?.version === 2 ? current : undefined;
+    const prior = current?.version === 2 ? structuredClone(current) : undefined;
     const worktreeRoot = await ask(prompt, `Worktree root [${prior?.workspace.worktreeRoot ?? '../.agent-containers-worktrees'}]: `, prior?.workspace.worktreeRoot ?? '../.agent-containers-worktrees');
     const baseBranch = await ask(prompt, `Base branch [${prior?.workspace.baseBranch ?? 'main'}]: `, prior?.workspace.baseBranch ?? 'main');
     const backend = await ask(prompt, `Backend [local|codespaces|both] (${prior ? (prior.backends.enabled.length === 2 ? 'both' : prior.backends.enabled[0]) : 'local'}): `, prior ? (prior.backends.enabled.length === 2 ? 'both' : prior.backends.enabled[0]) : 'local');
     if (backend !== 'local' && backend !== 'codespaces' && backend !== 'both') throw new Error('Backend must be local, codespaces, or both.');
     if (backend !== 'local') requireCodespacesExperimental();
+    // Discovery reads the immutable origin tracking tree, never a mutable local branch.
+    const discovered = backend === 'local' ? undefined : await discoverProjectSetup(root, nodeProcessRunner);
     const defaultBackend = backend === 'both' ? await ask(prompt, `Default backend [local|codespaces] (${prior?.backends.default ?? 'local'}): `, prior?.backends.default ?? 'local') : backend;
     if (defaultBackend !== 'local' && defaultBackend !== 'codespaces') throw new Error('Default backend must be local or codespaces.');
     const devcontainerPath = await ask(prompt, `Committed Dev Container path [${prior?.environment.devcontainerPath ?? '.devcontainer/devcontainer.json'}]: `, prior?.environment.devcontainerPath ?? '.devcontainer/devcontainer.json');
-    const repository = backend === 'local' ? undefined : await ask(prompt, 'Repository [OWNER/REPOSITORY]: ', prior?.project.repository);
-    const ref = backend === 'local' ? undefined : await ask(prompt, `Remote ref [${prior?.project.ref ?? 'refs/heads/main'}]: `, prior?.project.ref ?? 'refs/heads/main');
+    const repository = backend === 'local' ? undefined : await ask(prompt, 'Repository [OWNER/REPOSITORY]: ', prior?.project.repository ?? discovered?.repository);
+    const ref = backend === 'local' ? undefined : await ask(prompt, `Remote ref [${prior?.project.ref ?? discovered?.ref ?? 'refs/heads/main'}]: `, prior?.project.ref ?? discovered?.ref ?? 'refs/heads/main');
     const candidate = setupConfigTemplate(backend, defaultBackend as 'local' | 'codespaces', repository, ref, devcontainerPath);
     candidate.workspace = { worktreeRoot, baseBranch };
     if (backend !== 'local') {

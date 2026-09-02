@@ -62,9 +62,11 @@ export class GhCodespacesProvider {
   async committedDevcontainerBlob(repository: string, expectedOid: string, path: string): Promise<string> {
     assertRepository(repository);
     if (!oid(expectedOid) || !safeRepositoryPath(path)) throw new Error('Dev Container path or expected commit is unsafe.');
-    const value = await this.api(`/repos/${repository}/contents/${encodeURIComponent(path)}?ref=${encodeURIComponent(expectedOid)}`);
-    if (!isRecord(value) || value.type !== 'file' || !oid(value.sha)) throw new Error('Configured Dev Container path is not a committed regular file at the requested immutable commit.');
-    return value.sha;
+    const value = await this.api(`/repos/${repository}/git/trees/${encodeURIComponent(expectedOid)}?recursive=1`);
+    if (!isRecord(value) || !Array.isArray(value.tree)) throw new Error('Configured Dev Container path is not available from the immutable Git tree.');
+    const entry = value.tree.find((candidate) => isRecord(candidate) && candidate.path === path);
+    if (!isRecord(entry) || entry.type !== 'blob' || (entry.mode !== '100644' && entry.mode !== '100755') || !oid(entry.sha)) throw new Error('Configured Dev Container path is not a committed regular non-symlink blob at the requested immutable commit.');
+    return entry.sha;
   }
 
   private async api(path: string): Promise<unknown> {

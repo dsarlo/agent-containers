@@ -350,7 +350,17 @@ export async function loadMetadata(stateDir: string, name: string): Promise<Work
   }
 }
 
-export async function saveMetadata(stateDir: string, metadata: WorkspaceMetadata): Promise<void> {
+export interface MetadataSaveOptions {
+  /** `null` requires absence; a generation binds an update to the observed record. */
+  expectedGeneration?: string | null;
+}
+
+/** A stable generation suitable for an expected-generation metadata publication. */
+export function metadataGeneration(metadata: WorkspaceMetadata): string {
+  return createHash('sha256').update(JSON.stringify(metadata)).digest('hex');
+}
+
+export async function saveMetadata(stateDir: string, metadata: WorkspaceMetadata, options: MetadataSaveOptions = {}): Promise<void> {
   if (!isAgentContainersWorkspace(metadata)) throw new Error('Refusing to save invalid Agent Containers workspace metadata.');
   if (isLocalWorkspaceMetadata(metadata) && metadata.containerId !== undefined && !isCanonicalContainerId(metadata.containerId)) throw new Error('Refusing to save a non-canonical Docker container ID.');
   const path = metadataPath(stateDir, metadata.name);
@@ -358,8 +368,27 @@ export async function saveMetadata(stateDir: string, metadata: WorkspaceMetadata
   const durability = stateDurability();
   await durability.assertStateWriteSupport();
   await ensureDurableDirectory(directory, durability);
+  const current = await loadMetadata(stateDir, metadata.name);
+  if (options.expectedGeneration === null && current) throw new Error(`Metadata for ${metadata.name} changed concurrently; it was created while this operation was in progress.`);
+  if (typeof options.expectedGeneration === 'string' && (!current || metadataGeneration(current) !== options.expectedGeneration)) {
+    throw new Error(`Metadata for ${metadata.name} changed concurrently; reload before retrying.`);
+  }
+  if (current && !sameMetadataIdentity(current, metadata)) {
+    throw new Error(`Metadata for ${metadata.name} has immutable backend/resource identity; refusing replacement.`);
+  }
   const temporaryPath = join(directory, `.${metadata.name}.${randomUUID()}.tmp`);
   await durableReplace(temporaryPath, path, directory, `${JSON.stringify(metadata, null, 2)}\n`, durability);
+}
+
+function sameMetadataIdentity(current: WorkspaceMetadata, next: WorkspaceMetadata): boolean {
+  if (isLocalWorkspaceMetadata(current) !== isLocalWorkspaceMetadata(next)) return false;
+  if (isLocalWorkspaceMetadata(current) && isLocalWorkspaceMetadata(next)) {
+    return current.repoRoot === next.repoRoot && current.worktree === next.worktree && current.branch === next.branch && current.baseRef === next.baseRef && current.devcontainerPath === next.devcontainerPath;
+  }
+  if (!isLocalWorkspaceMetadata(current) && !isLocalWorkspaceMetadata(next)) {
+    return current.workspaceId === next.workspaceId && current.remote.codespaceId === next.remote.codespaceId && current.remote.environmentId === next.remote.environmentId && current.repository.id === next.repository.id;
+  }
+  return false;
 }
 
 export function isCanonicalContainerId(value: unknown): value is string {

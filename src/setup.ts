@@ -1,11 +1,12 @@
 import { GhCodespacesProvider } from './codespaces.js';
 import { parseConfig } from './config.js';
 import { loadMetadata } from './state.js';
+import { getProductionStateDurabilityAdapter } from './durability.js';
 import type { AgentContainersConfig, BackendKind, BackendSelection, DoctorCheck, DoctorReport, ProcessResult, ProcessRunner, SetupState } from './types.js';
 
 export interface CodespacesSetupEvidence { repository: string; requestedRef: string; expectedOid: string; devcontainerPath: string; devcontainerBlobOid: string }
 export interface DoctorOptions { abortSignal?: AbortSignal; timeoutMs?: number; stateDir?: string; workspaceName?: string }
-export interface DiscoveredProjectSetup { repository: string; ref: string; devcontainerPath: string }
+export interface DiscoveredProjectSetup { repository: string; ref: string; expectedOid: string; devcontainerPath: string }
 
 /** Discover only immutable Git-tree inputs suitable for first-project setup. */
 export async function discoverProjectSetup(root: string, runner: ProcessRunner): Promise<DiscoveredProjectSetup> {
@@ -15,7 +16,10 @@ export async function discoverProjectSetup(root: string, runner: ProcessRunner):
   const head = await runner.run('git', ['symbolic-ref', '--quiet', '--short', 'refs/remotes/origin/HEAD'], { cwd: root });
   const branch = head.code === 0 ? /^origin\/([A-Za-z0-9._/-]+)$/.exec(head.stdout.trim())?.[1] : undefined;
   if (!branch || branch.includes('..') || branch.startsWith('/') || branch.endsWith('/')) throw new Error('A safe origin default branch is required for Codespaces discovery.');
-  const ref = `refs/heads/${branch}`;
+  const ref = `refs/remotes/origin/${branch}`;
+  const oidResult = await runner.run('git', ['rev-parse', '--verify', `${ref}^{commit}`], { cwd: root });
+  const expectedOid = oidResult.code === 0 && /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(oidResult.stdout.trim()) ? oidResult.stdout.trim() : undefined;
+  if (!expectedOid) throw new Error(`Could not bind remote-tracking ref ${ref} to an immutable commit.`);
   const tree = await runner.run('git', ['ls-tree', '-r', '-z', ref], { cwd: root });
   if (tree.code !== 0) throw new Error(`Could not read committed Git tree for ${ref}.`);
   const candidates = tree.stdout.split('\0').flatMap((entry) => {
@@ -24,7 +28,7 @@ export async function discoverProjectSetup(root: string, runner: ProcessRunner):
     return [match[2]];
   });
   if (candidates.length !== 1) throw new Error(candidates.length ? 'Codespaces discovery requires exactly one committed regular Dev Container candidate.' : 'Codespaces discovery found no committed regular Dev Container candidate.');
-  return { repository, ref, devcontainerPath: candidates[0] };
+  return { repository, ref: `refs/heads/${branch}`, expectedOid, devcontainerPath: candidates[0] };
 }
 
 function isDevcontainerCandidate(path: string): boolean {
@@ -87,19 +91,26 @@ async function localChecks(config: AgentContainersConfig, runner: ProcessRunner,
   const docker = await attempt(runner, 'docker', ['--version'], root);
   const devcontainer = await attempt(runner, 'devcontainer', ['--version'], root);
   const configured = config.version === 1 || config.backends.enabled.includes('local');
+  let durabilityReady = true;
+  try { await getProductionStateDurabilityAdapter().assertStateWriteSupport(); } catch { durabilityReady = false; }
   const workspaceChecks: DoctorCheck[] = [];
   if (options.workspaceName && options.stateDir) {
     const metadata = await attemptValue(() => loadMetadata(options.stateDir!, options.workspaceName!));
     if (!metadata) workspaceChecks.push(action('local.workspace.metadata', `No local workspace metadata exists for ${options.workspaceName}.`, 'provisioned-runtime'));
     else if (!('repoRoot' in metadata)) workspaceChecks.push(action('local.workspace.metadata', `Workspace ${options.workspaceName} belongs to the phase-gated Codespaces backend.`, 'provisioned-runtime'));
     else {
-      workspaceChecks.push({ ...ready('local.workspace.metadata', `Local workspace metadata for ${options.workspaceName} is valid.`), phase: 'provisioned-runtime' });
-      if (!metadata.containerId) workspaceChecks.push(action('local.workspace.runtime', 'Local workspace is stopped; no recorded Dev Container is running.', 'provisioned-runtime'));
+      const currentRoot = await attempt(runner, 'git', ['rev-parse', '--show-toplevel'], root);
+      if (currentRoot?.code !== 0 || currentRoot.stdout.trim() !== metadata.repoRoot) {
+        workspaceChecks.push(action('local.workspace.metadata', `Workspace ${options.workspaceName} belongs to a different repository root.`, 'provisioned-runtime'));
+      } else {
+        workspaceChecks.push({ ...ready('local.workspace.metadata', `Local workspace metadata for ${options.workspaceName} is valid.`), phase: 'provisioned-runtime' });
+        if (!metadata.containerId) workspaceChecks.push(action('local.workspace.runtime', 'Local workspace is stopped; no recorded Dev Container is running.', 'provisioned-runtime'));
       else {
         const inspected = await attempt(runner, 'docker', ['inspect', '--format', '{{.State.Running}}', metadata.containerId], root);
         workspaceChecks.push(inspected?.code === 0 && inspected.stdout.trim() === 'true'
           ? { ...ready('local.workspace.runtime', `Recorded Dev Container ${metadata.containerId} is running.`), phase: 'provisioned-runtime' }
           : action('local.workspace.runtime', `Recorded Dev Container ${metadata.containerId} is stopped or cannot be inspected.`, 'provisioned-runtime'));
+      }
       }
     }
   }
@@ -111,7 +122,7 @@ async function localChecks(config: AgentContainersConfig, runner: ProcessRunner,
     result('local.docker', docker?.code === 0, 'Docker is available.', 'Docker is unavailable.'),
     result('local.devcontainers', devcontainer?.code === 0, 'Dev Containers CLI is available.', 'Dev Containers CLI is unavailable.'),
     result('local.config', configured, 'Local backend is enabled by configuration.', 'Local backend is disabled by configuration.'),
-    { id: 'local.state.durability', backend: 'local', phase: 'pre-provision', state: 'action-required', summary: 'Durability is verified at lifecycle publication time; doctor does not write state.', remediation: ['Run a lifecycle command with the packaged native durability addon.'] },
+    result('local.state.durability', durabilityReady, 'Packaged native durability capability is available (read-only probe).', 'Packaged native durability capability is unavailable; lifecycle writes remain blocked.'),
     ...workspaceChecks,
   ];
 }
@@ -153,8 +164,9 @@ function boundedRunner(runner: ProcessRunner, options: DoctorOptions): ProcessRu
     options.abortSignal?.addEventListener('abort', relay, { once: true });
     try {
       const operation = runner.run(command, args, { ...runOptions, signal: controller.signal });
-      const timeout = new Promise<never>((_, reject) => { timer = setTimeout(() => { controller.abort(); reject(new Error('Doctor operation timed out.')); }, options.timeoutMs ?? 5_000); });
-       return await Promise.race([operation, timeout]);
+       const timeout = new Promise<never>((_, reject) => { timer = setTimeout(() => { controller.abort(); reject(new Error('Doctor operation timed out.')); }, options.timeoutMs ?? 5_000); });
+       try { return await Promise.race([operation, timeout]); }
+       finally { if (controller.signal.aborted) await operation.catch(() => undefined); }
     } finally {
       if (timer) clearTimeout(timer);
       options.abortSignal?.removeEventListener('abort', relay);

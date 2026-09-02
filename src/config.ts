@@ -42,6 +42,7 @@ export async function initConfig(directory: string, force = false): Promise<void
   try {
     const stats = await lstat(path);
     if (stats.isSymbolicLink()) throw new Error(`${path} is a symlink; refusing to overwrite it.`);
+    if (stats.nlink > 1) throw new Error(`${path} has multiple hard links; refusing to overwrite it.`);
     if (!force) throw new Error(`${path} already exists; use --force to overwrite it.`);
   } catch (error: unknown) {
     if (!isNodeError(error, 'ENOENT')) throw error;
@@ -66,16 +67,23 @@ export async function initConfig(directory: string, force = false): Promise<void
 }
 
 /** Save a fully validated v2 candidate without silently replacing an existing configuration. */
-export async function initConfigV2(directory: string, config: CodespacesAgentContainersConfig): Promise<void> {
+export async function initConfigV2(directory: string, config: CodespacesAgentContainersConfig, force = false): Promise<void> {
   const path = join(directory, '.agent-containers.yml');
   try {
     const entry = await lstat(path);
     if (entry.isSymbolicLink()) throw new Error(`${path} is a symlink; refusing to overwrite it.`);
-    throw new Error(`${path} already exists; use ac configure to review and update it.`);
+    if (entry.nlink > 1) throw new Error(`${path} has multiple hard links; refusing to overwrite it.`);
+    if (!force) throw new Error(`${path} already exists; use --force to overwrite it.`);
   } catch (error: unknown) {
     if (!isNodeError(error, 'ENOENT')) throw error;
   }
-  try { await saveConfigAtomic(path, config, null); }
+  try {
+    if (force) {
+      const temporary = join(directory, `.${basename(path)}.${randomUUID()}.tmp`);
+      await writeFile(temporary, canonicalConfigSource(config), { encoding: 'utf8', flag: 'wx', mode: 0o600 });
+      await rename(temporary, path);
+    } else await saveConfigAtomic(path, config, null);
+  }
   catch (error: unknown) {
     if (error instanceof Error && /changed concurrently/.test(error.message)) throw new Error('Configuration changed concurrently; it was created while onboarding was in progress.', { cause: error });
     throw error;
@@ -185,6 +193,7 @@ function validateConfig(config: LocalAgentContainersConfig): string[] {
   if (!nonEmptyString(config.environment.devcontainerPath)) errors.push('environment.devcontainerPath must be a non-empty string');
   for (const [name, command] of Object.entries(config.commands)) {
     if (!nonEmptyString(command)) errors.push(`commands.${name} must be a non-empty string`);
+    else if (secretShaped(command)) errors.push(`commands.${safeField(name)} contains a secret-shaped value`);
   }
   return errors;
 }
@@ -225,6 +234,7 @@ function parseCodespaces(input: Record<string, unknown>): CodespacesAgentContain
   const result = { enabled: requiredBoolean(input.enabled, 'codespaces.enabled'), machine: input.machine === null ? null : requiredString(input.machine, 'codespaces.machine'), geo: requiredString(input.geo, 'codespaces.geo'), idleTimeoutMinutes: requiredInteger(input.idleTimeoutMinutes, 'idleTimeoutMinutes', 5, 240), retentionPeriodMinutes: requiredInteger(input.retentionPeriodMinutes, 'retentionPeriodMinutes', 1, 43200), maxTotal: requiredInteger(input.maxTotal, 'maxTotal', 1), maxRunning: requiredInteger(input.maxRunning, 'maxRunning', 1), maxCreating: requiredInteger(input.maxCreating, 'maxCreating', 1), maxParallelCommandsPerWorkspace: requiredInteger(input.maxParallelCommandsPerWorkspace, 'maxParallelCommandsPerWorkspace', 1), readiness: { providerTimeoutSeconds: requiredInteger(readiness.providerTimeoutSeconds, 'providerTimeoutSeconds', 1), sshTimeoutSeconds: requiredInteger(readiness.sshTimeoutSeconds, 'sshTimeoutSeconds', 1), command: requiredStrings(readiness.command, 'readiness.command'), commandTimeoutSeconds: requiredInteger(readiness.commandTimeoutSeconds, 'commandTimeoutSeconds', 1) }, transport: { reconnectWindowSeconds: requiredInteger(transport.reconnectWindowSeconds, 'reconnectWindowSeconds', 1), cancelGraceSeconds: requiredInteger(transport.cancelGraceSeconds, 'cancelGraceSeconds', 1), remoteLogBytesPerStream: requiredInteger(transport.remoteLogBytesPerStream, 'remoteLogBytesPerStream', 1), remoteLogRetentionHours: requiredInteger(transport.remoteLogRetentionHours, 'remoteLogRetentionHours', 1) }, ports: { allowVisibilityChanges: requiredBoolean(ports.allowVisibilityChanges, 'ports.allowVisibilityChanges'), allowPublic: requiredBoolean(ports.allowPublic, 'ports.allowPublic') }, secrets: { allowedRemoteSecretNames: requiredStrings(secrets.allowedRemoteSecretNames, 'secrets.allowedRemoteSecretNames'), allowCodespaceGitCredential: requiredBoolean(secrets.allowCodespaceGitCredential, 'secrets.allowCodespaceGitCredential') } };
   if (result.maxRunning > result.maxTotal || result.maxCreating > result.maxTotal || result.ports.allowPublic || result.ports.allowVisibilityChanges) throw new Error('Invalid configuration: capacity limits must not exceed maxTotal and public ports or visibility changes are unsupported');
   if (new Set(result.secrets.allowedRemoteSecretNames).size !== result.secrets.allowedRemoteSecretNames.length || result.secrets.allowedRemoteSecretNames.some((name) => !/^[A-Za-z_][A-Za-z0-9_]*$/.test(name))) throw new Error('Invalid configuration: remote secret capabilities must be unique environment names');
+  rejectCredentialArgv(result.readiness.command, 'backends.codespaces.readiness.command');
   return result;
 }
 
@@ -232,7 +242,7 @@ export function configurationDiff(current: AgentContainersConfig | null, next: A
   const cost = next.version === 2
     ? `machine: ${next.backends.codespaces.machine ?? 'null'}; idle timeout: ${next.backends.codespaces.idleTimeoutMinutes} minutes; retention: ${next.backends.codespaces.retentionPeriodMinutes} minutes; capacity: total ${next.backends.codespaces.maxTotal}, running ${next.backends.codespaces.maxRunning}, creating ${next.backends.codespaces.maxCreating}`
     : 'local-only configuration';
-  return `Configuration preview (nonsecret; cost-sensitive settings): ${cost}\n- ${current ? JSON.stringify(current, null, 2) : '(no configuration)'}\n+ ${JSON.stringify(next, null, 2)}`;
+  return `Configuration preview (nonsecret; cost-sensitive settings): ${cost}\n- ${current ? JSON.stringify(redactConfig(current), null, 2) : '(no configuration)'}\n+ ${JSON.stringify(redactConfig(next), null, 2)}`;
 }
 export function hashConfig(source: string): string { return createHash('sha256').update(source).digest('hex'); }
 export interface ConfigPublicationOptions {
@@ -242,6 +252,8 @@ export interface ConfigPublicationOptions {
   ownerAlive?: (pid: number) => boolean;
   now?: () => number;
   sleep?: (milliseconds: number) => Promise<void>;
+  /** Test seam immediately before the final generation check/publication boundary. */
+  beforePublish?: () => Promise<void>;
 }
 interface ConfigLockOwner { pid: number; operation: 'configuration-publication'; token: string; createdAt: string }
 
@@ -281,6 +293,16 @@ export async function saveConfigAtomic(path: string, next: AgentContainersConfig
     await writeFile(temporary, source, { encoding: 'utf8', flag: 'wx', mode: 0o600 });
     try {
       await adapter.syncFile(temporary);
+      await options.beforePublish?.();
+      // The lock only coordinates Agent Containers writers. Recheck immediately
+      // before visibility so an independent writer cannot be silently replaced.
+      const final = await readFile(path, 'utf8').catch((error: unknown) => {
+        if (isNodeError(error, 'ENOENT')) return undefined;
+        throw error;
+      });
+      if (expectedCurrentHash === null ? final !== undefined : expectedCurrentHash !== undefined && (final === undefined || hashConfig(final) !== expectedCurrentHash)) {
+        throw new Error('Configuration changed concurrently; reload and review the new diff.');
+      }
       if (await adapter.publicationMode() === 'strict') {
         await rename(temporary, path);
         try {
@@ -407,9 +429,37 @@ function requiredStrings(value: unknown, label: string): string[] {
   return value as string[];
 }
 
+function rejectCredentialArgv(argv: string[], label: string): void {
+  for (let index = 0; index < argv.length; index += 1) {
+    const value = argv[index];
+    if (/^(?:--?(?:token|password|secret|api[_-]?key)|authorization)$/i.test(value) || /^(?:--?(?:token|password|secret|api[_-]?key)|authorization)=/i.test(value)) {
+      throw new Error(`Invalid configuration: ${label} contains a credential option`);
+    }
+    // A value split from its credential flag is still a credential, even when it
+    // does not independently resemble a provider token.
+    if (index > 0 && /^(?:--?(?:token|password|secret|api[_-]?key)|authorization)$/i.test(argv[index - 1])) {
+      throw new Error(`Invalid configuration: ${label} contains a credential option`);
+    }
+    // curl-style headers can split both the header option and Bearer value.
+    if ((value === '-H' || value === '--header') && /^authorization\s*:/i.test(argv[index + 1] ?? '')) {
+      throw new Error(`Invalid configuration: ${label} contains a credential header`);
+    }
+    if (/^authorization\s*:/i.test(value) || (/^bearer$/i.test(value) && /^authorization\s*:/i.test(argv[index - 1] ?? ''))) {
+      throw new Error(`Invalid configuration: ${label} contains a credential header`);
+    }
+  }
+}
+
 /** Setup accepts policy, never credential values or fragments. */
 function secretShaped(value: string): boolean {
-  return /(?:-----BEGIN [A-Z ]*PRIVATE KEY-----|\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|glpat-[A-Za-z0-9_-]{20,}|sk-[A-Za-z0-9_-]{20,})\b|\bauthorization\s*:\s*bearer\s+\S+|\b(?:token|password|secret|api[_-]?key)\s*[:=]\s*\S+)/i.test(value);
+  return /(?:-----BEGIN [A-Z ]*PRIVATE KEY-----|\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|glpat-[A-Za-z0-9_-]{20,}|sk-[A-Za-z0-9_-]{20,})\b|\bauthorization\s*:\s*bearer(?:\s+\S+)?|\b(?:token|password|secret|api[_-]?key)\s*[:=]\s*\S+)/i.test(value);
+}
+
+function safeField(value: string): string { return /(?:token|password|secret|credential|key)/i.test(value) ? '[redacted]' : value; }
+function redactConfig<T>(value: T): T {
+  if (Array.isArray(value)) return value.map(redactConfig) as T;
+  if (!isRecord(value)) return typeof value === 'string' && secretShaped(value) ? '[redacted]' as T : value;
+  return Object.fromEntries(Object.entries(value).map(([key, item]) => [safeField(key), /(?:token|password|secret|credential|key)/i.test(key) ? '[redacted]' : redactConfig(item)])) as T;
 }
 
 function nonEmptyString(value: unknown): value is string {
@@ -422,7 +472,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function rejectUnknownKeys(input: Record<string, unknown>, allowed: string[], section: string): void {
   const unknown = Object.keys(input).filter((key) => !allowed.includes(key));
-  if (unknown.length > 0) throw new Error(`Invalid configuration: ${section} contains unknown key${unknown.length === 1 ? '' : 's'} ${unknown.join(', ')}`);
+  if (unknown.length > 0) throw new Error(`Invalid configuration: ${section} contains unknown key${unknown.length === 1 ? '' : 's'} ${unknown.map(safeField).join(', ')}`);
 }
 
 function isNodeError(error: unknown, code: string): error is NodeJS.ErrnoException {

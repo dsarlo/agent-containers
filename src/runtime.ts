@@ -2,7 +2,7 @@ import { readFile, realpath } from 'node:fs/promises';
 import { parse, type ParseError } from 'jsonc-parser';
 import { isAbsolute, relative, resolve } from 'node:path';
 import type { ProcessOutputEvent, ProcessResult, ProcessRunner, ProcessRunOptions } from './types.js';
-import { bootstrapManualRecoveryJournal, clearManualRecovery, isCanonicalContainerId, isLocalWorkspaceMetadata, loadMetadata, recordManualRecovery, saveMetadata, withWorkspaceLock, type LocalMetadata, type WorkspaceMetadata } from './state.js';
+import { bootstrapManualRecoveryJournal, clearManualRecovery, isCanonicalContainerId, isLocalWorkspaceMetadata, loadMetadata, metadataGeneration, recordManualRecovery, saveMetadata, withWorkspaceLock, type LocalMetadata, type WorkspaceMetadata } from './state.js';
 import { resolveDevcontainerInvocation, type DevcontainerInvocation } from './devcontainer.js';
 import { UnconfirmedProcessReapError } from './workspaces.js';
 
@@ -37,7 +37,7 @@ export async function execWorkspaceLifecycle(metadata: WorkspaceMetadata, comman
       recorded,
       command,
       runner,
-      (next) => saveMetadata(stateDir, next),
+      (next) => saveMetadata(stateDir, next, { expectedGeneration: metadataGeneration(recorded) }),
       readConfig,
       signal,
       (recovery) => recordManualRecovery(stateDir, recorded.name, recovery),
@@ -48,6 +48,12 @@ export async function execWorkspaceLifecycle(metadata: WorkspaceMetadata, comman
 
 /** Load the current workspace record only after acquiring its lifecycle lock. */
 export async function execNamedWorkspaceLifecycle(name: string, command: string[], runner: ProcessRunner, stateDir: string, readConfig: ConfigReader = readDevcontainerConfig): Promise<ProcessResult> {
+  // Narrow durable identity before creating any local recovery/journal state.
+  // A same-name remote record must never cause local lifecycle side effects.
+  const initial = await loadMetadata(stateDir, name);
+  // A missing record can be created or removed before the lock is acquired;
+  // only a positively observed remote record is safe to reject before lock IO.
+  if (initial) assertLocalMetadata(initial);
   return withWorkspaceLock(stateDir, name, async (signal) => {
     const metadata = await loadMetadata(stateDir, name);
     if (!metadata) throw new Error(`No Agent Containers workspace named "${name}".`);
@@ -57,7 +63,7 @@ export async function execNamedWorkspaceLifecycle(name: string, command: string[
       metadata,
       command,
       runner,
-      (next) => saveMetadata(stateDir, next),
+      (next) => saveMetadata(stateDir, next, { expectedGeneration: metadataGeneration(metadata) }),
       readConfig,
       signal,
       (recovery) => recordManualRecovery(stateDir, metadata.name, recovery),

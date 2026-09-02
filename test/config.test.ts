@@ -168,17 +168,17 @@ test('initConfigV2 never replaces a dangling configuration symlink', async () =>
   assert.equal((await lstat(path)).isSymbolicLink(), true);
 });
 
-test('initConfig force-replaces only its own hard link', async () => {
+test('initConfig force refuses a hard-linked configuration', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'agent-containers-config-'));
   const external = join(directory, 'external.yml');
   const path = join(directory, '.agent-containers.yml');
   await writeFile(external, 'external contents\n');
   await link(external, path);
 
-  await initConfig(directory, true);
+  await assert.rejects(() => initConfig(directory, true), /multiple hard links/);
 
   assert.equal(await readFile(external, 'utf8'), 'external contents\n');
-  assert.equal(await readFile(path, 'utf8'), CONFIG_OUTLINE);
+  assert.equal(await readFile(path, 'utf8'), 'external contents\n');
 });
 
 test('loadConfig rejects wrong-shaped roots and sections instead of defaulting them', async () => {
@@ -217,6 +217,11 @@ test('Codespaces setup rejects secret-shaped freeform values before preview or p
     backends: { enabled: ['codespaces'], default: 'codespaces', local: {}, codespaces: { enabled: true, machine: null, geo: 'auto', idleTimeoutMinutes: 30, retentionPeriodMinutes: 10080, maxTotal: 4, maxRunning: 2, maxCreating: 1, maxParallelCommandsPerWorkspace: 1, readiness: { providerTimeoutSeconds: 1200, sshTimeoutSeconds: 120, command: ['curl', 'Authorization: Bearer ghp_abcdefghijklmnopqrstuvwxyz1234567890'], commandTimeoutSeconds: 600 }, transport: { reconnectWindowSeconds: 60, cancelGraceSeconds: 10, remoteLogBytesPerStream: 67108864, remoteLogRetentionHours: 168 }, ports: { allowVisibilityChanges: false, allowPublic: false }, secrets: { allowedRemoteSecretNames: [], allowCodespaceGitCredential: false } } },
   };
   assert.throws(() => parseCodespacesDraft(JSON.stringify(candidate)), /secret-shaped/i);
+});
+
+test('Codespaces setup rejects split curl Authorization headers without exposing their value', () => {
+  const candidate = { version: 2, workspace: { worktreeRoot: 'worktrees', baseBranch: 'main' }, project: { repository: 'owner/repo', ref: 'refs/heads/main' }, environment: { devcontainerPath: '.devcontainer/devcontainer.json' }, backends: { enabled: ['codespaces'], default: 'codespaces', local: {}, codespaces: { enabled: true, machine: null, geo: 'auto', idleTimeoutMinutes: 30, retentionPeriodMinutes: 10080, maxTotal: 4, maxRunning: 2, maxCreating: 1, maxParallelCommandsPerWorkspace: 1, readiness: { providerTimeoutSeconds: 1200, sshTimeoutSeconds: 120, command: ['curl', '-H', 'Authorization:', 'Bearer', 'not-token-shaped'], commandTimeoutSeconds: 600 }, transport: { reconnectWindowSeconds: 60, cancelGraceSeconds: 10, remoteLogBytesPerStream: 67108864, remoteLogRetentionHours: 168 }, ports: { allowVisibilityChanges: false, allowPublic: false }, secrets: { allowedRemoteSecretNames: [], allowCodespaceGitCredential: false } } } };
+  assert.throws(() => parseCodespacesDraft(JSON.stringify(candidate)), (error: Error) => /credential header/.test(error.message) && !error.message.includes('not-token-shaped'));
 });
 
 test('equivalent canonical config returns no-change without durability or lock writes', async () => {

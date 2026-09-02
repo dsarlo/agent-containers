@@ -30,14 +30,14 @@ test('Codespaces setup validation requires remote ref, immutable commit, and a r
     calls.push([command, ...args]);
     if (command === 'git') return { code: 0, stdout: 'https://github.com/owner/repo.git\n', stderr: '' };
     if (args.at(-1) === '/repos/owner/repo/commits/refs%2Fheads%2Fmain') return { code: 0, stdout: '{"sha":"0123456789012345678901234567890123456789"}', stderr: '' };
-    return { code: 0, stdout: '{"type":"file","sha":"abcdefabcdefabcdefabcdefabcdefabcdefabcd"}', stderr: '' };
+    return { code: 0, stdout: '{"tree":[{"path":".devcontainer/devcontainer.json","mode":"100644","type":"blob","sha":"abcdefabcdefabcdefabcdefabcdefabcdefabcd"}]}', stderr: '' };
   } };
   const evidence = await validateCodespacesSetup(codespaces, '/repo', runner);
   assert.deepEqual(evidence, { repository: 'owner/repo', requestedRef: 'refs/heads/main', expectedOid: '0123456789012345678901234567890123456789', devcontainerPath: '.devcontainer/devcontainer.json', devcontainerBlobOid: 'abcdefabcdefabcdefabcdefabcdefabcdefabcd' });
   assert.deepEqual(calls, [
     ['git', 'remote', 'get-url', 'origin'],
     ['gh', 'api', '--method', 'GET', '-H', 'X-GitHub-Api-Version: 2022-11-28', '/repos/owner/repo/commits/refs%2Fheads%2Fmain'],
-    ['gh', 'api', '--method', 'GET', '-H', 'X-GitHub-Api-Version: 2022-11-28', '/repos/owner/repo/contents/.devcontainer%2Fdevcontainer.json?ref=0123456789012345678901234567890123456789'],
+    ['gh', 'api', '--method', 'GET', '-H', 'X-GitHub-Api-Version: 2022-11-28', '/repos/owner/repo/git/trees/0123456789012345678901234567890123456789?recursive=1'],
   ]);
 });
 
@@ -73,10 +73,11 @@ test('project discovery accepts one committed regular Dev Container and rejects 
   const runner: ProcessRunner = { async run(command, args) {
     if (command === 'git' && args.join(' ') === 'remote get-url origin') return { code: 0, stdout: 'git@github.com:owner/repo.git\n', stderr: '' };
     if (command === 'git' && args.join(' ') === 'symbolic-ref --quiet --short refs/remotes/origin/HEAD') return { code: 0, stdout: 'origin/main\n', stderr: '' };
+    if (command === 'git' && args.join(' ') === 'rev-parse --verify refs/remotes/origin/main^{commit}') return { code: 0, stdout: '0123456789012345678901234567890123456789\n', stderr: '' };
     if (command === 'git' && args[0] === 'ls-tree') return { code: 0, stdout: '100644 blob 0123456789012345678901234567890123456789\t.devcontainer/devcontainer.json\0', stderr: '' };
     throw new Error(`${command} ${args.join(' ')}`);
   } };
-  assert.deepEqual(await discoverProjectSetup('/repo', runner), { repository: 'owner/repo', ref: 'refs/heads/main', devcontainerPath: '.devcontainer/devcontainer.json' });
+  assert.deepEqual(await discoverProjectSetup('/repo', runner), { repository: 'owner/repo', ref: 'refs/heads/main', expectedOid: '0123456789012345678901234567890123456789', devcontainerPath: '.devcontainer/devcontainer.json' });
   const ambiguous: ProcessRunner = { async run(command, args) {
     const result = await runner.run(command, args);
     return args[0] === 'ls-tree' ? { ...result, stdout: '100644 blob 0123456789012345678901234567890123456789\t.devcontainer/devcontainer.json\0' + '100644 blob abcdefabcdefabcdefabcdefabcdefabcdefabcd\t.devcontainer.json\0' } : result;
@@ -132,11 +133,20 @@ test('strict v2 rejects secret-shaped fields and incomplete Codespaces repositor
   const directory = await mkdtemp(join(tmpdir(), 'agent-containers-v2-'));
   const path = join(directory, 'config.yml');
   await writeFile(path, JSON.stringify({ ...codespaces, project: {}, token: 'not-allowed' }));
-  await assert.rejects(() => loadConfig(path), /unknown key token/);
+  await assert.rejects(() => loadConfig(path), /unknown key \[redacted\]/);
   await writeFile(path, JSON.stringify(codespaces));
   await assert.doesNotReject(() => loadConfig(path));
   assert.throws(() => parseConfig(JSON.stringify({ ...codespaces, project: { repository: 'owner/repo' } })), /project\.ref is required/);
   assert.throws(() => parseConfig(JSON.stringify({ ...codespaces, project: { ref: 'refs/heads/main' } })), /project\.repository is required/);
+});
+
+test('configuration rejects and redacts free-form, legacy, and split credential arguments', () => {
+  const legacy = { version: 1, workspace: { worktreeRoot: 'worktrees', baseBranch: 'main' }, environment: { devcontainerPath: '.devcontainer/devcontainer.json' }, commands: { deploy: 'curl -H "Authorization: Bearer secret-value"' } };
+  assert.throws(() => parseConfig(JSON.stringify(legacy)), (error: Error) => !error.message.includes('secret-value'));
+  const split = structuredClone(codespaces);
+  split.backends.codespaces.readiness.command = ['curl', '--token', 'not-token-shaped'];
+  assert.throws(() => parseConfig(JSON.stringify(split)), (error: Error) => !error.message.includes('not-token-shaped'));
+  assert.doesNotMatch(configurationDiff(codespaces, codespaces), /secret-value/);
 });
 
 test('strict v2 only accepts full 40 or 64 character OIDs and rejects visibility changes', () => {
@@ -205,6 +215,18 @@ test('expected-absence contenders publish at most one configuration', async () =
   ]);
   assert.equal(results.filter((result) => result.status === 'fulfilled').length, 1);
   assert.ok((await readFile(path, 'utf8')).includes('"machine"'));
+});
+
+test('configuration CAS preserves a non-cooperating writer that changes the file before publication', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'agent-containers-config-external-race-'));
+  const path = join(directory, '.agent-containers.yml');
+  await writeFile(path, JSON.stringify(codespaces));
+  const expected = (await import('../src/config.js')).hashConfig(await readFile(path, 'utf8'));
+  await assert.rejects(() => saveConfigAtomic(path, { ...codespaces, backends: { ...codespaces.backends, codespaces: { ...codespaces.backends.codespaces, machine: 'basicLinux32gb' } } }, expected, {
+    durabilityAdapter: durability,
+    beforePublish: async () => { await writeFile(path, 'external edit'); },
+  }), /changed concurrently/);
+  assert.equal(await readFile(path, 'utf8'), 'external edit');
 });
 
 test('configuration publication rejects invalid candidates, leaves no-change unwritten, and preserves old data on durability failure', async () => {

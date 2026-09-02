@@ -51,6 +51,13 @@ test('provider diagnostics redact URLs, query strings, and credential-shaped val
   await assert.rejects(() => provider.actor(), (error: Error) => !error.message.includes('https://') && !error.message.includes('secret-value') && !error.message.includes('ghp_'));
 });
 
+test('provider proves a regular Git-tree blob rather than trusting API-followed contents', async () => {
+  const provider = new GhCodespacesProvider({ async run() {
+    return { code: 0, stdout: JSON.stringify({ tree: [{ path: '.devcontainer/devcontainer.json', mode: '120000', type: 'blob', sha: 'abcdefabcdefabcdefabcdefabcdefabcdefabcd' }] }), stderr: '' };
+  } });
+  await assert.rejects(() => provider.committedDevcontainerBlob('owner/repo', '0123456789012345678901234567890123456789', '.devcontainer/devcontainer.json'), /regular non-symlink blob/);
+});
+
 test('remote execution requests reject shell-shaped unsafe inputs before transport', () => {
   assert.throws(() => assertSafeExecuteRequest({ commandId: 'x', argv: ['echo', 'x\u0000y'], mode: 'pipe', stdin: 'closed' }), /NUL/);
   assert.throws(() => assertSafeExecuteRequest({ commandId: 'x', argv: ['echo'], cwd: '../outside', mode: 'pipe', stdin: 'closed' }), /repository-relative/);
