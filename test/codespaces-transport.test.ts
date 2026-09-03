@@ -135,6 +135,26 @@ test('a nonzero exit status is delivered exactly (N4)', async () => {
   assert.ok(status && status.state === 'exited' && status.exitCode === 137);
 });
 
+test('a completed command deterministically closes its SSH runner session (L1)', async () => {
+  const fixture = await transportFixture();
+  let closed = false;
+  fixture.helper.configure({ commandId: COMMAND_ID, outputs: [], exitCode: 0 });
+  const spawner = fixture.deps.spawner;
+  const deps = {
+    ...fixture.deps,
+    spawner: (argv: readonly string[], options: { signal?: AbortSignal }) => {
+      const child = spawner(argv, options);
+      const kill = child.kill.bind(child);
+      child.kill = (signal?: NodeJS.Signals) => { closed = true; return kill(signal); };
+      return child;
+    },
+  };
+  const events: CommandEvent[] = [];
+  for await (const event of executeRemoteCommand(deps, pipeInput())) events.push(event);
+  assert.deepEqual(events.at(-1), { type: 'exit', commandId: COMMAND_ID, code: 0 });
+  assert.equal(closed, true, 'the completed session must be explicitly closed');
+});
+
 test('stdin is forwarded as frames and half-closed before the output is drained (N5)', async () => {
   const fixture = await transportFixture();
   fixture.helper.configure({ commandId: COMMAND_ID, outputs: [{ stream: 'stdout', bytes: bytes(100) }], exitCode: 0 });

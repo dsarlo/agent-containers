@@ -137,6 +137,7 @@ export class HelperSession {
   private failure: Error | null = null;
   private ended = false;
   private writeBacklog: Promise<void> = Promise.resolve();
+  private closing: Promise<void> | undefined;
 
   constructor(private readonly child: FramedChildProcess) {
     child.stdout.on('data', (chunk: string | Uint8Array) => {
@@ -231,8 +232,17 @@ export class HelperSession {
     try { this.child.stdin.end(); } catch { /* already closed */ }
   }
 
-  close(): void {
-    try { this.child.kill(); } catch { /* best effort */ }
+  async close(): Promise<void> {
+    // `ended` describes decoded stdout, not the SSH child. A terminal frame
+    // can arrive before gh exits, so always reap the child exactly once.
+    if (this.closing) return this.closing;
+    this.closing = new Promise<void>((resolve) => {
+      let settled = false;
+      const settle = () => { if (!settled) { settled = true; resolve(); } };
+      this.child.once('close', settle);
+      try { if (!this.child.kill()) settle(); } catch { settle(); }
+    });
+    await this.closing;
   }
 
   private fail(error: Error): void {
@@ -389,6 +399,10 @@ export async function* executeRemoteCommand(deps: RemoteTransportDependencies, i
           void forwardResizes(session, commandId, input.resizeSource);
         }
         const streaming = yield* streamSession(deps, now, commandId, requestHash, session, offsets);
+        // A verified terminal frame settles this SSH invocation. Explicitly
+        // half-close and reap it instead of leaving a completed gh session alive.
+        session.endStdin();
+        await session.close();
         session = undefined;
         offsets = streaming.offsets;
         await saveOffsets(deps, offsets, now);
@@ -454,6 +468,9 @@ export async function* attachRemoteCommand(deps: RemoteTransportDependencies, co
       await helloHandshake(deps, session, helper.arch);
       await session.send(HelperFrameType.attach, { command_id: commandId, request_hash: requestHash, stdout_offset: offsets.stdout, stderr_offset: offsets.stderr, terminal_offset: offsets.terminal, workspace_id: deps.metadata.workspaceId, grace_ms: deps.cancelGraceMs ?? deps.config.backends.codespaces.transport.cancelGraceSeconds * 1000 });
       const streaming = yield* streamSession(deps, now, commandId, requestHash, session, offsets);
+      // Attach has the same terminal ownership boundary as execute.
+      session.endStdin();
+      await session.close();
       session = undefined;
       offsets = streaming.offsets;
       await saveOffsets(deps, offsets, now);
@@ -522,6 +539,9 @@ async function openExecSession(deps: RemoteTransportDependencies, helper: Remote
     grace_ms: deps.cancelGraceMs ?? deps.config.backends.codespaces.transport.cancelGraceSeconds * 1000,
     retention_bytes: deps.config.backends.codespaces.transport.remoteLogBytesPerStream,
     retention_hours: deps.config.backends.codespaces.transport.remoteLogRetentionHours,
+    // Names are capabilities only. Values stay in the Codespace and are never
+    // included in local state, audit records, or the framed request.
+    secret_names: deps.config.backends.codespaces.secrets.allowedRemoteSecretNames,
   });
   return acknowledgeStarted(deps, session, commandId, requestHash, now);
 }
@@ -626,7 +646,7 @@ async function* streamSession(deps: RemoteTransportDependencies, now: () => stri
     switch (event.kind) {
       case 'output': {
         let cursor = event.stream === 'stdout' ? stdoutCursor : event.stream === 'stderr' ? stderrCursor : terminalCursor;
-        if (event.offset < cursor) throw new Error(`Remote helper emitted overlapping output at offset ${event.offset} below the acknowledged cursor ${cursor}; refusing duplicate frames.`);
+        if (event.offset < cursor) throw new TransportLostError(`Remote helper emitted overlapping output at offset ${event.offset} below the acknowledged cursor ${cursor}; reconnecting from durable offsets.`);
         if (event.offset > cursor) throw new Error(`Remote helper skipped output between offset ${cursor} and ${event.offset}; refusing a lossy stream.`);
         cursor += BigInt(event.bytes.length);
         if (event.stream === 'stdout') stdoutCursor = cursor;
@@ -653,6 +673,9 @@ async function* streamSession(deps: RemoteTransportDependencies, now: () => stri
         return { outcome: 'cancelled', exitCode: null, offsets };
       }
       case 'error': {
+        if (event.message === 'stdin-overflow') {
+          throw new TransportLostError('Remote helper rejected stdin beyond its bounded queue; command outcome requires recovery.');
+        }
         throw new Error(`Remote helper reported an error: ${redactSecretDiagnostic(event.message)}`);
       }
       case 'status': {

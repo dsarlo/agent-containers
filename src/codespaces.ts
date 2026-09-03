@@ -62,6 +62,32 @@ export class GhCodespacesProvider {
     return parseCodespacesResource(value, `readback of ${name}`);
   }
 
+  /** Documented lifecycle PATCH, always followed by the caller's exact GET. */
+  async setState(name: string, state: 'Running' | 'Shutdown'): Promise<void> {
+    if (!safeName(name)) throw new Error('Invalid Codespaces name.');
+    const result = await this.process.run('gh', ['api', '--method', 'PATCH', '-H', `X-GitHub-Api-Version: ${API_VERSION}`, '-f', `state=${state}`, `/user/codespaces/${encodeURIComponent(name)}`], { kind: 'lifecycle' });
+    if (result.code !== 0) throw providerError('PATCH', `/user/codespaces/${name}`, result);
+  }
+
+  /** Exact-record deletion only. A 404 is deliberately left to lifecycle code
+   * so it can write a tombstone rather than infer that another resource is safe. */
+  async delete(name: string): Promise<void> {
+    if (!safeName(name)) throw new Error('Invalid Codespaces name.');
+    const result = await this.process.run('gh', ['api', '--method', 'DELETE', '-H', `X-GitHub-Api-Version: ${API_VERSION}`, `/user/codespaces/${encodeURIComponent(name)}`], { kind: 'lifecycle' });
+    if (result.code !== 0) throw providerError('DELETE', `/user/codespaces/${name}`, result);
+  }
+
+  /** Read-only port observation. This phase never changes visibility. */
+  async ports(name: string): Promise<ReadonlyArray<{ port: number; visibility: string }>> {
+    if (!safeName(name)) throw new Error('Invalid Codespaces name.');
+    const value = await this.api(`/user/codespaces/${encodeURIComponent(name)}/ports`);
+    if (!Array.isArray(value)) throw new Error('Codespaces port observation is incomplete.');
+    return value.map((entry) => {
+      if (!isRecord(entry) || !positiveInteger(entry.port) || !safeDisplay(entry.visibility)) throw new Error('Codespaces port observation contains an invalid entry.');
+      return { port: entry.port, visibility: entry.visibility };
+    });
+  }
+
   /** Documented repository identity read used to bind an immutable repository ID before create. */
   async repositoryRecord(repository: string): Promise<RepositoryRecordIdentity> {
     assertRepository(repository);

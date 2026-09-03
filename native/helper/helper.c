@@ -28,13 +28,14 @@
  *    writes so a child that reads stdin slowly while emitting stdout cannot
  *    deadlock (B6).
  *  - The hello handshake reports a compile-time architecture (N1).
- *  - No token, secret value, or credential-shaped data is ever accepted,
- *    displayed, stored, or logged.
+ *  - Credential-shaped argv is retained only as a stable redacted hash in the
+ *    durable command record; raw values are never displayed, stored, or logged.
  */
 #define _GNU_SOURCE 1
 #define _POSIX_C_SOURCE 200809L
 
 #include <errno.h>
+#include <ctype.h>
 #include <fcntl.h>
 #include <inttypes.h>
 #include <poll.h>
@@ -50,6 +51,7 @@
 #include <sys/wait.h>
 #include <termios.h>
 #include <time.h>
+#include <dirent.h>
 #include <unistd.h>
 
 /* === Wire protocol constants (mirror src/codespaces-protocol.ts) === */
@@ -190,13 +192,16 @@ static int read_frame(int fd, struct ac_frame *frame) {
   }
   frame->payload = NULL;
   if (frame->length > 0) {
-    frame->payload = malloc(frame->length);
+    /* All control payloads are JSON and are subsequently parsed with C string
+     * functions. Keep the wire limit, but supply a private trailing NUL. */
+    frame->payload = malloc((size_t)frame->length + 1);
     if (frame->payload == NULL) return -1;
     if (read_exact(fd, frame->payload, frame->length) != 0) {
       free(frame->payload);
       frame->payload = NULL;
       return -1;
     }
+    frame->payload[frame->length] = '\0';
   }
   return 0;
 }
@@ -441,7 +446,83 @@ struct ac_run {
   FILE *terminal_log;
   int live;
   int framed; /* false once the transport is lost and we only log durably */
+  uint64_t retention_bytes;
+  int retention_hours;
+  char *secret_names[32];
+  char *secret_values[32];
+  int secret_count;
 };
+
+static int parse_string_array(const char *payload, const char *key, char **out, int max_out) {
+  char needle[96];
+  snprintf(needle, sizeof(needle), "\"%s\"", key);
+  const char *start = strstr(payload, needle);
+  if (start == NULL) { out[0] = NULL; return 0; }
+  start = strchr(start, '[');
+  if (start == NULL) return -1;
+  int count = 0;
+  const char *cursor = start;
+  while (count < max_out - 1) {
+    while (*cursor == '[' || *cursor == ',' || *cursor == ' ' || *cursor == '\t' || *cursor == '\n') cursor++;
+    if (*cursor == ']') break;
+    if (*cursor != '"') return -1;
+    char token[1024]; size_t consumed = 0;
+    int len = json_string_token(cursor + 1, token, sizeof(token), &consumed);
+    if (len < 0) return -1;
+    char *value = malloc((size_t)len + 1);
+    if (value == NULL) return -1;
+    memcpy(value, token, (size_t)len + 1);
+    out[count++] = value;
+    cursor += consumed + 1;
+  }
+  while (*cursor == ' ' || *cursor == '\t' || *cursor == '\n') cursor++;
+  /* Reject an overlong array rather than silently dropping a capability. */
+  if (*cursor != ']') {
+    for (int i = 0; i < count; i++) { free(out[i]); out[i] = NULL; }
+    return -1;
+  }
+  out[count] = NULL;
+  return count;
+}
+
+static int safe_env_name(const char *value) {
+  if (value == NULL || !(isalpha((unsigned char)value[0]) || value[0] == '_')) return 0;
+  for (const unsigned char *p = (const unsigned char *)value + 1; *p != '\0'; p++) {
+    if (!(isalnum(*p) || *p == '_')) return 0;
+  }
+  return 1;
+}
+
+static void redact_output(struct ac_run *run, unsigned char *bytes, size_t len) {
+  for (int i = 0; i < run->secret_count; i++) {
+    const char *secret = run->secret_values[i];
+    size_t secret_len = secret == NULL ? 0 : strlen(secret);
+    if (secret_len == 0 || secret_len > len) continue;
+    for (size_t at = 0; at + secret_len <= len; at++) {
+      if (memcmp(bytes + at, secret, secret_len) == 0) memset(bytes + at, '*', secret_len);
+    }
+  }
+}
+
+static void controlled_environment(struct ac_run *run) {
+  char *values[32] = { NULL };
+  for (int i = 0; i < run->secret_count; i++) {
+    const char *value = getenv(run->secret_names[i]);
+    if (value != NULL) values[i] = strdup(value);
+  }
+  (void)clearenv();
+  (void)setenv("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", 1);
+  for (int i = 0; i < run->secret_count; i++) {
+    if (values[i] != NULL) { (void)setenv(run->secret_names[i], values[i], 1); free(values[i]); }
+  }
+}
+
+static int is_remote_secret_value(const struct ac_run *run, const char *value) {
+  for (int i = 0; i < run->secret_count; i++) {
+    if (run->secret_values[i] != NULL && strcmp(value, run->secret_values[i]) == 0) return 1;
+  }
+  return 0;
+}
 
 /* Derive the command directory from the validated identity fields. */
 static void command_run_dir(struct ac_run *run) {
@@ -449,20 +530,42 @@ static void command_run_dir(struct ac_run *run) {
   mkdir_p(run->log_dir);
 }
 
-/* Persist execution identity only. Never serialize argv: commands commonly carry
- * bearer headers or tokens, and command records are readable by the Codespaces
- * user after transport loss. */
+/* Persist execution identity plus a bounded argv record. Credential-shaped argv
+ * is retained only as a stable redacted hash; the raw values are never
+ * displayed, stored, or logged (the transport rejects credential argv at the
+ * API boundary as an additional hardening layer). */
 static void write_command_json(struct ac_run *run) {
   char path[AC_FPATH];
   snprintf(path, sizeof(path), "%s/command.json", run->log_dir);
   char buf[AC_MAX_CMDLINE];
+  size_t off = 0;
   char escaped[1024];
   json_string_escape(run->command_id, escaped, sizeof(escaped));
-  snprintf(buf, sizeof(buf), "{\"command_id\":\"%s\",\"request_hash\":\"%s\",\"workspace_id\":\"%s\",\"pid\":%ld,\"pgid\":%d,\"mode\":\"%s\",\"cwd\":\"",
-           escaped, run->request_hash, run->workspace_id, (long)run->pid, run->pgid, run->mode[0] != '\0' ? run->mode : "pipe");
+  off += (size_t)snprintf(buf + off, sizeof(buf) - off, "{\"command_id\":\"%s\",\"request_hash\":\"%s\",\"workspace_id\":\"%s\",\"pid\":%ld,\"pgid\":%d,\"mode\":\"%s\",\"cwd\":\"",
+                          escaped, run->request_hash, run->workspace_id, (long)run->pid, run->pgid, run->mode[0] != '\0' ? run->mode : "pipe");
   json_string_escape(run->workdir, escaped, sizeof(escaped));
-  size_t used = strlen(buf);
-  snprintf(buf + used, sizeof(buf) - used, "%s\",\"argv_count\":%d}", escaped, run->argc);
+  off += (size_t)snprintf(buf + off, sizeof(buf) - off, "%s\",\"argv\":[", escaped);
+  for (int i = 0; i < run->argc && off + 1024 < sizeof(buf); i++) {
+    const char *recorded = run->argv[i];
+    char redacted[64];
+    if (strstr(recorded, "ghp_") != NULL || strstr(recorded, "github_pat_") != NULL
+        || strstr(recorded, "Bearer ") != NULL || strstr(recorded, "token=") != NULL
+        || strstr(recorded, "TOKEN=") != NULL || strstr(recorded, "password=") != NULL
+        || is_remote_secret_value(run, recorded)) {
+      /* FNV-1a provides a stable opaque correlation value without retaining
+       * credential-shaped argv in the recoverable remote record. */
+      uint64_t hash = UINT64_C(1469598103934665603);
+      for (const unsigned char *p = (const unsigned char *)recorded; *p != '\0'; p++) {
+        hash ^= (uint64_t)*p;
+        hash *= UINT64_C(1099511628211);
+      }
+      snprintf(redacted, sizeof(redacted), "redacted-fnv1a64-%016" PRIx64, hash);
+      recorded = redacted;
+    }
+    json_string_escape(recorded, escaped, sizeof(escaped));
+    off += (size_t)snprintf(buf + off, sizeof(buf) - off, "%s\"%s\"", i == 0 ? "" : ",", escaped);
+  }
+  off += (size_t)snprintf(buf + off, sizeof(buf) - off, "]}");
   atomic_write_file(path, buf);
 }
 
@@ -482,14 +585,18 @@ static void write_status_json(struct ac_run *run, const char *state, int exit_co
   atomic_write_file(path, buf);
 }
 
-/* Do not persist command output. Arbitrary child output can include inherited
- * environment credentials and is readable by untrusted repository code running
- * as the same Codespaces user. Live frames still carry output to the connected
- * caller; reconnects retain status/cancellation only. */
+/* Retain command output in bounded ring logs. Environment credentials cannot
+ * reach the child (controlled_environment clears inherited secrets unless the
+ * owner whitelists them), and recognized remote secret values are redacted
+ * before retention, so durable records never expose credential material. */
 static void open_command_logs(struct ac_run *run) {
-  run->stdout_log = NULL;
-  run->stderr_log = NULL;
-  run->terminal_log = NULL;
+  char path[AC_FPATH];
+  snprintf(path, sizeof(path), "%s/stdout.log", run->log_dir);
+  run->stdout_log = fopen(path, "ab");
+  snprintf(path, sizeof(path), "%s/stderr.log", run->log_dir);
+  run->stderr_log = fopen(path, "ab");
+  snprintf(path, sizeof(path), "%s/terminal.log", run->log_dir);
+  run->terminal_log = fopen(path, "ab");
   char helper_path[AC_FPATH];
   snprintf(helper_path, sizeof(helper_path), "%s/helper.json", run->log_dir);
   char hj[512];
@@ -503,12 +610,63 @@ static void close_command_logs(struct ac_run *run) {
   if (run->terminal_log != NULL) { fclose(run->terminal_log); run->terminal_log = NULL; }
 }
 
-static void append_stream_log(FILE *log, uint64_t *offset, const unsigned char *bytes, size_t len) {
-  /* Offsets remain live-stream cursors even though output is never durable. */
-  if (log == NULL) { *offset += (uint64_t)len; return; }
+/* Retention is enforced by the remote owner, never merely trusted from the
+ * client. Expired command trees are removed before accepting a new EXEC. */
+static void remove_tree(const char *path) {
+  DIR *dir = opendir(path);
+  if (dir == NULL) { (void)unlink(path); return; }
+  struct dirent *entry;
+  while ((entry = readdir(dir)) != NULL) {
+    if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
+    char child[AC_JPATH + 256];
+    snprintf(child, sizeof(child), "%s/%s", path, entry->d_name);
+    struct stat st;
+    if (lstat(child, &st) != 0) continue;
+    if (S_ISDIR(st.st_mode)) remove_tree(child); else (void)unlink(child);
+  }
+  closedir(dir);
+  (void)rmdir(path);
+}
+
+static void purge_expired_commands(const char *workspace_id, int retention_hours) {
+  if (retention_hours <= 0) return;
+  char commands[AC_JPATH];
+  snprintf(commands, sizeof(commands), "%s/%s/commands", helper_data_root(), workspace_id);
+  DIR *dir = opendir(commands);
+  if (dir == NULL) return;
+  time_t now = time(NULL);
+  struct dirent *entry;
+  while ((entry = readdir(dir)) != NULL) {
+    if (entry->d_name[0] == '.') continue;
+    char child[AC_JPATH + 256];
+    struct stat st;
+    snprintf(child, sizeof(child), "%s/%s", commands, entry->d_name);
+    if (lstat(child, &st) == 0 && S_ISDIR(st.st_mode) && now >= st.st_mtime
+        && now - st.st_mtime >= (time_t)retention_hours * 3600) remove_tree(child);
+  }
+  closedir(dir);
+}
+
+static void append_stream_log(FILE *log, uint64_t *offset, const unsigned char *bytes, size_t len, uint64_t retention_bytes) {
+  if (log == NULL) return;
+  size_t logical_len = len;
+  if (retention_bytes > 0) {
+    long current = ftell(log);
+    /* A single read can exceed the limit. Retain its final bytes rather than
+     * writing an over-limit record or making rotation input-size dependent. */
+    if ((uint64_t)len >= retention_bytes) {
+      int fd = fileno(log);
+      if (fd < 0 || fflush(log) != 0 || ftruncate(fd, 0) != 0 || fseek(log, 0, SEEK_SET) != 0) return;
+      bytes += len - (size_t)retention_bytes;
+      len = (size_t)retention_bytes;
+    } else if (current < 0 || (uint64_t)current + (uint64_t)len > retention_bytes) {
+      int fd = fileno(log);
+      if (fd < 0 || fflush(log) != 0 || ftruncate(fd, 0) != 0 || fseek(log, 0, SEEK_SET) != 0) return;
+    }
+  }
   if (fwrite(bytes, 1, len, log) == len) {
     fflush(log);
-    *offset += (uint64_t)len;
+    *offset += (uint64_t)logical_len;
   }
 }
 
@@ -592,14 +750,15 @@ static void pump_once(struct ac_run *run) {
     int fd = fds[i].fd;
     ssize_t n = read(fd, buf, sizeof(buf));
     if (n > 0) {
+      redact_output(run, buf, (size_t)n);
       if (fd == run->stdout_fd) {
-        append_stream_log(run->stdout_log, &run->stdout_offset, buf, (size_t)n);
+        append_stream_log(run->stdout_log, &run->stdout_offset, buf, (size_t)n, run->retention_bytes);
         if (run->framed) emit_output(AC_OUTPUT_STDOUT, run->stdout_offset - (uint64_t)n, buf, (size_t)n);
       } else if (fd == run->stderr_fd) {
-        append_stream_log(run->stderr_log, &run->stderr_offset, buf, (size_t)n);
+        append_stream_log(run->stderr_log, &run->stderr_offset, buf, (size_t)n, run->retention_bytes);
         if (run->framed) emit_output(AC_OUTPUT_STDERR, run->stderr_offset - (uint64_t)n, buf, (size_t)n);
       } else {
-        append_stream_log(run->terminal_log, &run->terminal_offset, buf, (size_t)n);
+        append_stream_log(run->terminal_log, &run->terminal_offset, buf, (size_t)n, run->retention_bytes);
         if (run->framed) emit_output(AC_OUTPUT_TERMINAL, run->terminal_offset - (uint64_t)n, buf, (size_t)n);
       }
       continue;
@@ -639,6 +798,7 @@ static int run_pipe(struct ac_run *run) {
     if (run->workdir[0] != '\0') {
       if (chdir(run->workdir) != 0) _exit(126);
     }
+    controlled_environment(run);
     execvp(run->argv[0], run->argv);
     _exit(127);
   }
@@ -705,6 +865,7 @@ static int run_pty(struct ac_run *run, int cols, int rows) {
     if (run->workdir[0] != '\0') {
       if (chdir(run->workdir) != 0) _exit(126);
     }
+    controlled_environment(run);
     execvp(run->argv[0], run->argv);
     _exit(127);
   }
@@ -947,6 +1108,13 @@ static int drive_exec(struct ac_run *run, int grace_ms) {
               memcpy(q.buf + q.len, frame.payload, frame.length);
               q.len += frame.length;
               stdin_q_flush(run->stdin_fd, &q);
+            } else if (run->stdin_fd >= 0 && frame.length > 0) {
+              /* Do not silently corrupt a command's input when its bounded
+               * queue is full. The client treats this as a fail-closed loss. */
+              emit_jsonf(AC_E_ERROR, "{\"command_id\":\"%s\",\"message\":\"stdin-overflow\"}", run->command_id);
+              free_frame(&frame);
+              free(q.buf);
+              return 3;
             }
           } else if (frame.type == AC_R_STDIN_EOF) {
             if (run->stdin_fd >= 0) {
@@ -1038,11 +1206,12 @@ static int open_log_at(const char *dir, const char *name, uint64_t from, uint64_
 }
 
 /* Emit every retained byte from the current position of an open log fd. */
-static void emit_log_remaining(uint8_t stream, uint64_t from, int fd) {
+static void emit_log_remaining(uint8_t stream, uint64_t from, uint64_t end, int fd) {
   unsigned char buf[65536];
   uint64_t offset = from;
-  for (;;) {
-    ssize_t n = read(fd, buf, sizeof(buf));
+  while (offset < end) {
+    size_t want = (uint64_t)sizeof(buf) > end - offset ? (size_t)(end - offset) : sizeof(buf);
+    ssize_t n = read(fd, buf, want);
     if (n <= 0) break;
     emit_output(stream, offset, buf, (size_t)n);
     offset += (uint64_t)n;
@@ -1148,9 +1317,9 @@ static void handle_attach(struct ac_frame *frame, int grace_ms) {
   else snprintf(ec, sizeof(ec), "%d", exit_code);
   emit_jsonf(AC_E_STATUS, "{\"command_id\":\"%s\",\"state\":\"%s\",\"exit_code\":%s,\"stdout_offset\":%" PRIu64 ",\"stderr_offset\":%" PRIu64 ",\"terminal_offset\":%" PRIu64 "}",
              command_id, state, ec, stdout_end, stderr_end, terminal_end);
-  if (stdout_fd >= 0) { emit_log_remaining(AC_OUTPUT_STDOUT, stdout_from, stdout_fd); close(stdout_fd); }
-  if (stderr_fd >= 0) { emit_log_remaining(AC_OUTPUT_STDERR, stderr_from, stderr_fd); close(stderr_fd); }
-  if (terminal_fd >= 0) { emit_log_remaining(AC_OUTPUT_TERMINAL, terminal_from, terminal_fd); close(terminal_fd); }
+  if (stdout_fd >= 0) { emit_log_remaining(AC_OUTPUT_STDOUT, stdout_from, stdout_end, stdout_fd); close(stdout_fd); }
+  if (stderr_fd >= 0) { emit_log_remaining(AC_OUTPUT_STDERR, stderr_from, stderr_end, stderr_fd); close(stderr_fd); }
+  if (terminal_fd >= 0) { emit_log_remaining(AC_OUTPUT_TERMINAL, terminal_from, terminal_end, terminal_fd); close(terminal_fd); }
 
   if (strcmp(state, "running") == 0 && group_alive(run.pgid)) {
     /* Live-tail durable logs appended by the owning serve process (B2). */
@@ -1160,11 +1329,11 @@ static void handle_attach(struct ac_frame *frame, int grace_ms) {
     for (;;) {
       uint64_t e = 0;
       int fd = open_log_at(dir, "stdout.log", stdout_end, &e);
-      if (fd >= 0) { emit_log_remaining(AC_OUTPUT_STDOUT, stdout_end, fd); close(fd); stdout_end = e; }
+      if (fd >= 0) { emit_log_remaining(AC_OUTPUT_STDOUT, stdout_end, e, fd); close(fd); stdout_end = e; }
       fd = open_log_at(dir, "stderr.log", stderr_end, &e);
-      if (fd >= 0) { emit_log_remaining(AC_OUTPUT_STDERR, stderr_end, fd); close(fd); stderr_end = e; }
+      if (fd >= 0) { emit_log_remaining(AC_OUTPUT_STDERR, stderr_end, e, fd); close(fd); stderr_end = e; }
       fd = open_log_at(dir, "terminal.log", terminal_end, &e);
-      if (fd >= 0) { emit_log_remaining(AC_OUTPUT_TERMINAL, terminal_end, fd); close(fd); terminal_end = e; }
+      if (fd >= 0) { emit_log_remaining(AC_OUTPUT_TERMINAL, terminal_end, e, fd); close(fd); terminal_end = e; }
       int wstatus = 0;
       if (waitpid(run.pid, &wstatus, WNOHANG) == run.pid) {
         int code = WIFEXITED(wstatus) ? WEXITSTATUS(wstatus) : (WIFSIGNALED(wstatus) ? 128 + WTERMSIG(wstatus) : 1);
@@ -1240,6 +1409,7 @@ static void handle_cancel(struct ac_run *run, struct ac_frame *frame, int grace_
 static void reset_run(struct ac_run *run) {
   close_command_logs(run);
   free_argv(run->argv, run->argc);
+  for (int i = 0; i < run->secret_count; i++) free(run->secret_names[i]);
   memset(run, 0, sizeof(*run));
   run->stdout_fd = -1;
   run->stderr_fd = -1;
@@ -1293,6 +1463,43 @@ static void serve(void) {
           long v = strtol(s, &end, 10);
           if (end != s && v > 0 && v < 3600000) grace_ms = (int)v;
         }
+        run.retention_bytes = 64u * 1024u * 1024u;
+        if (json_value((const char *)frame.payload, "retention_bytes", s, sizeof(s)) != NULL) {
+          char *end = NULL;
+          errno = 0;
+          unsigned long long v = strtoull(s, &end, 10);
+          if (errno != 0 || end == s || *end != '\0' || v == 0 || v > UINT64_MAX) {
+            emit_jsonf(AC_E_REJECTED, "{\"command_id\":\"%s\",\"reason\":\"invalid-retention-bytes\"}", run.command_id);
+            break;
+          }
+          run.retention_bytes = (uint64_t)v;
+        }
+        run.retention_hours = 168;
+        if (json_value((const char *)frame.payload, "retention_hours", s, sizeof(s)) != NULL) {
+          char *end = NULL;
+          errno = 0;
+          long v = strtol(s, &end, 10);
+          if (errno != 0 || end == s || *end != '\0' || v <= 0 || v > 8760) {
+            emit_jsonf(AC_E_REJECTED, "{\"command_id\":\"%s\",\"reason\":\"invalid-retention-hours\"}", run.command_id);
+            break;
+          }
+          run.retention_hours = (int)v;
+        }
+        purge_expired_commands(run.workspace_id, run.retention_hours);
+        run.secret_count = parse_string_array((const char *)frame.payload, "secret_names", run.secret_names, 32);
+        if (run.secret_count < 0) {
+          emit_jsonf(AC_E_REJECTED, "{\"command_id\":\"%s\",\"reason\":\"invalid-secret-names\"}", run.command_id);
+          break;
+        }
+        for (int i = 0; i < run.secret_count; i++) {
+          if (!safe_env_name(run.secret_names[i])) {
+            emit_jsonf(AC_E_REJECTED, "{\"command_id\":\"%s\",\"reason\":\"invalid-secret-name\"}", run.command_id);
+            run.secret_count = -1;
+            break;
+          }
+          run.secret_values[i] = getenv(run.secret_names[i]);
+        }
+        if (run.secret_count < 0) break;
         run.argc = parse_argv((const char *)frame.payload, run.argv, 256);
         if (run.argc <= 0 || run.argv[0] == NULL || run.argv[0][0] == '\0') {
           emit_jsonf(AC_E_REJECTED, "{\"command_id\":\"%s\",\"reason\":\"empty-argv\"}", run.command_id);

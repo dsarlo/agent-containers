@@ -5,22 +5,22 @@
   "architectures": {
     "linux-x64": {
       "file": "agent-containers-helper-linux-x64",
-      "sha256": "02e9b3c8d4d2822b4798fb936da662a149af4886c2b6c34ca10104d3fd480c09",
-      "size": 862928,
+      "sha256": "7403d8a7b836aad3e46da558f061be22179cb757e376eba38985a32519ec2df7",
+      "size": 867024,
       "mode": "0755"
     },
     "linux-arm64": {
       "file": "agent-containers-helper-linux-arm64",
-      "sha256": "127b13fc2725259db748203a1fd7411f8ae9fd405ca3c6c7e3bd53eb3010d4bc",
-      "size": 665600,
+      "sha256": "87c3c5db004738cc6189ae55fb77e8b8b42ab39cd1e21d6bcb2e8ba377080118",
+      "size": 731136,
       "mode": "0755"
     }
   },
   "sourcePins": {
-    "helper.c": "a7606b3dbcb756a36943aa558c3a927e34fedd6a426899740e24ed93e21db3c9",
+    "helper.c": "d17277fab4256b33503a8fc48dac8acacd3094fef546ba6581ca4e05076faefd",
     "Makefile": "4eb1dc173337580a86c50e7ab9495d463c688df66f990c1f2ac4c35b426f643d"
   },
   "artifactsStaged": true,
-  "selfChecksum": "1715da90ce915794d6abacb175fc6079b2952dd2d8dbed1752dd338eb7f456d2",
-  "generatedAt": "2026-09-03T02:56:46.068Z"
+  "selfChecksum": "3627be8a9340f796fbe575ba9750a68ebcb83bc3785a59e07684fddef5c93bd5",
+  "generatedAt": "2026-09-03T00:48:21.967Z"
 }

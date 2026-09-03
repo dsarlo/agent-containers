@@ -209,7 +209,7 @@ async function codespacesChecks(config: AgentContainersConfig, runner: ProcessRu
       const normalized = record.lifecycle.normalized;
       if (['recovery-required', 'identity-mismatch', 'revision-mismatch', 'resource-missing', 'provider-error', 'ambiguous-create'].includes(normalized)) {
         workspaceChecks.push(action('codespaces.workspace.runtime', `Workspace ${options.workspaceName} is in ${normalized}; read-only diagnosis cannot reach ready and nothing is restarted.`, 'provisioned-runtime'));
-      } else if (normalized === 'stopped' || normalized === 'deleted') {
+      } else if (normalized === 'stopped' || normalized === 'deleted' || normalized === 'tombstoned') {
         workspaceChecks.push(action('codespaces.workspace.runtime', `Workspace ${options.workspaceName} is ${normalized}; doctor never starts or restores a stopped Codespace.`, 'provisioned-runtime'));
       } else if (v2) {
         workspaceChecks.push(...readonlyCodespacesRuntimeChecks());

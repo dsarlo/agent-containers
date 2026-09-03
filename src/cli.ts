@@ -10,6 +10,8 @@ import { execNamedWorkspaceLifecycle } from './runtime.js';
 import { createWorkspace, findGitRoot, nodeProcessRunner, removeWorkspace } from './workspaces.js';
 import { inventoryWorkspaces, staleCandidates, type WorkspaceInventory } from './inventory.js';
 import { assertBackendAvailable, createCodespacesExecutionBackend, resolveExecutionBackend } from './backend.js';
+import { reconcileCodespacesWorkspace, removeCodespacesWorkspace, startCodespacesWorkspace, stopCodespacesWorkspace } from './codespaces-lifecycle.js';
+import { GhCodespacesProvider } from './codespaces.js';
 
 export interface CliIo { input: NodeJS.ReadableStream; output: NodeJS.WritableStream; isTTY: boolean }
 const processIo: CliIo = { input: process.stdin, output: process.stdout, isTTY: Boolean(process.stdin.isTTY) };
@@ -277,16 +279,41 @@ export async function runCli(args: string[], cwd = process.cwd(), write: (messag
         write(JSON.stringify(redactConfig(entries), null, 2));
         return 0;
       }
+      case 'start':
+      case 'stop':
+      case 'reconcile': {
+        const name = requiredPositional(rest, 'workspace name');
+        ensureOnly(rest.slice(1), ['--yes']);
+        if (command !== 'reconcile' && !rest.includes('--yes')) throw new UsageError(`Usage: agent-containers ${command} <name> --yes`);
+        requireCodespacesExperimental();
+        const root = await findGitRoot(cwd, nodeProcessRunner);
+        const config = await loadConfig(join(root, '.agent-containers.yml'));
+        if (config.version !== 2 || !config.backends.enabled.includes('codespaces')) throw new Error('The recorded workspace requires an enabled Codespaces backend configuration.');
+        const deps = { stateDir, name, config, provider: new GhCodespacesProvider(nodeProcessRunner) };
+        if (command === 'start') await startCodespacesWorkspace(deps);
+        else if (command === 'stop') await stopCodespacesWorkspace(deps);
+        else write(`Codespaces reconcile ${name}: ${await reconcileCodespacesWorkspace(deps)}`);
+        if (command !== 'reconcile') write(`${command === 'start' ? 'Started' : 'Stopped'} ${name}`);
+        return 0;
+      }
       case 'remove': {
         const name = requiredPositional(rest, 'workspace name');
-        ensureOnly(rest.slice(1), ['--yes', '--skip-container-cleanup', '--force-worktree']);
+        ensureOnly(rest.slice(1), ['--yes', '--skip-container-cleanup', '--force-worktree', '--force-remote-data-loss']);
         if (!rest.includes('--yes')) throw new UsageError('Usage: agent-containers remove <name> --yes [--skip-container-cleanup] [--force-worktree]');
         let recoveryWorktree = cwd;
         let recoveryContainerIds: string[] = [];
         // Inspect durable identity before acquiring local lifecycle state or issuing Git/Docker commands.
         const recorded = await loadMetadata(stateDir, name);
         if (!recorded) throw new Error(`No Agent Containers workspace named "${name}".`);
-        if (!isLocalWorkspaceMetadata(recorded)) throw new Error(`Workspace "${name}" records the Codespaces backend, which is phase-gated and cannot be removed by local cleanup.`);
+        if (!isLocalWorkspaceMetadata(recorded)) {
+          requireCodespacesExperimental();
+          const root = await findGitRoot(cwd, nodeProcessRunner);
+          const config = await loadConfig(join(root, '.agent-containers.yml'));
+          if (config.version !== 2 || !config.backends.enabled.includes('codespaces')) throw new Error('The recorded workspace requires an enabled Codespaces backend configuration.');
+          await removeCodespacesWorkspace({ stateDir, name, config, provider: new GhCodespacesProvider(nodeProcessRunner) }, rest.includes('--force-remote-data-loss'));
+          write(`Tombstoned ${name}`);
+          return 0;
+        }
         await withWorkspaceLock(stateDir, name, async (signal) => {
           const metadata = await loadMetadata(stateDir, name);
           if (!metadata) throw new Error(`No Agent Containers workspace named "${name}".`);
@@ -395,7 +422,7 @@ function parseStaleDuration(value: string): number {
 }
 
 function usage(): string {
-  return 'Usage: agent-containers <init|configure|doctor|validate|create|wait|exec|run|recover|unlock|list|status|stale|remove> [options]\n  list [--json] [--probe]\n  status [name] [--probe]\n  stale [--older-than <duration>]\n  doctor [--backend local|codespaces|all] [--workspace NAME] [--json]\n  create <name> [--backend local|codespaces] [--machine MACHINE] [--geo GEO] --yes-cost\n  wait <name> --for ready [--timeout <duration>]';
+  return 'Usage: agent-containers <init|configure|doctor|validate|create|wait|exec|run|recover|unlock|list|status|stale|start|stop|reconcile|remove> [options]\n  init [--interactive] [--backends local] [--non-interactive (--from FILE|--stdin)]\n  configure --interactive | --non-interactive (--from FILE|--stdin)\n  list [--json] [--probe]\n  status [name] [--probe]\n  stale [--older-than <duration>]\n  doctor [--backend local|codespaces|all] [--workspace NAME] [--json]\n  create <name> [--backend local|codespaces] [--machine MACHINE] [--geo GEO] --yes-cost\n  wait <name> --for ready [--timeout <duration>]\n  start|stop <name> --yes\n  reconcile <name>\n  remove <name> --yes [--force-remote-data-loss]';
 }
 
 function codespacesCreateConfig(config: CodespacesAgentContainersConfig, args: string[]): CodespacesAgentContainersConfig {

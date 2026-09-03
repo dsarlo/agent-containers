@@ -10,6 +10,7 @@ export type ReadinessGateId =
   | 'resource-recorded'
   | 'provider-available'
   | 'readback-facts'
+  | 'ports-private'
   | 'repository-identity'
   | 'creation-logs'
   | 'ssh-ready'
@@ -129,6 +130,11 @@ async function* readinessProbeSequence(deps: CodespacesReadinessDependencies): A
   if (readback.state !== 'passed') { yield settle(readback.state === 'timeout' ? 'timeout' : 'blocked'); return; }
   yield report('pending');
 
+  const ports = await privatePorts(deps, metadata, now);
+  push(ports);
+  if (ports.state !== 'passed') { yield settle('blocked'); return; }
+  yield report('pending');
+
   const repository = await repositoryIdentity(deps, metadata, now);
   push(repository);
   if (repository.state !== 'passed') { yield settle('blocked'); return; }
@@ -150,6 +156,18 @@ async function* readinessProbeSequence(deps: CodespacesReadinessDependencies): A
 
   const terminal = deps.config.backends.codespaces.readiness.command.length > 0 ? 'ready' : 'ready-without-setup-proof';
   yield settle(terminal);
+}
+
+async function privatePorts(deps: CodespacesReadinessDependencies, metadata: CodespacesWorkspaceMetadata, now: () => string): Promise<ReadinessGateResult> {
+  const timeoutMs = deps.config.backends.codespaces.readiness.providerTimeoutSeconds * 1000;
+  try {
+    const ports = await deps.provider.ports(metadata.remote.name);
+    const exposed = ports.filter((port) => /^(public|org)$/i.test(port.visibility));
+    if (exposed.length && !deps.config.backends.codespaces.ports.allowPublic) return { id: 'ports-private', state: 'blocked', observedAt: now(), detail: `read-only port observation found public/org ports: ${exposed.map((port) => port.port).join(', ')}. Agent Containers never changes visibility.`, timeoutMs };
+    return { id: 'ports-private', state: 'passed', observedAt: now(), detail: 'read-only port observation found no disallowed public/org port.', timeoutMs };
+  } catch {
+    return { id: 'ports-private', state: 'blocked', observedAt: now(), detail: 'port visibility could not be read safely; readiness is blocked and no visibility mutation was attempted.', timeoutMs };
+  }
 }
 
 function timeoutOrSkipped(signal: AbortSignal): ReadinessTerminal {
@@ -307,6 +325,7 @@ export function readinessGateDoctorChecks(metadata: CodespacesWorkspaceMetadata,
   const mapping: Array<[ReadinessGateId, string]> = [
     ['provider-available', 'codespaces.runtime.provider'],
     ['readback-facts', 'codespaces.runtime.readback'],
+    ['ports-private', 'codespaces.runtime.ports'],
     ['repository-identity', 'codespaces.runtime.repository'],
     ['creation-logs', 'codespaces.runtime.creation-logs'],
     ['ssh-ready', 'codespaces.runtime.ssh'],

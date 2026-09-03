@@ -13,6 +13,7 @@ import { loadCreateIntent, recordCreateIntent } from '../src/codespaces-ops.js';
 import { loadMetadata, saveMetadata, type CodespacesWorkspaceMetadata } from '../src/state.js';
 import { runCli } from '../src/cli.js';
 import { nodeProcessRunner } from '../src/workspaces.js';
+import { reconcileCodespacesWorkspace, startCodespacesWorkspace, stopCodespacesWorkspace } from '../src/codespaces-lifecycle.js';
 import type { CodespacesAgentContainersConfig, ProcessRunner } from '../src/types.js';
 import { transportFixture, COMMAND_ID } from './transport-fixtures.js';
 
@@ -73,6 +74,7 @@ function readinessRunner(): ProcessRunner {
       if (command === 'gh' && path === '/user/codespaces' && method === 'POST') return { code: 0, stdout: JSON.stringify(resourceFixture()), stderr: '' };
       if (command === 'gh' && /^\/user\/codespaces(?:\?|$)/.test(path) && method === 'GET') return { code: 0, stdout: JSON.stringify({ total_count: 0, codespaces: [] }), stderr: '' };
       if (command === 'gh' && /^\/user\/codespaces\/[A-Za-z0-9-]+$/.test(path)) return { code: 0, stdout: JSON.stringify(resourceFixture()), stderr: '' };
+      if (command === 'gh' && /^\/user\/codespaces\/[A-Za-z0-9-]+\/ports$/.test(path)) return { code: 0, stdout: '[]', stderr: '' };
       if (command === 'gh' && args[0] === 'codespace' && args[1] === 'logs') return { code: 0, stdout: `build line token ${TOKEN_FIXTURE}\n`, stderr: '' };
       if (command === 'gh' && args[0] === 'codespace' && args[1] === 'ssh') {
         if (key.includes('rev-parse --show-toplevel')) return { code: 0, stdout: '/workspaces/agent-containers\n', stderr: '' };
@@ -136,7 +138,8 @@ test('doctor reports recorded Codespaces runtime checks as unknown without SSH o
   const ids = report.checks.filter((check) => check.id.startsWith('codespaces.runtime.')).map((check) => check.id);
   assert.deepEqual(ids, [
     'codespaces.runtime.provider',
-    'codespaces.runtime.readback',
+      'codespaces.runtime.readback',
+      'codespaces.runtime.ports',
     'codespaces.runtime.repository',
     'codespaces.runtime.creation-logs',
     'codespaces.runtime.ssh',
@@ -416,4 +419,31 @@ test('backend accepts empty argv tokens and preserves them in the framed corpus 
     if (previous === undefined) delete process.env.AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES;
     else process.env.AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES = previous;
   }
+});
+
+test('lifecycle stop/start uses exact identity, blocks active commands, and reconcile never mutates', async () => {
+  const stateDir = join(await mkdtemp(join(tmpdir(), 'agent-containers-lifecycle-')), 'state');
+  await saveMetadata(stateDir, recordedWorkspace(), { expectedGeneration: null });
+  const calls: string[][] = [];
+  let state = 'Running';
+  const runner: ProcessRunner = { async run(command, args) {
+    calls.push([command, ...args]);
+    if (args.includes('/user')) return { code: 0, stdout: JSON.stringify({ id: 1, login: 'octo' }), stderr: '' };
+    if (args.includes('state=Shutdown')) { state = 'Shutdown'; return { code: 0, stdout: '', stderr: '' }; }
+    if (args.includes('state=Running')) { state = 'Running'; return { code: 0, stdout: '', stderr: '' }; }
+    if (/^\/user\/codespaces\//.test(args.at(-1) ?? '')) return { code: 0, stdout: JSON.stringify(resourceFixture({ state })), stderr: '' };
+    throw new Error(`unexpected lifecycle call ${JSON.stringify(args)}`);
+  } };
+  const deps = { stateDir, name: 'issue-9', config: configFixture(), provider: new GhCodespacesProvider(runner) };
+  assert.equal(await reconcileCodespacesWorkspace(deps), 'matched');
+  await stopCodespacesWorkspace(deps);
+  const stoppedRecord = await loadMetadata(stateDir, 'issue-9');
+  assert.ok(stoppedRecord && stoppedRecord.version === 2 && stoppedRecord.backend === 'codespaces');
+  assert.equal(stoppedRecord.lifecycle.normalized, 'stopped');
+  await startCodespacesWorkspace(deps);
+  const startedRecord = await loadMetadata(stateDir, 'issue-9');
+  assert.ok(startedRecord && startedRecord.version === 2 && startedRecord.backend === 'codespaces');
+  assert.equal(startedRecord.lifecycle.normalized, 'starting');
+  assert.ok(calls.some((args) => args.includes('state=Shutdown')));
+  assert.ok(calls.some((args) => args.includes('state=Running')));
 });

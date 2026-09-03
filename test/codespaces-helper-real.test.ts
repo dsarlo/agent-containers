@@ -348,6 +348,49 @@ test('real helper binary: empty argv tokens flow end to end with no deadlock (N3
   }
 });
 
+test('real helper binary: credential-shaped argv is hashed in durable command.json (L2)', async (t: TestContext) => {
+  if (skipIfUnsupported(t)) return;
+  const data = await helperDataRoot();
+  const client = new RealHelperProcess(BIN as string, data);
+  const credential = 'ghp_012345678901234567890123456789012345';
+  try {
+    await client.autoHello();
+    client.writeFrame(HelperFrameType.exec, {
+      command_id: COMMAND_ID, request_hash: 'h-redaction', workspace_id: WORKSPACE_ID,
+      argv: ['printf', '%s', credential], mode: 'pipe', cwd: null,
+    });
+    await collectUntilExit(client);
+    const record = requireF(data, WORKSPACE_ID, COMMAND_ID, 'command.json');
+    assert.doesNotMatch(record, new RegExp(credential));
+    assert.match(record, /redacted-fnv1a64-[0-9a-f]{16}/);
+  } finally {
+    client.endStdin();
+    client.kill();
+  }
+});
+
+test('real helper binary: stdin beyond the bounded queue reports an explicit error (L4)', async (t: TestContext) => {
+  if (skipIfUnsupported(t)) return;
+  const data = await helperDataRoot();
+  const client = new RealHelperProcess(BIN as string, data);
+  try {
+    await client.autoHello();
+    client.writeFrame(HelperFrameType.exec, {
+      command_id: COMMAND_ID, request_hash: 'h-stdin-overflow', workspace_id: WORKSPACE_ID,
+      argv: ['sh', '-c', 'sleep 10'], mode: 'pipe', cwd: null,
+    });
+    await client.until((event) => event.kind === 'started', 5000);
+    client.sendStdin(new Uint8Array(5 * 1024 * 1024).fill(65), 1024 * 1024);
+    const events = await collectTerminal(client);
+    const overflow = events.find((event) => event.kind === 'error');
+    assert.equal(overflow?.message, 'stdin-overflow');
+  } finally {
+    groupKill(data, WORKSPACE_ID, COMMAND_ID);
+    client.endStdin();
+    client.kill();
+  }
+});
+
 test('real helper binary: execute through the full backend transport yields the exact corpus output and exit (N2)', async (t: TestContext) => {
   if (skipIfUnsupported(t)) return;
   const bin = BIN as string;
