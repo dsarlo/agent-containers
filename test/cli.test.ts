@@ -23,6 +23,28 @@ test('built public CLI entry point has the platform-appropriate package-bin cont
   assert.equal(mode & 0o111, 0o111, 'the built CLI must be directly executable for npm link and package bins');
 });
 
+test('CLI list, probe, and stale are read-only while status keeps its legacy metadata JSON', async (t) => {
+  const stateHome = await mkdtemp(join(tmpdir(), 'agent-containers-cli-inventory-'));
+  const stateDir = join(stateHome, 'agent-containers');
+  const root = await mkdtemp(join(tmpdir(), 'agent-containers-cli-inventory-repo-'));
+  const entry = { version: 1 as const, name: 'safe', repoRoot: root, worktree: join(root, 'worktrees', 'safe'), branch: 'agent-containers/safe', baseRef: 'refs/heads/main', devcontainerPath: '.devcontainer/devcontainer.json', createdAt: '2020-01-01T00:00:00.000Z' };
+  await mkdir(entry.worktree, { recursive: true });
+  await saveMetadata(stateDir, entry, { expectedGeneration: null });
+  const previous = process.env.XDG_STATE_HOME;
+  process.env.XDG_STATE_HOME = stateHome;
+  t.after(async () => { if (previous === undefined) delete process.env.XDG_STATE_HOME; else process.env.XDG_STATE_HOME = previous; await rm(stateHome, { recursive: true, force: true }); await rm(root, { recursive: true, force: true }); });
+  const listed: string[] = [];
+  assert.equal(await runCli(['list', '--json'], root, (message) => listed.push(message)), 0);
+  assert.equal(JSON.parse(listed[0])[0].worktree.state, 'unprobed');
+  const legacy: string[] = [];
+  assert.equal(await runCli(['status', 'safe'], root, (message) => legacy.push(message)), 0);
+  assert.equal(JSON.parse(legacy[0])[0].name, 'safe');
+  assert.equal(JSON.parse(legacy[0])[0].worktree, entry.worktree);
+  const stale: string[] = [];
+  assert.equal(await runCli(['stale', '--older-than', '1d'], root, (message) => stale.push(message)), 0);
+  assert.match(stale[0], /No managed workspaces/);
+});
+
 test('CLI parses destructive confirmation options strictly', async () => {
   const messages: string[] = [];
   assert.equal(await runCli(['remove', 'safe'], process.cwd(), (message) => messages.push(message)), 2);
