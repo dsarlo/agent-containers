@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test, { type TestContext } from 'node:test';
 import { createHash } from 'node:crypto';
-import { readFile, readdir, access } from 'node:fs/promises';
+import { readFile, readdir, access, mkdir, utimes, writeFile } from 'node:fs/promises';
 import { readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { COMMAND_ID, FIXTURE_ARM64, FIXTURE_X64, WORKSPACE_ID } from './transport-fixtures.js';
@@ -443,6 +443,41 @@ test('real helper binary: byte retention rejects evicted offsets and resumes its
       const events = await collectUntilExit(resumed);
       assert.equal(reassembleOutput(events, 'stdout').toString(), '7890');
     } finally { resumed.kill(); }
+  } finally { client.kill(); }
+});
+
+test('real helper binary: invalid retention settings are rejected fail-closed with exact reasons (F4/L3)', async (t: TestContext) => {
+  if (skipIfUnsupported(t)) return;
+  const data = await helperDataRoot();
+  for (const [field, value, reason] of [['retention_bytes', 0, 'invalid-retention-bytes'], ['retention_hours', 0, 'invalid-retention-hours']] as const) {
+    const client = new RealHelperProcess(BIN as string, data);
+    try {
+      await client.autoHello();
+      client.writeFrame(HelperFrameType.exec, { command_id: `${COMMAND_ID}-${field}`, request_hash: `h-${field}`, workspace_id: WORKSPACE_ID, argv: ['true'], mode: 'pipe', cwd: null, [field]: value });
+      const rejected = await client.nextTyped();
+      assert.equal(rejected?.kind, 'rejected');
+      assert.equal(rejected?.reason, reason);
+    } finally { client.kill(); }
+  }
+});
+
+test('real helper binary: EXEC purges only expired command directories before creating its durable record (F4/L3)', async (t: TestContext) => {
+  if (skipIfUnsupported(t)) return;
+  const data = await helperDataRoot();
+  const expired = commandDir(data, WORKSPACE_ID, 'expired-command');
+  const current = commandDir(data, WORKSPACE_ID, 'current-command');
+  await Promise.all([mkdir(expired, { recursive: true }), mkdir(current, { recursive: true })]);
+  await Promise.all([writeFile(join(expired, 'marker'), 'expired'), writeFile(join(current, 'marker'), 'current')]);
+  const now = new Date();
+  await Promise.all([utimes(expired, new Date(now.getTime() - 7_200_000), new Date(now.getTime() - 7_200_000)), utimes(current, now, now)]);
+  const client = new RealHelperProcess(BIN as string, data);
+  try {
+    await client.autoHello();
+    client.writeFrame(HelperFrameType.exec, { command_id: COMMAND_ID, request_hash: 'h-purge', workspace_id: WORKSPACE_ID, argv: ['true'], mode: 'pipe', cwd: null, retention_hours: 1 });
+    await collectUntilExit(client);
+    await assert.rejects(() => access(expired), { code: 'ENOENT' });
+    await access(current);
+    await access(commandDir(data, WORKSPACE_ID, COMMAND_ID));
   } finally { client.kill(); }
 });
 

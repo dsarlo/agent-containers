@@ -14,9 +14,10 @@ import { reconcileCodespacesWorkspace, removeCodespacesWorkspace, startCodespace
 import { GhCodespacesProvider } from './codespaces.js';
 
 export interface CliIo { input: NodeJS.ReadableStream; output: NodeJS.WritableStream; isTTY: boolean }
+export interface CliDependencies { createCodespacesBackend?: typeof createCodespacesExecutionBackend }
 const processIo: CliIo = { input: process.stdin, output: process.stdout, isTTY: Boolean(process.stdin.isTTY) };
 
-export async function runCli(args: string[], cwd = process.cwd(), write: (message: string) => void = console.log, io: CliIo = processIo): Promise<number> {
+export async function runCli(args: string[], cwd = process.cwd(), write: (message: string) => void = console.log, io: CliIo = processIo, dependencies: CliDependencies = {}): Promise<number> {
   if (args.length === 1 && (args[0] === '--help' || args[0] === '-h')) {
     write(usage());
     return 0;
@@ -209,10 +210,29 @@ export async function runCli(args: string[], cwd = process.cwd(), write: (messag
           const root = await findGitRoot(cwd, nodeProcessRunner);
           const config = await loadConfig(join(root, '.agent-containers.yml'));
           if (config.version !== 2 || !config.backends.enabled.includes('codespaces')) throw new Error('The recorded workspace requires an enabled Codespaces backend configuration.');
-          const backend = createCodespacesExecutionBackend({ stateDir, config, runner: nodeProcessRunner, root });
+          const backend = (dependencies.createCodespacesBackend ?? createCodespacesExecutionBackend)({ stateDir, config, runner: nodeProcessRunner, root });
           const request: RemoteCommandRequest = { commandId: `cli-${randomUUID()}`, argv: [rest[separator + 1] ?? 'true', ...rest.slice(separator + 2)] };
-          for await (const event of executeWithInterruptRelay(backend, { kind: 'codespaces', id: recorded.workspaceId, name: recorded.name, environmentId: recorded.remote.environmentId }, request)) { void event; }
-          return 0;
+          for await (const event of executeWithInterruptRelay(backend, { kind: 'codespaces', id: recorded.workspaceId, name: recorded.name, environmentId: recorded.remote.environmentId }, request)) {
+            if (event.type === 'exit') return event.code ?? 1;
+            if (event.type === 'rejected') {
+              write('Remote command was rejected; no successful remote outcome was reported.');
+              return 1;
+            }
+            if (event.type === 'detached') {
+              write('Remote command detached before its outcome was known.');
+              return 1;
+            }
+            if (event.type === 'cancel-unknown') {
+              write('Remote command cancellation could not be verified; its outcome is unknown.');
+              return 1;
+            }
+            if (event.type === 'cancelled') {
+              write('Remote command cancellation was verified.');
+              return 130;
+            }
+          }
+          write('Remote command ended without a terminal outcome.');
+          return 1;
         }
         const backend = resolveExecutionBackend('local', { execute: async function* (_handle, request) {
           const result = await execNamedWorkspaceLifecycle(name, [...request.argv], nodeProcessRunner, stateDir);
