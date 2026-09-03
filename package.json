@@ -51,6 +51,8 @@
     "verify:helper-reproducible": "node scripts/build-helper.mjs verify-reproducible",
     "test:native-packaging-contract": "node scripts/test-native-packaging-contract.mjs",
     "verify:ci-yaml": "node scripts/verify-ci-yaml.mjs",
+    "verify:lockfile-policy": "node scripts/verify-lockfile-policy.mjs",
+    "test:lockfile-policy": "node scripts/test-lockfile-policy.mjs",
     "verify:native-state-lifecycle-contract": "node scripts/verify-native-state-lifecycle-contract.mjs",
     "test:native": "npm run build:native && npm run build && npm run verify:native-state-lifecycle-contract && node scripts/test-native.mjs",
     "lint": "eslint .",

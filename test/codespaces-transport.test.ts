@@ -48,6 +48,14 @@ function reassemble(chunks: readonly { bytes: Uint8Array }[]): Buffer {
   return Buffer.concat(chunks.map((chunk) => Buffer.from(chunk.bytes)));
 }
 
+test('execute rejects credential-shaped argv before recording or dispatching it (SEC-2)', async () => {
+  const fixture = await transportFixture();
+  const token = 'ghp_' + 'abcdefghijklmnopqrstuvwxyz123456';
+  await assert.rejects(() => executeToEnd(fixture, pipeInput({ argv: ['tool', '--token', token] })), /credential-shaped argv/i);
+  assert.equal(fixture.helper.records.has(COMMAND_ID), false, 'credential-shaped argv must never reach the helper');
+  assert.equal(await loadCommandRequest(fixture.stateDir, COMMAND_ID), undefined, 'credential-shaped argv must never enter durable request state');
+});
+
 test('execute preserves the exhaustive argv corpus end to end without a host shell (N1)', async () => {
   const argv: readonly [string, ...string[]] = [
     'printf', '%s',

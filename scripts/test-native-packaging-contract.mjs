@@ -36,7 +36,7 @@ const legacyV4ActionRefs = Object.freeze({
 });
 
 function actionStep(action, ref = actionRefs[action]) {
-  return `      # ${action} v5\n      - uses: ${action}@${ref}`;
+  return `      # ${action} v5\n      - uses: ${action}@${ref}${action === 'actions/checkout' ? '\n        with:\n          persist-credentials: false' : ''}`;
 }
 
 function sourceBuildSteps(refs = actionRefs) {
@@ -76,7 +76,7 @@ ${actionStep('actions/download-artifact', refs['actions/download-artifact'])}
         with:
           name: native-package
           path: ${archiveDirectory}
-      - run: mkdir .packed-native && npm install --prefix .packed-native ./${archiveDirectory}/*.tgz
+      - run: mkdir .packed-native && npm install --ignore-scripts --prefix .packed-native ./${archiveDirectory}/*.tgz
       - run: node scripts/test-native.mjs
         env:
           PACKED_NATIVE_PACKAGE_DIR: ${'${{ github.workspace }}'}/.packed-native/node_modules/@dsarlo/agent-containers
@@ -93,9 +93,9 @@ ${actionStep('actions/setup-node', refs['actions/setup-node'])}
         with:
           node-version: 20.19.0
           cache: npm
-      - run: npm ci
+      - run: npm ci --ignore-scripts
 ${nativeBuildStep}
-      - run: npm install --global @devcontainers/cli@0.89.0
+      - run: npm install --global --ignore-scripts @devcontainers/cli@0.89.0
       - name: Require Docker, Dev Containers, and relative linked-worktree support
         run: |
           docker version
@@ -156,11 +156,14 @@ const allSupportedArchitectures = [
   { runner: 'windows-11-arm', artifact: 'win32-arm64', publicationMode: 'recoverable' },
 ];
 
-async function writeFixture(workflow) {
+async function writeFixture(workflow, devcontainerPostCreateCommand = 'npm ci --ignore-scripts') {
   const workflowDirectory = join(fixtureRoot, '.github', 'workflows');
+  const devcontainerDirectory = join(fixtureRoot, '.devcontainer');
   await mkdir(workflowDirectory, { recursive: true });
+  await mkdir(devcontainerDirectory, { recursive: true });
   await writeFile(join(fixtureRoot, 'package.json'), `${JSON.stringify(requiredPackage, null, 2)}\n`, 'utf8');
   await writeFile(join(workflowDirectory, 'ci.yml'), workflow, 'utf8');
+  await writeFile(join(devcontainerDirectory, 'devcontainer.json'), `${JSON.stringify({ postCreateCommand: devcontainerPostCreateCommand }, null, 2)}\n`, 'utf8');
 }
 
 function verifyFixture() {
@@ -197,6 +200,14 @@ try {
     `the static packaging contract must accept full immutable actions/* commit SHAs with adjacent action/version comments:\n${pinnedActionsResult.output}`,
   );
 
+  await writeFixture(workflowFor(allSupportedArchitectures), 'npm ci');
+  const unsafeDevcontainerInstallResult = verifyFixture();
+  assert.notEqual(
+    unsafeDevcontainerInstallResult.status,
+    0,
+    'the static packaging contract must reject a Dev Container post-create npm ci command that enables dependency lifecycle scripts',
+  );
+
   await writeFixture(workflowFor(allSupportedArchitectures, '.', packageArchiveDirectory, '', legacyV4ActionRefs));
   const legacyV4ActionsResult = verifyFixture();
   assert.notEqual(
@@ -225,8 +236,8 @@ try {
     {
       name: 'build:native after prerequisites',
       workflow: (fixture) => fixture.replace(
-        `${liveNativeBuildStep}\n      - run: npm install --global @devcontainers/cli@0.89.0`,
-        '      - run: npm install --global @devcontainers/cli@0.89.0',
+        `${liveNativeBuildStep}\n      - run: npm install --global --ignore-scripts @devcontainers/cli@0.89.0`,
+        '      - run: npm install --global --ignore-scripts @devcontainers/cli@0.89.0',
       ).replace(
         '      - run: AGENT_CONTAINERS_REQUIRE_LIVE_INTEGRATION=1 npm run test:integration',
         `${liveNativeBuildStep}\n      - run: AGENT_CONTAINERS_REQUIRE_LIVE_INTEGRATION=1 npm run test:integration`,
@@ -386,11 +397,15 @@ try {
     },
     {
       name: 'npm ci if',
-      workflow: (fixture) => fixture.replace('      - run: npm ci', '      - if: always()\n        run: npm ci'),
+      workflow: (fixture) => fixture.replace('      - run: npm ci --ignore-scripts', '      - if: always()\n        run: npm ci --ignore-scripts'),
     },
     {
       name: 'Dev Containers CLI install continue-on-error',
-      workflow: (fixture) => fixture.replace('      - run: npm install --global @devcontainers/cli@0.89.0', '      - continue-on-error: true\n        run: npm install --global @devcontainers/cli@0.89.0'),
+      workflow: (fixture) => fixture.replace('      - run: npm install --global --ignore-scripts @devcontainers/cli@0.89.0', '      - continue-on-error: true\n        run: npm install --global --ignore-scripts @devcontainers/cli@0.89.0'),
+    },
+    {
+      name: 'packed package install runs lifecycle scripts',
+      workflow: (fixture) => fixture.replace(`npm install --ignore-scripts --prefix .packed-native ${packageInstallArchiveGlob}`, `npm install --prefix .packed-native ${packageInstallArchiveGlob}`),
     },
     {
       name: 'prerequisite if',
@@ -483,8 +498,8 @@ try {
   }
 
   const legacyPackageInstallWorkflow = workflowFor(allSupportedArchitectures).replace(
-    `npm install --prefix .packed-native ${packageInstallArchiveGlob}`,
-    `npm install --prefix .packed-native ${packageArchiveDirectory}/*.tgz`,
+    `npm install --ignore-scripts --prefix .packed-native ${packageInstallArchiveGlob}`,
+    `npm install --ignore-scripts --prefix .packed-native ${packageArchiveDirectory}/*.tgz`,
   );
   await writeFixture(legacyPackageInstallWorkflow);
   const legacyPackageInstallResult = verifyFixture();
@@ -554,7 +569,7 @@ try {
     },
     {
       name: 'smoke package installation if',
-      workflow: (fixture) => fixture.replace(`      - run: mkdir .packed-native && npm install --prefix .packed-native ${packageInstallArchiveGlob}`, `      - if: always()\n        run: mkdir .packed-native && npm install --prefix .packed-native ${packageInstallArchiveGlob}`),
+      workflow: (fixture) => fixture.replace(`      - run: mkdir .packed-native && npm install --ignore-scripts --prefix .packed-native ${packageInstallArchiveGlob}`, `      - if: always()\n        run: mkdir .packed-native && npm install --ignore-scripts --prefix .packed-native ${packageInstallArchiveGlob}`),
     },
     {
       name: 'removed production package smoke command',

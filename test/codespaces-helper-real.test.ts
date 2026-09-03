@@ -92,7 +92,30 @@ test('real helper binary: the handshake subcommand matches the package format (N
   void data;
 });
 
-test('real helper binary: execute → disconnect → attach from a nonzero offset resumes retained bytes and exact exit status (B2/N5)', async (t: TestContext) => {
+test('real helper never durably retains output that may contain a remote environment secret (SEC-1)', async (t: TestContext) => {
+  if (skipIfUnsupported(t)) return;
+  const bin = BIN as string;
+  const data = await helperDataRoot();
+  const secret = 'ghp_' + 'abcdefghijklmnopqrstuvwxyz123456';
+  const client = new RealHelperProcess(bin, data, { AC_TEST_SECRET: secret });
+  try {
+    await client.autoHello();
+    client.writeFrame(HelperFrameType.exec, {
+      command_id: COMMAND_ID, request_hash: 'h-secret-output', workspace_id: WORKSPACE_ID,
+      argv: ['printenv', 'AC_TEST_SECRET'], mode: 'pipe', cwd: null,
+    });
+    const events = await collectUntilExit(client);
+    assert.equal(reassembleOutput(events, 'stdout').toString(), `${secret}\n`);
+    const files = await readdir(commandDir(data, WORKSPACE_ID, COMMAND_ID));
+    const contents = await Promise.all(files.map((file) => readFile(join(commandDir(data, WORKSPACE_ID, COMMAND_ID), file), 'utf8')));
+    assert.ok(contents.every((content) => !content.includes(secret)), 'remote command records must never retain secret-bearing output');
+  } finally {
+    groupKill(data, WORKSPACE_ID, COMMAND_ID);
+    client.kill();
+  }
+});
+
+test('real helper binary: execute → disconnect → attach preserves exact exit status without retaining output (B2/SEC-1)', async (t: TestContext) => {
   if (skipIfUnsupported(t)) return;
   const bin = BIN as string;
   const data = await helperDataRoot();
@@ -117,7 +140,7 @@ test('real helper binary: execute → disconnect → attach from a nonzero offse
         stdout_offset: '5', stderr_offset: '0', terminal_offset: '0',
       });
       const events = await collectUntilExit(attach);
-      assert.equal(reassembleOutput(events, 'stdout').toString(), '67890', 'attach must resume the retained bytes from offset 5');
+      assert.equal(reassembleOutput(events, 'stdout').toString(), '', 'attach must not replay untrusted durable output');
       const exit = events.find((e) => e.kind === 'exit') as unknown as { code: number } | undefined;
       assert.ok(exit, 'attach must deliver an exit event');
       assert.equal(exit.code, 42, 'attach must deliver the exact retained exit status');
@@ -128,7 +151,7 @@ test('real helper binary: execute → disconnect → attach from a nonzero offse
     const status = JSON.parse(requireF(data, WORKSPACE_ID, COMMAND_ID, 'status.json'));
     assert.equal(status.state, 'exited');
     assert.equal(status.exit_code, 42);
-    assert.deepEqual(readdirSyncWithin(data, WORKSPACE_ID, COMMAND_ID).sort(), ['command.json', 'helper.json', 'status.json', 'stderr.log', 'stdout.log', 'terminal.log']);
+    assert.deepEqual(readdirSyncWithin(data, WORKSPACE_ID, COMMAND_ID).sort(), ['command.json', 'helper.json', 'status.json']);
     const helperJson = JSON.parse(requireF(data, WORKSPACE_ID, COMMAND_ID, 'helper.json'));
     assert.equal(helperJson.protocol, 1);
     assert.match(helperJson.arch, /^(x86_64|aarch64)$/);
@@ -171,7 +194,7 @@ test('real helper binary: PTY mode produces one merged terminal stream with \\r\
     assert.match(terminal, /40 100/, 'twsize(100x40) must be reflected by the child stty size');
     const status = JSON.parse(requireF(data, WORKSPACE_ID, COMMAND_ID, 'status.json'));
     assert.equal(status.state, 'exited');
-    assert.deepEqual(readFileSync(join(commandDir(data, WORKSPACE_ID, COMMAND_ID), 'terminal.log'), 'utf8'), terminal);
+    assert.equal(readdirSyncWithin(data, WORKSPACE_ID, COMMAND_ID).includes('terminal.log'), false, 'PTY output must not persist after the session ends');
   } finally {
     groupKill(data, WORKSPACE_ID, COMMAND_ID);
     client.endStdin();

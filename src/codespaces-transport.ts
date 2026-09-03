@@ -13,7 +13,7 @@ import {
 } from './codespaces-command.js';
 import { bootstrapRemoteHelper, inspectRemoteHelper, type RemoteHelperBootstrapResult } from './codespaces-helper.js';
 import type { CodespacesJournalEventInput } from './codespaces-ops.js';
-import { redactSecretDiagnostic } from './secrets.js';
+import { credentialArgvShaped, redactSecretDiagnostic, secretShaped } from './secrets.js';
 
 /**
  * Streaming transport over `gh codespace ssh`. The remote argv is always the
@@ -287,6 +287,7 @@ function statusRecord(commandId: string, now: () => string, state: CodespacesCom
 }
 
 export async function* executeRemoteCommand(deps: RemoteTransportDependencies, input: ExecuteTransportInput): AsyncGenerator<CommandEvent> {
+  if (credentialArgvShaped(input.argv) || input.argv.some(secretShaped)) throw new Error('Remote execution rejects credential-shaped argv. Pass secrets only through approved remote secret configuration.');
   const now = deps.now ?? (() => new Date().toISOString());
   const commandId = input.commandId;
   const requestHash = computeRequestHash(input.argv, input.cwd, input.mode);
