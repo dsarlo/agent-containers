@@ -8,6 +8,7 @@ import type { CodespacesAgentContainersConfig, CodespacesConfig, CommandEvent, E
 import { acknowledgeUnconfirmedProcessReap, clearManualRecoveryIfCurrent, defaultStateDir, deleteMetadata, isLocalWorkspaceMetadata, listMetadata, loadManualRecovery, loadMetadata, recordManualRecovery, releaseStaleWorkspaceLock, saveMetadata, withWorkspaceLock } from './state.js';
 import { execNamedWorkspaceLifecycle } from './runtime.js';
 import { createWorkspace, findGitRoot, nodeProcessRunner, removeWorkspace } from './workspaces.js';
+import { inventoryWorkspaces, staleCandidates, type WorkspaceInventory } from './inventory.js';
 import { assertBackendAvailable, createCodespacesExecutionBackend, resolveExecutionBackend } from './backend.js';
 
 export interface CliIo { input: NodeJS.ReadableStream; output: NodeJS.WritableStream; isTTY: boolean }
@@ -248,10 +249,31 @@ export async function runCli(args: string[], cwd = process.cwd(), write: (messag
         write(`Released stale lifecycle lock for ${name}`);
         return 0;
       }
+      case 'list': {
+        ensureOnly(rest, ['--json', '--probe']);
+        const entries = await inventoryWorkspaces(stateDir, nodeProcessRunner, { probe: rest.includes('--probe') });
+        write(rest.includes('--json') ? JSON.stringify(entries, null, 2) : renderInventory(entries));
+        return 0;
+      }
+      case 'stale': {
+        ensureOptions(rest, ['--older-than']);
+        const olderThan = optionValue(rest, '--older-than') ?? '30d';
+        const entries = staleCandidates(await inventoryWorkspaces(stateDir, nodeProcessRunner), parseStaleDuration(olderThan));
+        write(renderInventory(entries));
+        return 0;
+      }
       case 'status': {
-        if (rest.length > 1) throw new UsageError('Usage: agent-containers status [name]');
-        const entries = rest[0] ? [await loadMetadata(stateDir, rest[0])] : await listMetadata(stateDir);
-        if (entries.some((entry) => !entry)) throw new Error(`No Agent Containers workspace named "${rest[0]}".`);
+        const names = rest.filter((value) => !value.startsWith('--'));
+        if (names.length > 1 || rest.some((value) => value.startsWith('--') && value !== '--probe')) throw new UsageError('Usage: agent-containers status [name] [--probe]');
+        if (rest.includes('--probe')) {
+          const entries = await inventoryWorkspaces(stateDir, nodeProcessRunner, { probe: true });
+          const selected = names[0] ? entries.filter((entry) => entry.name === names[0]) : entries;
+          if (names[0] && selected.length === 0) throw new Error(`No Agent Containers workspace named "${names[0]}".`);
+          write(JSON.stringify(selected, null, 2));
+          return 0;
+        }
+        const entries = names[0] ? [await loadMetadata(stateDir, names[0])] : await listMetadata(stateDir);
+        if (entries.some((entry) => !entry)) throw new Error(`No Agent Containers workspace named "${names[0]}".`);
         write(JSON.stringify(redactConfig(entries), null, 2));
         return 0;
       }
@@ -356,8 +378,24 @@ async function* executeWithInterruptRelay(backend: ExecutionBackend, handle: Wor
   }
 }
 
+function renderInventory(entries: readonly WorkspaceInventory[]): string {
+  if (entries.length === 0) return 'No managed workspaces.';
+  return entries.map((entry) => `${entry.name}\t${entry.backend}\tworktree=${entry.worktree.state}\tcontainer=${entry.container.state}\tlock=${entry.lock}\trecovery=${entry.recovery}`).join('\n');
+}
+
+function parseStaleDuration(value: string): number {
+  const match = /^(\d+(?:\.\d+)?)(ms|s|m|h|d)?$/.exec(value.trim());
+  if (!match) throw new UsageError('--older-than must be a duration such as 30d, 12h, or 5m.');
+  const amount = Number(match[1]);
+  const unit = match[2] ?? 'd';
+  const multiplier = unit === 'ms' ? 1 : unit === 's' ? 1_000 : unit === 'm' ? 60_000 : unit === 'h' ? 3_600_000 : 86_400_000;
+  const total = amount * multiplier;
+  if (!Number.isSafeInteger(total) || total < 1 || total > 3650 * 86_400_000) throw new UsageError('--older-than must be between 1ms and 3650d.');
+  return Math.round(total);
+}
+
 function usage(): string {
-  return 'Usage: agent-containers <init|configure|doctor|validate|create|wait|exec|run|recover|unlock|status|remove> [options]\n  init [--interactive] [--backends local] [--non-interactive (--from FILE|--stdin)]\n  configure --interactive | --non-interactive (--from FILE|--stdin)\n  doctor [--backend local|codespaces|all] [--workspace NAME] [--json]\n  create <name> [--backend local|codespaces] [--machine MACHINE] [--geo GEO] --yes-cost\n  wait <name> --for ready [--timeout <duration>]';
+  return 'Usage: agent-containers <init|configure|doctor|validate|create|wait|exec|run|recover|unlock|list|status|stale|remove> [options]\n  list [--json] [--probe]\n  status [name] [--probe]\n  stale [--older-than <duration>]\n  doctor [--backend local|codespaces|all] [--workspace NAME] [--json]\n  create <name> [--backend local|codespaces] [--machine MACHINE] [--geo GEO] --yes-cost\n  wait <name> --for ready [--timeout <duration>]';
 }
 
 function codespacesCreateConfig(config: CodespacesAgentContainersConfig, args: string[]): CodespacesAgentContainersConfig {
