@@ -753,12 +753,15 @@ static void pump_once(struct ac_run *run) {
       redact_output(run, buf, (size_t)n);
       if (fd == run->stdout_fd) {
         append_stream_log(run->stdout_log, &run->stdout_offset, buf, (size_t)n, run->retention_bytes);
+        write_status_json(run, "running", -1);
         if (run->framed) emit_output(AC_OUTPUT_STDOUT, run->stdout_offset - (uint64_t)n, buf, (size_t)n);
       } else if (fd == run->stderr_fd) {
         append_stream_log(run->stderr_log, &run->stderr_offset, buf, (size_t)n, run->retention_bytes);
+        write_status_json(run, "running", -1);
         if (run->framed) emit_output(AC_OUTPUT_STDERR, run->stderr_offset - (uint64_t)n, buf, (size_t)n);
       } else {
         append_stream_log(run->terminal_log, &run->terminal_offset, buf, (size_t)n, run->retention_bytes);
+        write_status_json(run, "running", -1);
         if (run->framed) emit_output(AC_OUTPUT_TERMINAL, run->terminal_offset - (uint64_t)n, buf, (size_t)n);
       }
       continue;
@@ -1012,6 +1015,31 @@ static int load_status_json(const char *workspace_id, const char *command_id, ch
   return 1;
 }
 
+static int load_status_offsets(const char *workspace_id, const char *command_id, uint64_t *stdout_offset, uint64_t *stderr_offset, uint64_t *terminal_offset) {
+  char dir[AC_JPATH];
+  command_dir_path(workspace_id, command_id, dir, sizeof(dir));
+  char path[AC_FPATH];
+  snprintf(path, sizeof(path), "%s/status.json", dir);
+  FILE *f = fopen(path, "r");
+  if (f == NULL) return 0;
+  char buf[2048];
+  size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+  fclose(f);
+  buf[n] = '\0';
+  char value[32];
+  uint64_t *offsets[] = { stdout_offset, stderr_offset, terminal_offset };
+  const char *keys[] = { "stdout_offset", "stderr_offset", "terminal_offset" };
+  for (size_t i = 0; i < 3; i++) {
+    if (json_value(buf, keys[i], value, sizeof(value)) == NULL) return 0;
+    char *end = NULL;
+    errno = 0;
+    uint64_t parsed = (uint64_t)strtoull(value, &end, 10);
+    if (errno != 0 || end == value || *end != '\0') return 0;
+    *offsets[i] = parsed;
+  }
+  return 1;
+}
+
 /* Cross-session (fresh connection) cancel: the fresh run has no owning pgid,
  * so the recorded pgid is used and proof is reported only after the owning
  * server observed the completion in status.json within the bounded grace (B3). */
@@ -1189,8 +1217,25 @@ static void orphan_pump(struct ac_run *run) {
   if (run->stdin_fd >= 0) { close(run->stdin_fd); run->stdin_fd = -1; }
 }
 
-/* Open a retained log file positioned at `from`; returns the fd and the
- * current on-disk EOF, or -1 when the log is absent / offset is beyond EOF. */
+/* Open a retained log at a logical stream offset. The retained file's base is
+ * derived from the durable stream end, so evicted bytes remain detectable. */
+static int open_retained_log_at(const char *dir, const char *name, uint64_t from, uint64_t logical_end, uint64_t *end) {
+  char path[AC_FPATH];
+  snprintf(path, sizeof(path), "%s/%s", dir, name);
+  int fd = open(path, O_RDONLY);
+  if (fd < 0) return -1;
+  struct stat st;
+  if (fstat(fd, &st) != 0) { close(fd); return -1; }
+  uint64_t size = (uint64_t)st.st_size;
+  if (logical_end < size) { close(fd); return -1; }
+  uint64_t base = logical_end - size;
+  if (from < base || from > logical_end) { close(fd); return -1; }
+  *end = logical_end;
+  if (lseek(fd, (off_t)(from - base), SEEK_SET) < 0) { close(fd); return -1; }
+  return fd;
+}
+
+/* Open a log positioned at its physical file offset for the live tail. */
 static int open_log_at(const char *dir, const char *name, uint64_t from, uint64_t *end) {
   char path[AC_FPATH];
   snprintf(path, sizeof(path), "%s/%s", dir, name);
@@ -1307,11 +1352,20 @@ static void handle_attach(struct ac_frame *frame, int grace_ms) {
   uint64_t stdout_end = 0;
   uint64_t stderr_end = 0;
   uint64_t terminal_end = 0;
-  int stdout_fd = open_log_at(dir, "stdout.log", stdout_from, &stdout_end);
-  int stderr_fd = open_log_at(dir, "stderr.log", stderr_from, &stderr_end);
-  int terminal_fd = open_log_at(dir, "terminal.log", terminal_from, &terminal_end);
-  /* Output is intentionally never retained. Attachment is status/cancellation
-   * recovery only, so missing output logs are expected rather than rejected. */
+  if (!load_status_offsets(workspace_id, command_id, &stdout_end, &stderr_end, &terminal_end)) {
+    emit_jsonf(AC_E_REJECTED, "{\"command_id\":\"%s\",\"reason\":\"attach-offset-beyond-retention\"}", command_id);
+    return;
+  }
+  int stdout_fd = open_retained_log_at(dir, "stdout.log", stdout_from, stdout_end, &stdout_end);
+  int stderr_fd = open_retained_log_at(dir, "stderr.log", stderr_from, stderr_end, &stderr_end);
+  int terminal_fd = open_retained_log_at(dir, "terminal.log", terminal_from, terminal_end, &terminal_end);
+  if (stdout_fd < 0 || stderr_fd < 0 || terminal_fd < 0) {
+    if (stdout_fd >= 0) close(stdout_fd);
+    if (stderr_fd >= 0) close(stderr_fd);
+    if (terminal_fd >= 0) close(terminal_fd);
+    emit_jsonf(AC_E_REJECTED, "{\"command_id\":\"%s\",\"reason\":\"attach-offset-beyond-retention\"}", command_id);
+    return;
+  }
   char ec[16];
   if (exit_code < 0) snprintf(ec, sizeof(ec), "null");
   else snprintf(ec, sizeof(ec), "%d", exit_code);

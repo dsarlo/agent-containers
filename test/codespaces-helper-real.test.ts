@@ -12,7 +12,7 @@ import {
 import { HelperFrameType } from '../src/codespaces-protocol.js';
 import { executeRemoteCommand } from '../src/codespaces-transport.js';
 import { loadCommandStatus } from '../src/codespaces-command.js';
-import { transportFixture } from './transport-fixtures.js';
+import { transportConfigFixture, transportFixture } from './transport-fixtures.js';
 import type { CommandEvent } from '../src/types.js';
 
 const BIN = realHelperBinaryPath();
@@ -416,7 +416,7 @@ test('real helper binary: stdin overflow is caller-visible and never reconnects 
   }
 });
 
-test('real helper binary: byte retention keeps a deterministic tail and attach does not duplicate that tail (N5)', async (t: TestContext) => {
+test('real helper binary: byte retention rejects evicted offsets and resumes its deterministic tail (N5)', async (t: TestContext) => {
   if (skipIfUnsupported(t)) return;
   const data = await helperDataRoot();
   const client = new RealHelperProcess(BIN as string, data);
@@ -432,10 +432,43 @@ test('real helper binary: byte retention keeps a deterministic tail and attach d
     try {
       await attach.autoHello();
       attach.writeFrame(HelperFrameType.attach, { command_id: COMMAND_ID, request_hash: 'h-retention', workspace_id: WORKSPACE_ID, stdout_offset: '0', stderr_offset: '0', terminal_offset: '0' });
-      const events = await collectUntilExit(attach);
-      assert.equal(reassembleOutput(events, 'stdout').toString(), '7890');
+      const rejected = await attach.nextTyped();
+      assert.equal(rejected?.kind, 'rejected');
+      assert.equal(rejected?.reason, 'attach-offset-beyond-retention');
     } finally { attach.kill(); }
+    const resumed = new RealHelperProcess(BIN as string, data);
+    try {
+      await resumed.autoHello();
+      resumed.writeFrame(HelperFrameType.attach, { command_id: COMMAND_ID, request_hash: 'h-retention', workspace_id: WORKSPACE_ID, stdout_offset: '6', stderr_offset: '0', terminal_offset: '0' });
+      const events = await collectUntilExit(resumed);
+      assert.equal(reassembleOutput(events, 'stdout').toString(), '7890');
+    } finally { resumed.kill(); }
   } finally { client.kill(); }
+});
+
+test('real helper binary: a live chunk larger than retention reaches executeRemoteCommand intact and exits durably (N5)', async (t: TestContext) => {
+  if (skipIfUnsupported(t)) return;
+  const data = await helperDataRoot();
+  try {
+    const config = transportConfigFixture();
+    config.backends.codespaces.transport.remoteLogBytesPerStream = 4;
+    const fixture = await transportFixture({
+      config,
+      spawner: createRealHelperSpawner(BIN as string, data),
+      runner: realBootstrapRunner(BIN as string, digestOf(process.arch === 'arm64' ? FIXTURE_ARM64 : FIXTURE_X64)),
+    });
+    const events: CommandEvent[] = [];
+    for await (const event of executeRemoteCommand(fixture.deps, {
+      commandId: COMMAND_ID, argv: ['sh', '-c', 'printf 1234567890'], mode: 'pipe', stdin: 'closed',
+    })) events.push(event);
+    assert.equal(Buffer.concat(events.filter((event) => event.type === 'stdout').map((event) => Buffer.from((event as { bytes: Uint8Array }).bytes))).toString(), '1234567890');
+    assert.deepEqual(events.at(-1), { type: 'exit', commandId: COMMAND_ID, code: 0 });
+    const status = await loadCommandStatus(fixture.stateDir, COMMAND_ID);
+    assert.equal(status?.state, 'exited');
+    assert.equal(status?.exitCode, 0);
+  } finally {
+    killSpawnedRelays();
+  }
 });
 
 test('real helper binary: execute through the full backend transport yields the exact corpus output and exit (N2)', async (t: TestContext) => {
