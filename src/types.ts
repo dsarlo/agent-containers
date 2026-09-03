@@ -81,7 +81,7 @@ export interface CodespacesConfig {
   maxCreating: number;
   maxParallelCommandsPerWorkspace: number;
   readiness: { providerTimeoutSeconds: number; sshTimeoutSeconds: number; command: string[]; commandTimeoutSeconds: number };
-  transport: { reconnectWindowSeconds: number; cancelGraceSeconds: number; remoteLogBytesPerStream: number; remoteLogRetentionHours: number };
+  transport: { reconnectWindowSeconds: number; cancelGraceSeconds: number };
   ports: { allowVisibilityChanges: boolean; allowPublic: boolean };
   secrets: { allowedRemoteSecretNames: string[]; allowCodespaceGitCredential: boolean };
 }

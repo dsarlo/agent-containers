@@ -9,12 +9,11 @@
  * Design rules (spec section 9):
  *  - No shell string is ever executed. User argv travels inside length-prefixed
  *    frames on stdin and is passed to fork()+execvp() directly.
- *  - stdout/stderr (pipe mode) or the merged PTY terminal (pty mode) are logged
- *    durably under /workspaces/.agent-containers/<workspace_id>/commands/<id>/
- *    (spec 9.3 / N5) with byte offsets before offsets are acknowledged. Attach
- *    re-emits retained logs from the requested stream offsets (B2).
+ *  - stdout/stderr (pipe mode) or the merged PTY terminal (pty mode) stream
+ *    only to the connected caller. Child output is never written under
+ *    /workspaces/.agent-containers and attach never replays it (SEC-1).
  *  - The owning serve process survives transport loss: on EOF it switches to a
- *    durable orphan pump that drains the child streams into the log files,
+ *    durable orphan pump that drains child streams without retaining output,
  *    reaps the child and records the final status. Transport loss and stdin
  *    half-close never SIGKILL the process group (B4).
  *  - Cancel proof requires the recorded owning process group; CANCEL_VERIFIED
@@ -35,6 +34,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include <errno.h>
+#include <ctype.h>
 #include <fcntl.h>
 #include <inttypes.h>
 #include <poll.h>
@@ -190,13 +190,16 @@ static int read_frame(int fd, struct ac_frame *frame) {
   }
   frame->payload = NULL;
   if (frame->length > 0) {
-    frame->payload = malloc(frame->length);
+    /* All control payloads are JSON and are subsequently parsed with C string
+     * functions. Keep the wire limit, but supply a private trailing NUL. */
+    frame->payload = malloc((size_t)frame->length + 1);
     if (frame->payload == NULL) return -1;
     if (read_exact(fd, frame->payload, frame->length) != 0) {
       free(frame->payload);
       frame->payload = NULL;
       return -1;
     }
+    frame->payload[frame->length] = '\0';
   }
   return 0;
 }
@@ -208,10 +211,10 @@ static void free_frame(struct ac_frame *frame) {
 
 /* === Durable command tree (spec section 9.3 / N5) ===
  * <data_root>/<workspace_id>/commands/<command_id>/
- *   command.json  identity (argv, mode, pid, pgid)
- *   status.json   { state, exit_code, stdout_offset, stderr_offset, terminal_offset }
+ *   command.json  identity and lifecycle ownership (never argv or request hash)
+ *   status.json   { state, exit_code, timestamps }
  *   helper.json   { protocol, arch, version }
- *   stdout.log / stderr.log (pipe) or terminal.log (pty) retained appends. */
+ * Child output is never written into this tree. */
 static const char *helper_data_root(void) {
   const char *env = getenv("AC_HELPER_DATA_DIR");
   return (env != NULL && env[0] != '\0') ? env : "/workspaces/.agent-containers";
@@ -436,12 +439,76 @@ struct ac_run {
   uint64_t stdout_offset;
   uint64_t stderr_offset;
   uint64_t terminal_offset;
-  FILE *stdout_log;
-  FILE *stderr_log;
-  FILE *terminal_log;
   int live;
-  int framed; /* false once the transport is lost and we only log durably */
+  int framed; /* false once the transport is lost and no frames are emitted */
+  char *secret_names[32];
+  char *secret_values[32];
+  int secret_count;
 };
+
+static int parse_string_array(const char *payload, const char *key, char **out, int max_out) {
+  char needle[96];
+  snprintf(needle, sizeof(needle), "\"%s\"", key);
+  const char *start = strstr(payload, needle);
+  if (start == NULL) { out[0] = NULL; return 0; }
+  start = strchr(start, '[');
+  if (start == NULL) return -1;
+  int count = 0;
+  const char *cursor = start;
+  while (count < max_out - 1) {
+    while (*cursor == '[' || *cursor == ',' || *cursor == ' ' || *cursor == '\t' || *cursor == '\n') cursor++;
+    if (*cursor == ']') break;
+    if (*cursor != '"') return -1;
+    char token[1024]; size_t consumed = 0;
+    int len = json_string_token(cursor + 1, token, sizeof(token), &consumed);
+    if (len < 0) return -1;
+    char *value = malloc((size_t)len + 1);
+    if (value == NULL) return -1;
+    memcpy(value, token, (size_t)len + 1);
+    out[count++] = value;
+    cursor += consumed + 1;
+  }
+  while (*cursor == ' ' || *cursor == '\t' || *cursor == '\n') cursor++;
+  /* Reject an overlong array rather than silently dropping a capability. */
+  if (*cursor != ']') {
+    for (int i = 0; i < count; i++) { free(out[i]); out[i] = NULL; }
+    return -1;
+  }
+  out[count] = NULL;
+  return count;
+}
+
+static int safe_env_name(const char *value) {
+  if (value == NULL || !(isalpha((unsigned char)value[0]) || value[0] == '_')) return 0;
+  for (const unsigned char *p = (const unsigned char *)value + 1; *p != '\0'; p++) {
+    if (!(isalnum(*p) || *p == '_')) return 0;
+  }
+  return 1;
+}
+
+static void redact_output(struct ac_run *run, unsigned char *bytes, size_t len) {
+  for (int i = 0; i < run->secret_count; i++) {
+    const char *secret = run->secret_values[i];
+    size_t secret_len = secret == NULL ? 0 : strlen(secret);
+    if (secret_len == 0 || secret_len > len) continue;
+    for (size_t at = 0; at + secret_len <= len; at++) {
+      if (memcmp(bytes + at, secret, secret_len) == 0) memset(bytes + at, '*', secret_len);
+    }
+  }
+}
+
+static void controlled_environment(struct ac_run *run) {
+  char *values[32] = { NULL };
+  for (int i = 0; i < run->secret_count; i++) {
+    const char *value = getenv(run->secret_names[i]);
+    if (value != NULL) values[i] = strdup(value);
+  }
+  (void)clearenv();
+  (void)setenv("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", 1);
+  for (int i = 0; i < run->secret_count; i++) {
+    if (values[i] != NULL) { (void)setenv(run->secret_names[i], values[i], 1); free(values[i]); }
+  }
+}
 
 /* Derive the command directory from the validated identity fields. */
 static void command_run_dir(struct ac_run *run) {
@@ -449,17 +516,14 @@ static void command_run_dir(struct ac_run *run) {
   mkdir_p(run->log_dir);
 }
 
-/* Persist execution identity only. Never serialize argv: commands commonly carry
- * bearer headers or tokens, and command records are readable by the Codespaces
- * user after transport loss. */
 static void write_command_json(struct ac_run *run) {
   char path[AC_FPATH];
   snprintf(path, sizeof(path), "%s/command.json", run->log_dir);
   char buf[AC_MAX_CMDLINE];
   char escaped[1024];
   json_string_escape(run->command_id, escaped, sizeof(escaped));
-  snprintf(buf, sizeof(buf), "{\"command_id\":\"%s\",\"request_hash\":\"%s\",\"workspace_id\":\"%s\",\"pid\":%ld,\"pgid\":%d,\"mode\":\"%s\",\"cwd\":\"",
-           escaped, run->request_hash, run->workspace_id, (long)run->pid, run->pgid, run->mode[0] != '\0' ? run->mode : "pipe");
+  snprintf(buf, sizeof(buf), "{\"command_id\":\"%s\",\"workspace_id\":\"%s\",\"pid\":%ld,\"pgid\":%d,\"mode\":\"%s\",\"cwd\":\"",
+           escaped, run->workspace_id, (long)run->pid, run->pgid, run->mode[0] != '\0' ? run->mode : "pipe");
   json_string_escape(run->workdir, escaped, sizeof(escaped));
   size_t used = strlen(buf);
   snprintf(buf + used, sizeof(buf) - used, "%s\",\"argv_count\":%d}", escaped, run->argc);
@@ -472,24 +536,17 @@ static void write_status_json(struct ac_run *run, const char *state, int exit_co
   char buf[1024];
   if (exit_code < 0) {
     snprintf(buf, sizeof(buf),
-             "{\"command_id\":\"%s\",\"state\":\"%s\",\"exit_code\":null,\"stdout_offset\":%" PRIu64 ",\"stderr_offset\":%" PRIu64 ",\"terminal_offset\":%" PRIu64 ",\"started_at\":\"%ld\",\"exited_at\":null}\n",
-             run->command_id, state, run->stdout_offset, run->stderr_offset, run->terminal_offset, (long)time(NULL));
+              "{\"command_id\":\"%s\",\"state\":\"%s\",\"exit_code\":null,\"started_at\":\"%ld\",\"exited_at\":null}\n",
+              run->command_id, state, (long)time(NULL));
   } else {
     snprintf(buf, sizeof(buf),
-             "{\"command_id\":\"%s\",\"state\":\"%s\",\"exit_code\":%d,\"stdout_offset\":%" PRIu64 ",\"stderr_offset\":%" PRIu64 ",\"terminal_offset\":%" PRIu64 ",\"started_at\":\"%ld\",\"exited_at\":\"%ld\"}\n",
-             run->command_id, state, exit_code, run->stdout_offset, run->stderr_offset, run->terminal_offset, (long)time(NULL), (long)time(NULL));
+              "{\"command_id\":\"%s\",\"state\":\"%s\",\"exit_code\":%d,\"started_at\":\"%ld\",\"exited_at\":\"%ld\"}\n",
+              run->command_id, state, exit_code, (long)time(NULL), (long)time(NULL));
   }
   atomic_write_file(path, buf);
 }
 
-/* Do not persist command output. Arbitrary child output can include inherited
- * environment credentials and is readable by untrusted repository code running
- * as the same Codespaces user. Live frames still carry output to the connected
- * caller; reconnects retain status/cancellation only. */
 static void open_command_logs(struct ac_run *run) {
-  run->stdout_log = NULL;
-  run->stderr_log = NULL;
-  run->terminal_log = NULL;
   char helper_path[AC_FPATH];
   snprintf(helper_path, sizeof(helper_path), "%s/helper.json", run->log_dir);
   char hj[512];
@@ -498,18 +555,11 @@ static void open_command_logs(struct ac_run *run) {
 }
 
 static void close_command_logs(struct ac_run *run) {
-  if (run->stdout_log != NULL) { fclose(run->stdout_log); run->stdout_log = NULL; }
-  if (run->stderr_log != NULL) { fclose(run->stderr_log); run->stderr_log = NULL; }
-  if (run->terminal_log != NULL) { fclose(run->terminal_log); run->terminal_log = NULL; }
+  (void)run;
 }
 
-static void append_stream_log(FILE *log, uint64_t *offset, const unsigned char *bytes, size_t len) {
-  /* Offsets remain live-stream cursors even though output is never durable. */
-  if (log == NULL) { *offset += (uint64_t)len; return; }
-  if (fwrite(bytes, 1, len, log) == len) {
-    fflush(log);
-    *offset += (uint64_t)len;
-  }
+static void advance_output_offset(uint64_t *offset, size_t len) {
+  *offset += (uint64_t)len;
 }
 
 /* Emit output event frames carrying the durable offset for the given stream. */
@@ -572,7 +622,7 @@ static void stdin_q_flush(int fd, struct ac_stdin_q *q) {
   }
 }
 
-/* Poll-based drain of child output streams into durable logs + frames.
+/* Poll-based drain of child output streams into connected frames.
  * Reads at most one full buffer per fd per call so a chatty stream can never
  * starve concurrent stdin frames (B6). */
 static void pump_once(struct ac_run *run) {
@@ -592,14 +642,15 @@ static void pump_once(struct ac_run *run) {
     int fd = fds[i].fd;
     ssize_t n = read(fd, buf, sizeof(buf));
     if (n > 0) {
+      redact_output(run, buf, (size_t)n);
       if (fd == run->stdout_fd) {
-        append_stream_log(run->stdout_log, &run->stdout_offset, buf, (size_t)n);
+        advance_output_offset(&run->stdout_offset, (size_t)n);
         if (run->framed) emit_output(AC_OUTPUT_STDOUT, run->stdout_offset - (uint64_t)n, buf, (size_t)n);
       } else if (fd == run->stderr_fd) {
-        append_stream_log(run->stderr_log, &run->stderr_offset, buf, (size_t)n);
+        advance_output_offset(&run->stderr_offset, (size_t)n);
         if (run->framed) emit_output(AC_OUTPUT_STDERR, run->stderr_offset - (uint64_t)n, buf, (size_t)n);
       } else {
-        append_stream_log(run->terminal_log, &run->terminal_offset, buf, (size_t)n);
+        advance_output_offset(&run->terminal_offset, (size_t)n);
         if (run->framed) emit_output(AC_OUTPUT_TERMINAL, run->terminal_offset - (uint64_t)n, buf, (size_t)n);
       }
       continue;
@@ -639,6 +690,7 @@ static int run_pipe(struct ac_run *run) {
     if (run->workdir[0] != '\0') {
       if (chdir(run->workdir) != 0) _exit(126);
     }
+    controlled_environment(run);
     execvp(run->argv[0], run->argv);
     _exit(127);
   }
@@ -705,6 +757,7 @@ static int run_pty(struct ac_run *run, int cols, int rows) {
     if (run->workdir[0] != '\0') {
       if (chdir(run->workdir) != 0) _exit(126);
     }
+    controlled_environment(run);
     execvp(run->argv[0], run->argv);
     _exit(127);
   }
@@ -947,6 +1000,13 @@ static int drive_exec(struct ac_run *run, int grace_ms) {
               memcpy(q.buf + q.len, frame.payload, frame.length);
               q.len += frame.length;
               stdin_q_flush(run->stdin_fd, &q);
+            } else if (run->stdin_fd >= 0 && frame.length > 0) {
+              /* Do not silently corrupt a command's input when its bounded
+               * queue is full. The client treats this as a fail-closed loss. */
+              emit_jsonf(AC_E_ERROR, "{\"command_id\":\"%s\",\"message\":\"stdin-overflow\"}", run->command_id);
+              free_frame(&frame);
+              free(q.buf);
+              return 3;
             }
           } else if (frame.type == AC_R_STDIN_EOF) {
             if (run->stdin_fd >= 0) {
@@ -999,9 +1059,9 @@ static int drive_exec(struct ac_run *run, int grace_ms) {
   return 0;
 }
 
-/* Durable orphan pump after transport loss: no frames are emitted, the child
- * streams keep draining into the durable logs, the child is reaped and the
- * final status recorded. This is the ONLY post-loss owner (B4). */
+/* Durable orphan pump after transport loss: no frames are emitted; child
+ * streams keep draining without retention, the child is reaped and the final
+ * status recorded. This is the ONLY post-loss owner (B4). */
 static void orphan_pump(struct ac_run *run) {
   run->framed = 0;
   while (run->live) {
@@ -1021,97 +1081,33 @@ static void orphan_pump(struct ac_run *run) {
   if (run->stdin_fd >= 0) { close(run->stdin_fd); run->stdin_fd = -1; }
 }
 
-/* Open a retained log file positioned at `from`; returns the fd and the
- * current on-disk EOF, or -1 when the log is absent / offset is beyond EOF. */
-static int open_log_at(const char *dir, const char *name, uint64_t from, uint64_t *end) {
-  char path[AC_FPATH];
-  snprintf(path, sizeof(path), "%s/%s", dir, name);
-  int fd = open(path, O_RDONLY);
-  if (fd < 0) return -1;
-  struct stat st;
-  if (fstat(fd, &st) != 0) { close(fd); return -1; }
-  uint64_t size = (uint64_t)st.st_size;
-  if (from > size) { close(fd); return -1; }
-  *end = size;
-  if (lseek(fd, (off_t)from, SEEK_SET) < 0) { close(fd); return -1; }
-  return fd;
-}
-
-/* Emit every retained byte from the current position of an open log fd. */
-static void emit_log_remaining(uint8_t stream, uint64_t from, int fd) {
-  unsigned char buf[65536];
-  uint64_t offset = from;
-  for (;;) {
-    ssize_t n = read(fd, buf, sizeof(buf));
-    if (n <= 0) break;
-    emit_output(stream, offset, buf, (size_t)n);
-    offset += (uint64_t)n;
-  }
-}
-
 static void write_status_direct(const char *dir, const char *command_id, const char *state, int exit_code) {
   char path[AC_FPATH];
   snprintf(path, sizeof(path), "%s/status.json", dir);
-  uint64_t so = 0;
-  uint64_t se = 0;
-  uint64_t to = 0;
-  {
-    char p[AC_FPATH];
-    struct stat st;
-    snprintf(p, sizeof(p), "%s/stdout.log", dir);
-    if (stat(p, &st) == 0) so = (uint64_t)st.st_size;
-    snprintf(p, sizeof(p), "%s/stderr.log", dir);
-    if (stat(p, &st) == 0) se = (uint64_t)st.st_size;
-    snprintf(p, sizeof(p), "%s/terminal.log", dir);
-    if (stat(p, &st) == 0) to = (uint64_t)st.st_size;
-  }
   char buf[1024];
   if (exit_code < 0) {
     snprintf(buf, sizeof(buf),
-             "{\"command_id\":\"%s\",\"state\":\"%s\",\"exit_code\":null,\"stdout_offset\":%" PRIu64 ",\"stderr_offset\":%" PRIu64 ",\"terminal_offset\":%" PRIu64 ",\"started_at\":\"%ld\",\"exited_at\":null}\n",
-             command_id, state, so, se, to, (long)time(NULL));
+              "{\"command_id\":\"%s\",\"state\":\"%s\",\"exit_code\":null,\"started_at\":\"%ld\",\"exited_at\":null}\n",
+              command_id, state, (long)time(NULL));
   } else {
     snprintf(buf, sizeof(buf),
-             "{\"command_id\":\"%s\",\"state\":\"%s\",\"exit_code\":%d,\"stdout_offset\":%" PRIu64 ",\"stderr_offset\":%" PRIu64 ",\"terminal_offset\":%" PRIu64 ",\"started_at\":\"%ld\",\"exited_at\":\"%ld\"}\n",
-             command_id, state, exit_code, so, se, to, (long)time(NULL), (long)time(NULL));
+              "{\"command_id\":\"%s\",\"state\":\"%s\",\"exit_code\":%d,\"started_at\":\"%ld\",\"exited_at\":\"%ld\"}\n",
+              command_id, state, exit_code, (long)time(NULL), (long)time(NULL));
   }
   atomic_write_file(path, buf);
 }
 
-/* AC_R_ATTACH: re-emit retained logs from the requested stream offsets, then
- * live-tail the durable logs appended by the owning serve process until the
- * recorded status flips to exited (then the exact exit status is delivered) or
- * the client cancels (B2/N5). Unknown or unrecorded commands are rejected. */
+/* AC_R_ATTACH recovers only durable status and cancellation. It deliberately
+ * never reads or emits child output after a connection has been lost. */
 static void handle_attach(struct ac_frame *frame, int grace_ms) {
   char workspace_id[128];
   char command_id[129];
-  uint64_t stdout_from = 0;
-  uint64_t stderr_from = 0;
-  uint64_t terminal_from = 0;
   if (json_value((const char *)frame->payload, "command_id", command_id, sizeof(command_id)) == NULL) {
     emit_jsonf(AC_E_REJECTED, "{\"command_id\":null,\"reason\":\"missing-command-id\"}");
     return;
   }
   if (json_value((const char *)frame->payload, "workspace_id", workspace_id, sizeof(workspace_id)) == NULL) {
     workspace_id[0] = '\0';
-  }
-  {
-    char s[64];
-    if (json_value((const char *)frame->payload, "stdout_offset", s, sizeof(s)) != NULL) {
-      char *end = NULL;
-      uint64_t v = (uint64_t)strtoull(s, &end, 10);
-      if (end != s) stdout_from = v;
-    }
-    if (json_value((const char *)frame->payload, "stderr_offset", s, sizeof(s)) != NULL) {
-      char *end = NULL;
-      uint64_t v = (uint64_t)strtoull(s, &end, 10);
-      if (end != s) stderr_from = v;
-    }
-    if (json_value((const char *)frame->payload, "terminal_offset", s, sizeof(s)) != NULL) {
-      char *end = NULL;
-      uint64_t v = (uint64_t)strtoull(s, &end, 10);
-      if (end != s) terminal_from = v;
-    }
   }
   char dir[AC_JPATH];
   command_dir_path(workspace_id, command_id, dir, sizeof(dir));
@@ -1135,36 +1131,16 @@ static void handle_attach(struct ac_frame *frame, int grace_ms) {
     emit_jsonf(AC_E_REJECTED, "{\"command_id\":\"%s\",\"reason\":\"attach-not-recorded\"}", command_id);
     return;
   }
-  uint64_t stdout_end = 0;
-  uint64_t stderr_end = 0;
-  uint64_t terminal_end = 0;
-  int stdout_fd = open_log_at(dir, "stdout.log", stdout_from, &stdout_end);
-  int stderr_fd = open_log_at(dir, "stderr.log", stderr_from, &stderr_end);
-  int terminal_fd = open_log_at(dir, "terminal.log", terminal_from, &terminal_end);
-  /* Output is intentionally never retained. Attachment is status/cancellation
-   * recovery only, so missing output logs are expected rather than rejected. */
   char ec[16];
   if (exit_code < 0) snprintf(ec, sizeof(ec), "null");
   else snprintf(ec, sizeof(ec), "%d", exit_code);
-  emit_jsonf(AC_E_STATUS, "{\"command_id\":\"%s\",\"state\":\"%s\",\"exit_code\":%s,\"stdout_offset\":%" PRIu64 ",\"stderr_offset\":%" PRIu64 ",\"terminal_offset\":%" PRIu64 "}",
-             command_id, state, ec, stdout_end, stderr_end, terminal_end);
-  if (stdout_fd >= 0) { emit_log_remaining(AC_OUTPUT_STDOUT, stdout_from, stdout_fd); close(stdout_fd); }
-  if (stderr_fd >= 0) { emit_log_remaining(AC_OUTPUT_STDERR, stderr_from, stderr_fd); close(stderr_fd); }
-  if (terminal_fd >= 0) { emit_log_remaining(AC_OUTPUT_TERMINAL, terminal_from, terminal_fd); close(terminal_fd); }
+  emit_jsonf(AC_E_STATUS, "{\"command_id\":\"%s\",\"state\":\"%s\",\"exit_code\":%s}", command_id, state, ec);
 
   if (strcmp(state, "running") == 0 && group_alive(run.pgid)) {
-    /* Live-tail durable logs appended by the owning serve process (B2). */
     struct ac_stdin_q q;
     memset(&q, 0, sizeof(q));
     int transport_open = 1;
     for (;;) {
-      uint64_t e = 0;
-      int fd = open_log_at(dir, "stdout.log", stdout_end, &e);
-      if (fd >= 0) { emit_log_remaining(AC_OUTPUT_STDOUT, stdout_end, fd); close(fd); stdout_end = e; }
-      fd = open_log_at(dir, "stderr.log", stderr_end, &e);
-      if (fd >= 0) { emit_log_remaining(AC_OUTPUT_STDERR, stderr_end, fd); close(fd); stderr_end = e; }
-      fd = open_log_at(dir, "terminal.log", terminal_end, &e);
-      if (fd >= 0) { emit_log_remaining(AC_OUTPUT_TERMINAL, terminal_end, fd); close(fd); terminal_end = e; }
       int wstatus = 0;
       if (waitpid(run.pid, &wstatus, WNOHANG) == run.pid) {
         int code = WIFEXITED(wstatus) ? WEXITSTATUS(wstatus) : (WIFSIGNALED(wstatus) ? 128 + WTERMSIG(wstatus) : 1);
@@ -1240,6 +1216,7 @@ static void handle_cancel(struct ac_run *run, struct ac_frame *frame, int grace_
 static void reset_run(struct ac_run *run) {
   close_command_logs(run);
   free_argv(run->argv, run->argc);
+  for (int i = 0; i < run->secret_count; i++) free(run->secret_names[i]);
   memset(run, 0, sizeof(*run));
   run->stdout_fd = -1;
   run->stderr_fd = -1;
@@ -1293,6 +1270,20 @@ static void serve(void) {
           long v = strtol(s, &end, 10);
           if (end != s && v > 0 && v < 3600000) grace_ms = (int)v;
         }
+        run.secret_count = parse_string_array((const char *)frame.payload, "secret_names", run.secret_names, 32);
+        if (run.secret_count < 0) {
+          emit_jsonf(AC_E_REJECTED, "{\"command_id\":\"%s\",\"reason\":\"invalid-secret-names\"}", run.command_id);
+          break;
+        }
+        for (int i = 0; i < run.secret_count; i++) {
+          if (!safe_env_name(run.secret_names[i])) {
+            emit_jsonf(AC_E_REJECTED, "{\"command_id\":\"%s\",\"reason\":\"invalid-secret-name\"}", run.command_id);
+            run.secret_count = -1;
+            break;
+          }
+          run.secret_values[i] = getenv(run.secret_names[i]);
+        }
+        if (run.secret_count < 0) break;
         run.argc = parse_argv((const char *)frame.payload, run.argv, 256);
         if (run.argc <= 0 || run.argv[0] == NULL || run.argv[0][0] == '\0') {
           emit_jsonf(AC_E_REJECTED, "{\"command_id\":\"%s\",\"reason\":\"empty-argv\"}", run.command_id);

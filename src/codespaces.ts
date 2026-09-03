@@ -13,6 +13,7 @@ export interface CodespacesMachineInventory { machines: readonly { name: string;
 export interface CodespacesDefaults { billableOwner: GithubActor; location: string; devcontainerPath: string | null }
 export interface RepositoryRecordIdentity { id: string; owner: string; name: string }
 export interface CodespacesGitStatus { sha: string; ref: string }
+export interface CodespacesRemoteGitRisk { branch: string; dirty: boolean; unpushed: boolean }
 
 /** Every field required for fail-closed Codespace ownership from the documented resource object. */
 export interface CodespacesResource {
@@ -60,6 +61,43 @@ export class GhCodespacesProvider {
     const value = await this.api(`/user/codespaces/${encodeURIComponent(name)}`);
     if (!isRecord(value) || value.name !== name) throw new Error('GitHub response name does not equal the exact requested Codespaces name; refusing adoption.');
     return parseCodespacesResource(value, `readback of ${name}`);
+  }
+
+  /** Documented lifecycle PATCH, always followed by the caller's exact GET. */
+  async setState(name: string, state: 'Running' | 'Shutdown'): Promise<void> {
+    if (!safeName(name)) throw new Error('Invalid Codespaces name.');
+    const result = await this.process.run('gh', ['api', '--method', 'PATCH', '-H', `X-GitHub-Api-Version: ${API_VERSION}`, '-f', `state=${state}`, `/user/codespaces/${encodeURIComponent(name)}`], { kind: 'lifecycle' });
+    if (result.code !== 0) throw providerError('PATCH', `/user/codespaces/${name}`, result);
+  }
+
+  /** Exact-record deletion only. A 404 is deliberately left to lifecycle code
+   * so it can write a tombstone rather than infer that another resource is safe. */
+  async delete(name: string): Promise<void> {
+    if (!safeName(name)) throw new Error('Invalid Codespaces name.');
+    const result = await this.process.run('gh', ['api', '--method', 'DELETE', '-H', `X-GitHub-Api-Version: ${API_VERSION}`, `/user/codespaces/${encodeURIComponent(name)}`], { kind: 'lifecycle' });
+    if (result.code !== 0) throw providerError('DELETE', `/user/codespaces/${name}`, result);
+  }
+
+  /** Read the fixed porcelain form before a destructive lifecycle action. */
+  async remoteGitRisk(name: string): Promise<CodespacesRemoteGitRisk> {
+    const output = await this.remoteSshProbe(name, ['git', 'status', '--porcelain=v1', '--branch']);
+    const lines = output.split(/\r?\n/).filter(Boolean);
+    const header = lines.find((line) => line.startsWith('## '));
+    if (!header) throw new Error('Remote Git status did not provide a branch header; deletion is blocked.');
+    const branch = header.slice(3).split('...')[0]?.trim();
+    if (!branch) throw new Error('Remote Git status did not provide a branch name; deletion is blocked.');
+    return { branch, dirty: lines.some((line) => !line.startsWith('## ')), unpushed: /\[ahead(?: \d+)?(?:, behind \d+)?\]/.test(header) };
+  }
+
+  /** Read-only port observation. This phase never changes visibility. */
+  async ports(name: string): Promise<ReadonlyArray<{ port: number; visibility: string }>> {
+    if (!safeName(name)) throw new Error('Invalid Codespaces name.');
+    const value = await this.api(`/user/codespaces/${encodeURIComponent(name)}/ports`);
+    if (!Array.isArray(value)) throw new Error('Codespaces port observation is incomplete.');
+    return value.map((entry) => {
+      if (!isRecord(entry) || !positiveInteger(entry.port) || !safeDisplay(entry.visibility)) throw new Error('Codespaces port observation contains an invalid entry.');
+      return { port: entry.port, visibility: entry.visibility };
+    });
   }
 
   /** Documented repository identity read used to bind an immutable repository ID before create. */

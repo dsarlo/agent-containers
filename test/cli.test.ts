@@ -9,6 +9,7 @@ import test from 'node:test';
 import { isLocalWorkspaceMetadata, loadManualRecovery, loadMetadata, recordManualRecovery, saveMetadata, setStateDurableRenameForTesting, withWorkspaceLock } from '../src/state.js';
 import { exitCodeForError, runCli } from '../src/cli.js';
 import { nodeProcessRunner, UnconfirmedProcessReapError } from '../src/workspaces.js';
+import type { CommandEvent, ExecutionBackend } from '../src/types.js';
 
 const repoRoot = resolve(tmpdir(), 'agent-containers-cli-repo');
 const worktree = join(repoRoot, 'worktrees', 'safe');
@@ -394,14 +395,14 @@ test('doctor resolves a v1 local configuration before applying the Codespaces ex
 test('local create fails closed when schema v2 disables the local backend', async () => {
   const root = await mkdtemp(join(tmpdir(), 'agent-containers-cli-local-disabled-'));
   assert.equal(spawnSync('git', ['init', '-b', 'main'], { cwd: root }).status, 0);
-  await writeFile(join(root, '.agent-containers.yml'), JSON.stringify({ version: 2, workspace: { worktreeRoot: 'worktrees', baseBranch: 'main' }, project: { repository: 'owner/repo', ref: 'refs/heads/main', expectedOid: '0123456789012345678901234567890123456789' }, environment: { devcontainerPath: '.devcontainer/devcontainer.json', devcontainerBlobOid: 'abcdefabcdefabcdefabcdefabcdefabcdefabcd' }, backends: { enabled: ['codespaces'], default: 'codespaces', local: {}, codespaces: { enabled: true, machine: null, geo: 'auto', idleTimeoutMinutes: 30, retentionPeriodMinutes: 1, maxTotal: 1, maxRunning: 1, maxCreating: 1, maxParallelCommandsPerWorkspace: 1, readiness: { providerTimeoutSeconds: 1, sshTimeoutSeconds: 1, command: [], commandTimeoutSeconds: 1 }, transport: { reconnectWindowSeconds: 1, cancelGraceSeconds: 1, remoteLogBytesPerStream: 1, remoteLogRetentionHours: 1 }, ports: { allowVisibilityChanges: false, allowPublic: false }, secrets: { allowedRemoteSecretNames: [], allowCodespaceGitCredential: false } } } }));
+  await writeFile(join(root, '.agent-containers.yml'), JSON.stringify({ version: 2, workspace: { worktreeRoot: 'worktrees', baseBranch: 'main' }, project: { repository: 'owner/repo', ref: 'refs/heads/main', expectedOid: '0123456789012345678901234567890123456789' }, environment: { devcontainerPath: '.devcontainer/devcontainer.json', devcontainerBlobOid: 'abcdefabcdefabcdefabcdefabcdefabcdefabcd' }, backends: { enabled: ['codespaces'], default: 'codespaces', local: {}, codespaces: { enabled: true, machine: null, geo: 'auto', idleTimeoutMinutes: 30, retentionPeriodMinutes: 1, maxTotal: 1, maxRunning: 1, maxCreating: 1, maxParallelCommandsPerWorkspace: 1, readiness: { providerTimeoutSeconds: 1, sshTimeoutSeconds: 1, command: [], commandTimeoutSeconds: 1 }, transport: { reconnectWindowSeconds: 1, cancelGraceSeconds: 1 }, ports: { allowVisibilityChanges: false, allowPublic: false }, secrets: { allowedRemoteSecretNames: [], allowCodespaceGitCredential: false } } } }));
   assert.equal(await runCli(['create', 'blocked'], root, () => undefined), 1);
 });
 
 test('create and exec fail closed when schema v2 selects Codespaces as the default backend', async () => {
   const root = await mkdtemp(join(tmpdir(), 'agent-containers-cli-codespaces-default-'));
   assert.equal(spawnSync('git', ['init', '-b', 'main'], { cwd: root }).status, 0);
-  const source = JSON.stringify({ version: 2, workspace: { worktreeRoot: 'worktrees', baseBranch: 'main' }, project: { repository: 'owner/repo', ref: 'refs/heads/main', expectedOid: '0123456789012345678901234567890123456789' }, environment: { devcontainerPath: '.devcontainer/devcontainer.json', devcontainerBlobOid: 'abcdefabcdefabcdefabcdefabcdefabcdefabcd' }, backends: { enabled: ['local', 'codespaces'], default: 'codespaces', local: {}, codespaces: { enabled: true, machine: null, geo: 'auto', idleTimeoutMinutes: 30, retentionPeriodMinutes: 1, maxTotal: 1, maxRunning: 1, maxCreating: 1, maxParallelCommandsPerWorkspace: 1, readiness: { providerTimeoutSeconds: 1, sshTimeoutSeconds: 1, command: [], commandTimeoutSeconds: 1 }, transport: { reconnectWindowSeconds: 1, cancelGraceSeconds: 1, remoteLogBytesPerStream: 1, remoteLogRetentionHours: 1 }, ports: { allowVisibilityChanges: false, allowPublic: false }, secrets: { allowedRemoteSecretNames: [], allowCodespaceGitCredential: false } } } });
+  const source = JSON.stringify({ version: 2, workspace: { worktreeRoot: 'worktrees', baseBranch: 'main' }, project: { repository: 'owner/repo', ref: 'refs/heads/main', expectedOid: '0123456789012345678901234567890123456789' }, environment: { devcontainerPath: '.devcontainer/devcontainer.json', devcontainerBlobOid: 'abcdefabcdefabcdefabcdefabcdefabcdefabcd' }, backends: { enabled: ['local', 'codespaces'], default: 'codespaces', local: {}, codespaces: { enabled: true, machine: null, geo: 'auto', idleTimeoutMinutes: 30, retentionPeriodMinutes: 1, maxTotal: 1, maxRunning: 1, maxCreating: 1, maxParallelCommandsPerWorkspace: 1, readiness: { providerTimeoutSeconds: 1, sshTimeoutSeconds: 1, command: [], commandTimeoutSeconds: 1 }, transport: { reconnectWindowSeconds: 1, cancelGraceSeconds: 1 }, ports: { allowVisibilityChanges: false, allowPublic: false }, secrets: { allowedRemoteSecretNames: [], allowCodespaceGitCredential: false } } } });
   await writeFile(join(root, '.agent-containers.yml'), source);
   const stateHome = await mkdtemp(join(tmpdir(), 'agent-containers-cli-codespaces-state-'));
   const previousStateHome = process.env.XDG_STATE_HOME;
@@ -430,3 +431,47 @@ test('exec dispatches a recorded local workspace without reading mutable checkou
     assert.doesNotMatch(messages.at(-1) ?? '', /Configuration not found|Codespaces is selected/);
   } finally { setStateDurabilityAdapterForTesting(undefined); }
 });
+
+test('Codespaces exec returns nonzero for terminal unverified outcomes and preserves remote exits (R5)', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'agent-containers-cli-codespaces-exec-'));
+  const stateHome = await mkdtemp(join(tmpdir(), 'agent-containers-cli-codespaces-exec-state-'));
+  const stateDir = join(stateHome, 'agent-containers');
+  const previousStateHome = process.env.XDG_STATE_HOME;
+  const previousGate = process.env.AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES;
+  const { setStateDurabilityAdapterForTesting } = await import('../src/state.js');
+  setStateDurabilityAdapterForTesting({ publicationMode: async () => 'strict', assertStateWriteSupport: async () => undefined, syncFile: async () => undefined, syncDirectory: async () => undefined, moveFileWriteThrough: async () => undefined });
+  process.env.XDG_STATE_HOME = stateHome;
+  process.env.AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES = '1';
+  t.after(async () => {
+    setStateDurabilityAdapterForTesting(undefined);
+    if (previousStateHome === undefined) delete process.env.XDG_STATE_HOME; else process.env.XDG_STATE_HOME = previousStateHome;
+    if (previousGate === undefined) delete process.env.AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES; else process.env.AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES = previousGate;
+    await Promise.all([rm(root, { recursive: true, force: true }), rm(stateHome, { recursive: true, force: true })]);
+  });
+  assert.equal(spawnSync('git', ['init', '-b', 'main'], { cwd: root }).status, 0);
+  await writeFile(join(root, '.agent-containers.yml'), JSON.stringify(codespacesConfig()));
+  await saveMetadata(stateDir, codespacesMetadata());
+
+  for (const [event, expected] of [
+    [{ type: 'rejected', commandId: 'remote-command', reason: 'attach-offset-beyond-retention ghp_012345678901234567890123456789012345' }, 1],
+    [{ type: 'detached', commandId: 'remote-command', offsets: { stdout: 0n, stderr: 0n, terminal: 0n } }, 1],
+    [{ type: 'cancel-unknown', commandId: 'remote-command' }, 1],
+    [{ type: 'exit', commandId: 'remote-command', code: 42 }, 42],
+    [{ type: 'cancelled', commandId: 'remote-command' }, 130],
+  ] as const satisfies ReadonlyArray<readonly [CommandEvent, number]>) {
+    const messages: string[] = [];
+    const backend: ExecutionBackend = { kind: 'codespaces', async create() { throw new Error('unexpected'); }, async observe() { throw new Error('unexpected'); }, async *waitReady() { yield* []; throw new Error('unexpected'); }, async *execute() { yield event; }, async *attach() { yield* []; throw new Error('unexpected'); }, async cancel() { throw new Error('unexpected'); }, async recover() { throw new Error('unexpected'); }, async remove() { throw new Error('unexpected'); } };
+    const code = await runCli(['exec', 'remote', '--', 'true'], root, (message) => messages.push(message), undefined, { createCodespacesBackend: () => backend });
+    assert.equal(code, expected, event.type);
+    if (event.type !== 'exit') assert.match(messages.at(-1) ?? '', /Remote command/i);
+    assert.doesNotMatch(messages.join('\n'), /ghp_012345678901234567890123456789012345/);
+  }
+});
+
+function codespacesConfig() {
+  return { version: 2 as const, workspace: { worktreeRoot: 'worktrees', baseBranch: 'main' }, project: { repository: 'owner/repo', ref: 'refs/heads/main', expectedOid: '0123456789012345678901234567890123456789' }, environment: { devcontainerPath: '.devcontainer/devcontainer.json', devcontainerBlobOid: 'abcdefabcdefabcdefabcdefabcdefabcdefabcd' }, backends: { enabled: ['codespaces'] as const, default: 'codespaces' as const, local: {}, codespaces: { enabled: true, machine: null, geo: 'auto', idleTimeoutMinutes: 30, retentionPeriodMinutes: 1, maxTotal: 1, maxRunning: 1, maxCreating: 1, maxParallelCommandsPerWorkspace: 1, readiness: { providerTimeoutSeconds: 1, sshTimeoutSeconds: 1, command: [], commandTimeoutSeconds: 1 }, transport: { reconnectWindowSeconds: 1, cancelGraceSeconds: 1 }, ports: { allowVisibilityChanges: false, allowPublic: false }, secrets: { allowedRemoteSecretNames: [], allowCodespaceGitCredential: false } } } };
+}
+
+function codespacesMetadata() {
+  return { version: 2 as const, backend: 'codespaces' as const, name: 'remote', workspaceId: '00000000-0000-4000-8000-000000000001', createdAt: '2026-01-01T00:00:00.000Z', control: { githubHost: 'github.com', actorId: '1', actorLogin: 'actor', ghVersion: 'test' }, repository: { id: '1', owner: 'owner', name: 'repo' }, source: { requestedRef: 'refs/heads/main', expectedOid: '0123456789012345678901234567890123456789', effectiveBranch: 'agent-containers/remote', devcontainerPath: '.devcontainer/devcontainer.json', devcontainerBlobOid: 'abcdefabcdefabcdefabcdefabcdefabcdefabcd' }, remote: { codespaceId: '3', name: 'remote-name', environmentId: 'environment-id', ownerId: '1', ownerLogin: 'actor', billableOwnerId: '1', machine: 'basicLinux32gb', geo: 'auto', createdAt: '2026-01-01T00:00:00.000Z' }, lifecycle: { desired: 'ready' as const, normalized: 'available', providerRawState: 'Available', lastObservedAt: '2026-01-01T00:00:00.000Z', activeOperation: null }, recovery: null, cleanup: { remoteStopped: false, remoteDeleted: false, tombstoneWritten: false } };
+}

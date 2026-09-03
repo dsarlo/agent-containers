@@ -197,3 +197,24 @@ test('provider resource carries lossless identity fields for fail-closed ownersh
   const resource: CodespacesResource = await provider.get('bookish-space-parakeet');
   assert.equal(resource.id, '9007199254740993', 'numeric-id strings must be handled losslessly');
 });
+
+test('provider lifecycle operations use exact documented argv and port observation is read-only', async () => {
+  const calls: string[][] = [];
+  const provider = new GhCodespacesProvider({
+    async run(_command, args) {
+      calls.push(args);
+      if (args.at(-1)?.endsWith('/ports')) return { code: 0, stdout: JSON.stringify([{ port: 3000, visibility: 'private' }]), stderr: '' };
+      return { code: 0, stdout: '', stderr: '' };
+    },
+  });
+  await provider.setState('bookish-space-parakeet', 'Shutdown');
+  await provider.setState('bookish-space-parakeet', 'Running');
+  await provider.delete('bookish-space-parakeet');
+  assert.deepEqual(await provider.ports('bookish-space-parakeet'), [{ port: 3000, visibility: 'private' }]);
+  assert.deepEqual(calls, [
+    ['api', '--method', 'PATCH', '-H', 'X-GitHub-Api-Version: 2022-11-28', '-f', 'state=Shutdown', '/user/codespaces/bookish-space-parakeet'],
+    ['api', '--method', 'PATCH', '-H', 'X-GitHub-Api-Version: 2022-11-28', '-f', 'state=Running', '/user/codespaces/bookish-space-parakeet'],
+    ['api', '--method', 'DELETE', '-H', 'X-GitHub-Api-Version: 2022-11-28', '/user/codespaces/bookish-space-parakeet'],
+    ['api', '--method', 'GET', '-H', 'X-GitHub-Api-Version: 2022-11-28', '/user/codespaces/bookish-space-parakeet/ports'],
+  ]);
+});

@@ -135,6 +135,26 @@ test('a nonzero exit status is delivered exactly (N4)', async () => {
   assert.ok(status && status.state === 'exited' && status.exitCode === 137);
 });
 
+test('a completed command deterministically closes its SSH runner session (L1)', async () => {
+  const fixture = await transportFixture();
+  let closed = false;
+  fixture.helper.configure({ commandId: COMMAND_ID, outputs: [], exitCode: 0 });
+  const spawner = fixture.deps.spawner;
+  const deps = {
+    ...fixture.deps,
+    spawner: (argv: readonly string[], options: { signal?: AbortSignal }) => {
+      const child = spawner(argv, options);
+      const kill = child.kill.bind(child);
+      child.kill = (signal?: NodeJS.Signals) => { closed = true; return kill(signal); };
+      return child;
+    },
+  };
+  const events: CommandEvent[] = [];
+  for await (const event of executeRemoteCommand(deps, pipeInput())) events.push(event);
+  assert.deepEqual(events.at(-1), { type: 'exit', commandId: COMMAND_ID, code: 0 });
+  assert.equal(closed, true, 'the completed session must be explicitly closed');
+});
+
 test('stdin is forwarded as frames and half-closed before the output is drained (N5)', async () => {
   const fixture = await transportFixture();
   fixture.helper.configure({ commandId: COMMAND_ID, outputs: [{ stream: 'stdout', bytes: bytes(100) }], exitCode: 0 });
@@ -144,6 +164,23 @@ test('stdin is forwarded as frames and half-closed before the output is drained 
   assert.equal(events.at(-1)?.type, 'exit');
   const status = await loadCommandStatus(fixture.stateDir, COMMAND_ID);
   assert.equal(status?.state, 'exited');
+});
+
+test('stdin overflow reaches the caller promptly while the remote child remains running', async () => {
+  const fixture = await transportFixture({ reconnectBudgetMs: 60_000 });
+  fixture.helper.configure({ commandId: COMMAND_ID, stdinOverflow: true, stayRunning: true });
+  async function* endlessStdin() {
+    yield bytes(1);
+    await new Promise<void>(() => undefined);
+  }
+  const started = Date.now();
+  await assert.rejects(
+    () => withSettleGuard(executeToEnd(fixture, pipeInput({ stdin: 'stream', stdinSource: endlessStdin() })), 'stdin overflow was not caller-visible', 500),
+    /stdin.*overflow/i,
+  );
+  assert.ok(Date.now() - started < 500, 'overflow must not wait for the long-running remote child');
+  assert.equal((await loadCommandStatus(fixture.stateDir, COMMAND_ID))?.state, 'outcome-unknown');
+  assert.ok(await loadCommandRecovery(fixture.stateDir, COMMAND_ID));
 });
 
 test('disconnect/reconnect resumes by offsets and delivers the exact retained exit (N6)', async () => {

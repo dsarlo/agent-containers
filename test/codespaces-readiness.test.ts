@@ -29,7 +29,7 @@ function configFixture(): CodespacesAgentContainersConfig {
         enabled: true, machine: 'basicLinux32gb', geo: 'auto', idleTimeoutMinutes: 30, retentionPeriodMinutes: 10080,
         maxTotal: 4, maxRunning: 2, maxCreating: 1, maxParallelCommandsPerWorkspace: 1,
         readiness: { providerTimeoutSeconds: 5, sshTimeoutSeconds: 5, command: [], commandTimeoutSeconds: 5 },
-        transport: { reconnectWindowSeconds: 60, cancelGraceSeconds: 10, remoteLogBytesPerStream: 1, remoteLogRetentionHours: 1 },
+        transport: { reconnectWindowSeconds: 60, cancelGraceSeconds: 10 },
         ports: { allowVisibilityChanges: false, allowPublic: false },
         secrets: { allowedRemoteSecretNames: [], allowCodespaceGitCredential: false },
       },
@@ -64,6 +64,7 @@ interface ProbeOptions {
   get?: () => Record<string, unknown>;
   ssh?: Record<string, string | { code: number; stderr: string }>;
   logs?: string | { code: number; stderr: string };
+  ports?: ReadonlyArray<{ port: number; visibility: string }>;
 }
 
 async function probeContext(options: ProbeOptions = {}) {
@@ -82,6 +83,9 @@ async function probeContext(options: ProbeOptions = {}) {
   const run: ProcessRunner['run'] = async (command, args) => {
     dispatch.push(args);
     const key = ['gh', ...args].join(' ');
+    if (command === 'gh' && /\/ports$/.test(args.at(-1) ?? '')) {
+      return { code: 0, stdout: JSON.stringify(options.ports ?? []), stderr: '' };
+    }
     if (command === 'gh' && /^\/user\/codespaces\/[A-Za-z0-9-]+$/.test(args.at(-1) ?? '')) {
       return { code: 0, stdout: JSON.stringify(options.get ? options.get() : resourceFixture()), stderr: '' };
     }
@@ -117,6 +121,7 @@ test('readiness passes every gate and reports ready-without-setup-proof when no 
     ['resource-recorded', 'passed'],
     ['provider-available', 'passed'],
     ['readback-facts', 'passed'],
+    ['ports-private', 'passed'],
     ['repository-identity', 'passed'],
     ['creation-logs', 'passed'],
     ['ssh-ready', 'passed'],
@@ -219,10 +224,11 @@ test('doctor check mapping is stable, deterministic, and agrees between human an
   const { deps } = await probeContext();
   const report = await runReadinessProbes(deps);
   const checks = readinessGateDoctorChecks(recordedWorkspace(), report);
-  assert.equal(checks.length, 6);
+  assert.equal(checks.length, 7);
   assert.deepEqual(checks.map((check) => check.id), [
     'codespaces.runtime.provider',
     'codespaces.runtime.readback',
+    'codespaces.runtime.ports',
     'codespaces.runtime.repository',
     'codespaces.runtime.creation-logs',
     'codespaces.runtime.ssh',
@@ -248,10 +254,10 @@ test('waitCodespacesReady yields one readable event per gate and the terminal re
   const { deps } = await probeContext();
   const events = [];
   for await (const event of waitCodespacesReady(deps)) events.push(event);
-  assert.equal(events.length, 9);
+  assert.equal(events.length, 10);
   const terminal = events.at(-1);
   assert.equal(terminal?.report.terminal, 'ready-without-setup-proof');
-  assert.equal(events.filter((event) => event.type === 'readiness').length, 9);
+  assert.equal(events.filter((event) => event.type === 'readiness').length, 10);
 });
 
 test('readiness durably persists a settled ready-without-setup-proof observation (B1)', async () => {

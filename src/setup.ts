@@ -209,7 +209,7 @@ async function codespacesChecks(config: AgentContainersConfig, runner: ProcessRu
       const normalized = record.lifecycle.normalized;
       if (['recovery-required', 'identity-mismatch', 'revision-mismatch', 'resource-missing', 'provider-error', 'ambiguous-create'].includes(normalized)) {
         workspaceChecks.push(action('codespaces.workspace.runtime', `Workspace ${options.workspaceName} is in ${normalized}; read-only diagnosis cannot reach ready and nothing is restarted.`, 'provisioned-runtime'));
-      } else if (normalized === 'stopped' || normalized === 'deleted') {
+      } else if (normalized === 'stopped' || normalized === 'deleted' || normalized === 'tombstoned') {
         workspaceChecks.push(action('codespaces.workspace.runtime', `Workspace ${options.workspaceName} is ${normalized}; doctor never starts or restores a stopped Codespace.`, 'provisioned-runtime'));
       } else if (v2) {
         workspaceChecks.push(...readonlyCodespacesRuntimeChecks());
@@ -238,6 +238,7 @@ function readonlyCodespacesRuntimeChecks(): readonly DoctorCheck[] {
   return [
     unknown('codespaces.runtime.provider', 'The recorded Codespace is not remotely probed by doctor.' , 'provisioned-runtime'),
     unknown('codespaces.runtime.readback', 'Remote runtime readback is not performed by doctor.', 'provisioned-runtime'),
+    unknown('codespaces.runtime.ports', 'Port visibility requires a provisioned runtime and is not probed by doctor.', 'provisioned-runtime'),
     unknown('codespaces.runtime.repository', 'Repository identity requires remote SSH and is not probed by doctor.', 'provisioned-runtime'),
     unknown('codespaces.runtime.creation-logs', 'Creation logs for the recorded runtime are not read by doctor.', 'provisioned-runtime'),
     unknown('codespaces.runtime.ssh', 'SSH reachability is not probed because gh may create a local key.', 'provisioned-runtime'),

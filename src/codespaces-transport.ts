@@ -63,6 +63,14 @@ export class TransportLostError extends Error {
   }
 }
 
+/** The helper has refused part of stdin, so a later exit cannot prove the requested command completed. */
+export class StdinOverflowError extends Error {
+  constructor() {
+    super('Remote helper rejected stdin beyond its bounded queue; command outcome requires recovery.');
+    this.name = 'StdinOverflowError';
+  }
+}
+
 export type RemoteHelperEvent =
   | { kind: 'hello-ok'; protocol: number; helperVersion: string; helperArch: string; remoteBootId: string; helperPid: number }
   | { kind: 'rejected'; commandId: string | null; reason: string }
@@ -137,8 +145,13 @@ export class HelperSession {
   private failure: Error | null = null;
   private ended = false;
   private writeBacklog: Promise<void> = Promise.resolve();
+  private closing: Promise<void> | undefined;
 
   constructor(private readonly child: FramedChildProcess) {
+    child.stdin.on('error', () => {
+      // A terminal helper outcome can race an in-flight stdin write; send()
+      // converts that closed transport into a fail-closed transport error.
+    });
     child.stdout.on('data', (chunk: string | Uint8Array) => {
       const bytes = typeof chunk === 'string' ? new TextEncoder().encode(chunk) : new Uint8Array(chunk);
       let frames: HelperFrame[];
@@ -231,8 +244,18 @@ export class HelperSession {
     try { this.child.stdin.end(); } catch { /* already closed */ }
   }
 
-  close(): void {
-    try { this.child.kill(); } catch { /* best effort */ }
+  async close(): Promise<void> {
+    // `ended` describes decoded stdout, not the SSH child. A terminal frame
+    // can arrive before gh exits, so always reap the child exactly once.
+    if (this.closing) return this.closing;
+    this.closing = new Promise<void>((resolve) => {
+      let settled = false;
+      const settle = () => { if (!settled) { settled = true; resolve(); } };
+      this.child.once('close', settle);
+      this.endStdin();
+      try { if (!this.child.kill()) settle(); } catch { settle(); }
+    });
+    await this.closing;
   }
 
   private fail(error: Error): void {
@@ -351,6 +374,7 @@ export async function* executeRemoteCommand(deps: RemoteTransportDependencies, i
       if (attempt >= 1 && Date.now() >= deadline) break;
       attempt += 1;
       const connect = attachNext ? openAttachSession : openExecSession;
+      let stdinFailure: unknown;
       try {
         const opened = await connect(deps, helper, commandId, requestHash, input, offsets, now);
         attachNext = true;
@@ -369,26 +393,36 @@ export async function* executeRemoteCommand(deps: RemoteTransportDependencies, i
         if (cancelRequested) { session.close(); session = undefined; continue; }
         yield { type: 'started', commandId };
         if (input.stdin === 'stream' && input.stdinSource) {
-          for await (const chunk of input.stdinSource) {
-            if (deps.signal?.aborted) { void session.close(); break; }
-            if (chunk.length > MAX_STDIN_FRAME_BYTES) throw new Error('A user stdin chunk exceeded the bounded frame size; refusing the oversized chunk.');
-            await session.send(HelperFrameType.stdin, chunk);
+          // Keep reading helper events while stdin is backpressured or its source
+          // is still open: stdin-overflow is terminal and must not wait for child exit.
+          void (async () => {
+            try {
+              for await (const chunk of input.stdinSource as AsyncIterable<Uint8Array>) {
+                if (deps.signal?.aborted) { void session.close(); break; }
+                if (chunk.length > MAX_STDIN_FRAME_BYTES) throw new Error('A user stdin chunk exceeded the bounded frame size; refusing the oversized chunk.');
+                await session.send(HelperFrameType.stdin, chunk);
+              }
+              await session.send(HelperFrameType.stdinEof, { command_id: commandId, request_hash: requestHash });
+            } catch (error) {
+              stdinFailure = error;
+              void session.close();
+            }
+          })();
+        } else {
+          try {
+            await session.send(HelperFrameType.stdinEof, { command_id: commandId, request_hash: requestHash });
+          } catch (error) {
+            if (!(error instanceof TransportLostError)) throw error;
           }
-        }
-        /* Half-close stdin with an explicit protocol frame so the child keeps
-         * running detached from the stream (spec 9.4). This is never a transport
-         * half-close of the connection itself (B4). If the remote helper already
-         * closed the transport, the queued output is still drained below and
-         * the loss is handled by the reconnect loop, not by discarding bytes. */
-        try {
-          await session.send(HelperFrameType.stdinEof, { command_id: commandId, request_hash: requestHash });
-        } catch (error: unknown) {
-          if (!(error instanceof TransportLostError)) throw error;
         }
         if (input.mode === 'pty' && input.resizeSource) {
           void forwardResizes(session, commandId, input.resizeSource);
         }
         const streaming = yield* streamSession(deps, now, commandId, requestHash, session, offsets);
+        // A verified terminal frame settles this SSH invocation. Explicitly
+        // half-close and reap it instead of leaving a completed gh session alive.
+        session.endStdin();
+        await session.close();
         session = undefined;
         offsets = streaming.offsets;
         await saveOffsets(deps, offsets, now);
@@ -412,11 +446,16 @@ export async function* executeRemoteCommand(deps: RemoteTransportDependencies, i
         const persisted = await loadCommandOffsets(deps.stateDir, commandId);
         if (persisted) offsets = persisted;
         if (cancelRequested) continue;
+        if (stdinFailure) throw stdinFailure;
         if (!(error instanceof TransportLostError)) throw error;
       }
       if (cancelRequested) continue;
     }
   } catch (error: unknown) {
+    if (error instanceof StdinOverflowError) {
+      await recordUnknownOutcome(deps, commandId, requestHash, offsets, now, savedStatus, 'outcome-unknown');
+      throw error;
+    }
     if (!cancelRequested) throw error;
     await recordUnknownOutcome(deps, commandId, requestHash, offsets, now, savedStatus, 'cancel-outcome-unknown');
     yield { type: 'cancel-unknown', commandId };
@@ -454,6 +493,9 @@ export async function* attachRemoteCommand(deps: RemoteTransportDependencies, co
       await helloHandshake(deps, session, helper.arch);
       await session.send(HelperFrameType.attach, { command_id: commandId, request_hash: requestHash, stdout_offset: offsets.stdout, stderr_offset: offsets.stderr, terminal_offset: offsets.terminal, workspace_id: deps.metadata.workspaceId, grace_ms: deps.cancelGraceMs ?? deps.config.backends.codespaces.transport.cancelGraceSeconds * 1000 });
       const streaming = yield* streamSession(deps, now, commandId, requestHash, session, offsets);
+      // Attach has the same terminal ownership boundary as execute.
+      session.endStdin();
+      await session.close();
       session = undefined;
       offsets = streaming.offsets;
       await saveOffsets(deps, offsets, now);
@@ -520,8 +562,9 @@ async function openExecSession(deps: RemoteTransportDependencies, helper: Remote
     rows: input.mode === 'pty' ? (input.rows ?? 24) : undefined,
     workspace_id: deps.metadata.workspaceId,
     grace_ms: deps.cancelGraceMs ?? deps.config.backends.codespaces.transport.cancelGraceSeconds * 1000,
-    retention_bytes: deps.config.backends.codespaces.transport.remoteLogBytesPerStream,
-    retention_hours: deps.config.backends.codespaces.transport.remoteLogRetentionHours,
+    // Names are capabilities only. Values stay in the Codespace and are never
+    // included in local state, audit records, or the framed request.
+    secret_names: deps.config.backends.codespaces.secrets.allowedRemoteSecretNames,
   });
   return acknowledgeStarted(deps, session, commandId, requestHash, now);
 }
@@ -551,6 +594,9 @@ async function acknowledgeStarted(deps: RemoteTransportDependencies, session: He
   if (first.kind === 'rejected') {
     session.close();
     return { kind: 'rejected', reason: first.reason };
+  }
+  if (reattaching && first.kind === 'status') {
+    return { kind: 'session', session };
   }
   if (first.kind !== 'started') {
     session.close();
@@ -626,7 +672,7 @@ async function* streamSession(deps: RemoteTransportDependencies, now: () => stri
     switch (event.kind) {
       case 'output': {
         let cursor = event.stream === 'stdout' ? stdoutCursor : event.stream === 'stderr' ? stderrCursor : terminalCursor;
-        if (event.offset < cursor) throw new Error(`Remote helper emitted overlapping output at offset ${event.offset} below the acknowledged cursor ${cursor}; refusing duplicate frames.`);
+        if (event.offset < cursor) throw new TransportLostError(`Remote helper emitted overlapping output at offset ${event.offset} below the acknowledged cursor ${cursor}; reconnecting from durable offsets.`);
         if (event.offset > cursor) throw new Error(`Remote helper skipped output between offset ${cursor} and ${event.offset}; refusing a lossy stream.`);
         cursor += BigInt(event.bytes.length);
         if (event.stream === 'stdout') stdoutCursor = cursor;
@@ -653,6 +699,9 @@ async function* streamSession(deps: RemoteTransportDependencies, now: () => stri
         return { outcome: 'cancelled', exitCode: null, offsets };
       }
       case 'error': {
+        if (event.message === 'stdin-overflow') {
+          throw new StdinOverflowError();
+        }
         throw new Error(`Remote helper reported an error: ${redactSecretDiagnostic(event.message)}`);
       }
       case 'status': {

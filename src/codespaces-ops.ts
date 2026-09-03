@@ -73,7 +73,14 @@ export type CodespacesJournalKind =
   | 'command-terminal'
   | 'cancel-requested'
   | 'cancel-verified'
-  | 'cancel-unknown';
+  | 'cancel-unknown'
+  | 'stop-requested'
+  | 'stop-verified'
+  | 'start-requested'
+  | 'start-verified'
+  | 'remove-requested'
+  | 'remove-verified'
+  | 'tombstone-written';
 
 export interface CodespacesJournalEvent {
   schemaVersion: 1;
@@ -354,7 +361,7 @@ function safeRepositoryPath(value: unknown): value is string { return typeof val
 function safeDetail(value: unknown): value is string { return typeof value === 'string' && !secretShaped(value) && value.length > 0 && value.length <= 2048 && !/[\0\r\n]/.test(value); }
 function safeRef(value: unknown): value is string { return typeof value === 'string' && !secretShaped(value) && /^refs\/(?:heads|tags)\/(?:[A-Za-z0-9][A-Za-z0-9._-]*)(?:\/[A-Za-z0-9][A-Za-z0-9._-]*)*$/.test(value) && !value.includes('..') && !value.split('/').some((part) => part.endsWith('.') || part.endsWith('.lock')); }
 function isOperationState(value: unknown): value is CodespacesOperationState { return typeof value === 'string' && ['intent-recorded', 'create-dispatched', 'resource-recorded', 'identity-verified', 'identity-mismatch', 'revision-mismatch', 'provider-error', 'ambiguous-create', 'recovery-required', 'recovery-cleared'].includes(value); }
-function isJournalKind(value: unknown): value is CodespacesJournalKind { return typeof value === 'string' && ['operation-created', 'provider-request-dispatched', 'provider-response-recorded', 'identity-verified', 'identity-mismatch', 'readiness-transition', 'recovery-set', 'recovery-cleared', 'ambiguous-create', 'provider-error', 'command-accepted', 'command-started', 'command-detached', 'command-terminal', 'cancel-requested', 'cancel-verified', 'cancel-unknown'].includes(value); }
+function isJournalKind(value: unknown): value is CodespacesJournalKind { return typeof value === 'string' && ['operation-created', 'provider-request-dispatched', 'provider-response-recorded', 'identity-verified', 'identity-mismatch', 'readiness-transition', 'recovery-set', 'recovery-cleared', 'ambiguous-create', 'provider-error', 'command-accepted', 'command-started', 'command-detached', 'command-terminal', 'cancel-requested', 'cancel-verified', 'cancel-unknown', 'stop-requested', 'stop-verified', 'start-requested', 'start-verified', 'remove-requested', 'remove-verified', 'tombstone-written'].includes(value); }
 function isCommandId(value: unknown): value is string { return typeof value === 'string' && /^[0-9A-Za-z-]{1,128}$/.test(value) && !secretShaped(value); }
 function isRequestHash(value: unknown): value is string { return typeof value === 'string' && /^[0-9a-f]{64}$/.test(value); }
 function isNodeError(error: unknown, code: string): error is NodeJS.ErrnoException { return typeof error === 'object' && error !== null && 'code' in error && error.code === code; }

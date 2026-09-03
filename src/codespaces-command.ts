@@ -7,9 +7,8 @@ import { isValidRequestHash } from './codespaces-protocol.js';
 /**
  * Local durable record for one remote command. Output bytes are never
  * persisted locally; only request metadata, status transitions, and the
- * client-acknowledged byte offsets are. The remote helper owns the durable
- * stdout/stderr/terminal log files; the local record tracks the offset cursor
- * used to resume attach/reconnect sessions.
+ * client-acknowledged byte offsets are. These cursors describe only the live
+ * connection and never permit output replay after reconnect.
  */
 export type CodespacesCommandStatusState =
   | 'accepted'

@@ -42,7 +42,7 @@ export interface CodespacesWorkspaceMetadata {
   repository: { id: string; owner: string; name: string };
   source: { requestedRef: string; expectedOid: string; effectiveBranch: string; devcontainerPath: string; devcontainerBlobOid: string };
   remote: { codespaceId: string; name: string; environmentId: string; ownerId: string; ownerLogin: string; billableOwnerId: string; machine: string; geo: string; createdAt: string };
-  lifecycle: { desired: 'ready' | 'stopped'; normalized: string; providerRawState: string; lastObservedAt: string; activeOperation: null | { id: string; kind: 'create' | 'stop' | 'remove'; startedAt: string; checkpoint: string } };
+  lifecycle: { desired: 'ready' | 'stopped'; normalized: string; providerRawState: string; lastObservedAt: string; activeOperation: null | { id: string; kind: 'create' | 'start' | 'stop' | 'remove'; startedAt: string; checkpoint: string } };
   recovery: null | { reason: string; operationId: string; recordedAt: string };
   cleanup: { remoteStopped: boolean; remoteDeleted: boolean; tombstoneWritten: boolean };
 }
@@ -545,7 +545,7 @@ function safeIdentifier(value: unknown): value is string { return typeof value =
 function safeDisplay(value: unknown): value is string { return typeof value === 'string' && !secretShaped(value) && /^[\x20-\x7e]{1,128}$/.test(value); }
 function safeRef(value: unknown): value is string { return typeof value === 'string' && !secretShaped(value) && /^refs\/(?:heads|tags)\/(?:[A-Za-z0-9][A-Za-z0-9._-]*)(?:\/[A-Za-z0-9][A-Za-z0-9._-]*)*$/.test(value) && !value.includes('..') && !value.split('/').some((part) => part.endsWith('.') || part.endsWith('.lock')); }
 function safeRepositoryPath(value: unknown): value is string { return typeof value === 'string' && !secretShaped(value) && value.length > 0 && !/[\0\r\n\\]/.test(value) && !value.split('/').some((part) => !part || part === '.' || part === '..'); }
-function validOperation(value: unknown): boolean { return value === null || (isStrictRecord(value, ['id', 'kind', 'startedAt', 'checkpoint']) && isUuid(value.id) && (value.kind === 'create' || value.kind === 'stop' || value.kind === 'remove') && isTimestamp(value.startedAt) && safeDisplay(value.checkpoint)); }
+function validOperation(value: unknown): boolean { return value === null || (isStrictRecord(value, ['id', 'kind', 'startedAt', 'checkpoint']) && isUuid(value.id) && (value.kind === 'create' || value.kind === 'start' || value.kind === 'stop' || value.kind === 'remove') && isTimestamp(value.startedAt) && safeDisplay(value.checkpoint)); }
 
 function isCanonicalPath(value: unknown): value is string {
   return typeof value === 'string' && isAbsolute(value) && resolve(value) === value;
