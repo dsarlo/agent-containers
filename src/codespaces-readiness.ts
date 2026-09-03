@@ -38,6 +38,8 @@ export interface CodespacesReadinessDependencies {
   now?: () => string;
   sleep?: (milliseconds: number) => Promise<void>;
   loadMetadata?: (stateDir: string, name: string) => Promise<WorkspaceMetadata | undefined>;
+  /** Doctor-mode observation must never change lifecycle metadata. */
+  persistSettledObservation?: boolean;
 }
 
 const PROVIDER_POLL_INTERVAL_MS = 250;
@@ -96,7 +98,7 @@ async function* readinessProbeSequence(deps: CodespacesReadinessDependencies): A
       const provider = gates.find((gate) => gate.id === 'provider-available');
       normalized = provider?.state === 'blocked' && /terminal state/.test(provider.detail) ? 'stopped' : 'recovery-required';
     }
-    if (normalized !== null) {
+    if (normalized !== null && deps.persistSettledObservation !== false) {
       try {
         const current = await (deps.loadMetadata ?? loadMetadata)(deps.stateDir, deps.name);
         if (current && current.version === 2 && current.backend === 'codespaces') {

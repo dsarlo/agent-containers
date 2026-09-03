@@ -116,6 +116,32 @@ test('local doctor reports path sharing as unknown without a safe read-only prob
   assert.equal(pathSharing?.status, 'unknown');
 });
 
+test('local doctor rejects a Node version below the package engine', async () => {
+  const runner: ProcessRunner = { async run(command, args) {
+    if (command === 'git' && args.join(' ') === 'worktree add -h') return { code: 129, stdout: '', stderr: 'usage: git worktree add [--relative-paths] <path>' };
+    return { code: 0, stdout: args.join(' ') === 'rev-parse --is-inside-work-tree' ? 'true\n' : 'available', stderr: '' };
+  } };
+  const report = await doctor({ version: 1, workspace: { worktreeRoot: 'worktrees', baseBranch: 'main' }, environment: { devcontainerPath: '.devcontainer/devcontainer.json' }, commands: {} }, 'local', runner, '/repo', { nodeVersion: '20.18.0' });
+  const node = report.checks.find((check) => check.id === 'local.node');
+  assert.equal(node?.state, 'action-required');
+  assert.equal(node?.status, 'fail');
+});
+
+test('local doctor rejects a configured base that is not a local branch', async () => {
+  const oid = '0123456789012345678901234567890123456789';
+  const runner: ProcessRunner = { async run(command, args) {
+    const invocation = args.join(' ');
+    if (command === 'git' && invocation === 'worktree add -h') return { code: 129, stdout: '', stderr: 'usage: git worktree add [--relative-paths] <path>' };
+    if (command === 'git' && invocation === 'show-ref --verify --quiet refs/heads/HEAD') return { code: 1, stdout: '', stderr: '' };
+    if (command === 'git' && invocation === 'rev-parse --verify HEAD^{commit}') return { code: 0, stdout: `${oid}\n`, stderr: '' };
+    if (command === 'git' && invocation === `ls-tree -r -z ${oid} -- .devcontainer/devcontainer.json`) return { code: 0, stdout: `100644 blob ${oid}\t.devcontainer/devcontainer.json\0`, stderr: '' };
+    if (command === 'git' && invocation === `show ${oid}:.devcontainer/devcontainer.json`) return { code: 0, stdout: '{}', stderr: '' };
+    return { code: 0, stdout: invocation === 'rev-parse --is-inside-work-tree' ? 'true\n' : 'available', stderr: '' };
+  } };
+  const report = await doctor({ version: 1, workspace: { worktreeRoot: 'worktrees', baseBranch: 'HEAD' }, environment: { devcontainerPath: '.devcontainer/devcontainer.json' }, commands: {} }, 'local', runner);
+  assert.equal(report.checks.find((check) => check.id === 'local.base')?.state, 'action-required');
+});
+
 test('local doctor accepts Git worktree capability from bounded help output when Git exits 129', async () => {
   const runner: ProcessRunner = { async run(command, args) {
     if (command === 'git' && args.join(' ') === 'worktree add -h') return { code: 129, stdout: '', stderr: 'usage: git worktree add [--relative-paths] <path>' };
@@ -156,6 +182,9 @@ test('doctor permits only read-only prerequisite commands without claiming runti
   const runner: ProcessRunner = { async run(command, args) { calls.push([command, ...args]); return { code: 0, stdout: args.at(-1) === '/user' ? '{"id":1,"login":"octo"}' : args[0] === 'api' ? '{"billable_owner":{"id":"1"}}' : 'git version 2.0', stderr: '' }; } };
   const report = await doctor(codespaces, 'codespaces', runner);
   assert.equal(report.overall, 'action-required');
+  assert.equal(report.checks.find((check) => check.id === 'codespaces.ports')?.status, 'unknown');
+  assert.equal(report.checks.find((check) => check.id === 'codespaces.secrets')?.status, 'unknown');
+  assert.equal(report.checks.find((check) => check.id === 'codespaces.ssh-key')?.status, 'unknown');
   assert.ok(report.checks.every((check) => check.phase === 'pre-provision'));
   assert.ok(calls.every(([command, ...args]) => command === 'git' || (command === 'gh' && (args[0] === '--version' || (args[0] === 'api' && args.includes('GET'))))));
 });

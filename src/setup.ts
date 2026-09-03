@@ -9,7 +9,7 @@ import { assertSupportedDevcontainerConfig } from './runtime.js';
 import type { AgentContainersConfig, BackendKind, BackendSelection, DoctorCheck, DoctorReport, ProcessResult, ProcessRunner, SetupState } from './types.js';
 
 export interface CodespacesSetupEvidence { repository: string; requestedRef: string; expectedOid: string; devcontainerPath: string; devcontainerBlobOid: string }
-export interface DoctorOptions { abortSignal?: AbortSignal; timeoutMs?: number; stateDir?: string; workspaceName?: string }
+export interface DoctorOptions { abortSignal?: AbortSignal; timeoutMs?: number; stateDir?: string; workspaceName?: string; nodeVersion?: string }
 export interface DiscoveredProjectSetup { repository: string; ref: string; expectedOid: string; devcontainerPath: string }
 
 /** Discover only immutable Git-tree inputs suitable for first-project setup. */
@@ -133,6 +133,7 @@ async function localChecks(config: AgentContainersConfig, runner: ProcessRunner,
   }
   return [
     result('local.os', process.platform === 'win32' || process.platform === 'darwin' || process.platform === 'linux', 'Host OS is supported.', 'Host OS is unsupported.'),
+    result('local.node', supportsNodeEngine(options.nodeVersion ?? process.versions.node), `Node ${options.nodeVersion ?? process.versions.node} satisfies the package engine (>=20.19.0).`, `Node ${options.nodeVersion ?? process.versions.node} does not satisfy the package engine (>=20.19.0).`),
     result('local.git', git?.code === 0, 'Git is available.', 'Git is unavailable.'),
     result('local.repository', repository?.code === 0 && repository.stdout.trim() === 'true', 'Git repository is available.', 'Git repository cannot be verified.'),
     result('local.worktree', Boolean(worktree && (worktree.code === 0 || worktree.code === 129) && /relative-paths/.test(`${worktree.stdout}${worktree.stderr}`)), 'Git worktree relative paths are supported.', 'Git worktree relative paths are unsupported.'),
@@ -146,9 +147,20 @@ async function localChecks(config: AgentContainersConfig, runner: ProcessRunner,
   ];
 }
 
+/** Matches package.json's Node >=20.19.0 engine without shelling out. */
+function supportsNodeEngine(version: string): boolean {
+  const match = /^(\d+)\.(\d+)\.(\d+)/.exec(version);
+  if (!match) return false;
+  const [major, minor, patch] = match.slice(1).map(Number);
+  return major > 20 || (major === 20 && (minor > 19 || (minor === 19 && patch >= 0)));
+}
+
 /** Inspect the configured Dev Container from the configured base commit, never from a mutable checkout. */
 async function localDevcontainerChecks(config: AgentContainersConfig, runner: ProcessRunner, root: string): Promise<DoctorCheck[]> {
-  const base = await attempt(runner, 'git', ['rev-parse', '--verify', `${config.workspace.baseBranch}^{commit}`], root);
+  const baseRef = `refs/heads/${config.workspace.baseBranch}`;
+  const branch = await attempt(runner, 'git', ['show-ref', '--verify', '--quiet', baseRef], root);
+  if (branch?.code !== 0) return [action('local.base', `Configured local base branch ${config.workspace.baseBranch} does not exist.`), action('local.devcontainer', 'Dev Container compatibility cannot be checked until the configured local base branch resolves.')];
+  const base = await attempt(runner, 'git', ['rev-parse', '--verify', `${baseRef}^{commit}`], root);
   const oid = base?.code === 0 && /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(base.stdout.trim()) ? base.stdout.trim() : undefined;
   if (!oid) return [action('local.base', `Configured base branch ${config.workspace.baseBranch} cannot be resolved to a commit.`), action('local.devcontainer', 'Dev Container compatibility cannot be checked until the configured base branch resolves.')];
   const path = config.environment.devcontainerPath;
@@ -195,7 +207,7 @@ async function codespacesChecks(config: AgentContainersConfig, runner: ProcessRu
       } else if (normalized === 'stopped' || normalized === 'deleted') {
         workspaceChecks.push(action('codespaces.workspace.runtime', `Workspace ${options.workspaceName} is ${normalized}; doctor never starts or restores a stopped Codespace.`, 'provisioned-runtime'));
       } else if (v2) {
-        const report = await observe(() => runReadinessProbes({ stateDir: options.stateDir!, name: options.workspaceName!, provider, config: v2, loadMetadata }));
+        const report = await observe(() => runReadinessProbes({ stateDir: options.stateDir!, name: options.workspaceName!, provider, config: v2, loadMetadata, persistSettledObservation: false }));
         if (report.error) workspaceChecks.push(action('codespaces.workspace.runtime', 'Provisioned-runtime readiness probes could not complete; no repair or restart was attempted.', 'provisioned-runtime'));
         else workspaceChecks.push(...readinessGateDoctorChecks(record, report.value));
         workspaceChecks.push(await remoteHelperDoctorCheck(provider, record));
@@ -212,9 +224,9 @@ async function codespacesChecks(config: AgentContainersConfig, runner: ProcessRu
     defaults ? { ...ready('codespaces.owner-billing', 'Documented default billable owner and location were read.'), evidence: { billableOwner: defaults.billableOwner.login, defaultLocation: defaults.location, defaultDevcontainerPath: defaults.devcontainerPath } } : action('codespaces.owner-billing', 'Documented default billable owner and location could not be read.'),
     result('codespaces.machine', Boolean(selectedMachine), 'Configured machine appears in provider inventory.', 'Configured machine is absent from provider inventory.'),
     result('codespaces.geo', Boolean(geoEligible), v2?.backends.codespaces.geo === 'auto' ? 'geo:auto uses the documented default location.' : 'Configured geo is eligible for selected machine.', 'Configured geo is not eligible for selected machine.'),
-    action('codespaces.ports', 'Port policy is unavailable because no documented read-only endpoint proves it.'),
-    action('codespaces.secrets', 'Secret policy is unavailable because no documented read-only endpoint proves it.'),
-    action('codespaces.ssh-key', 'A pre-existing SSH key/config is required later and was not inspected.'),
+    unknown('codespaces.ports', 'Port policy is unavailable because no documented read-only endpoint proves it.'),
+    unknown('codespaces.secrets', 'Secret policy is unavailable because no documented read-only endpoint proves it.'),
+    unknown('codespaces.ssh-key', 'A pre-existing SSH key/config is required later and was not inspected.'),
     ...workspaceChecks,
   ];
 }

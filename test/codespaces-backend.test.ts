@@ -118,7 +118,9 @@ test('doctor runs the same bounded provisioned-runtime probes only for exactly r
   const stateDir = join(await mkdtemp(join(tmpdir(), 'agent-containers-backend-')), 'state');
   await saveMetadata(stateDir, recordedWorkspace(), { expectedGeneration: null });
   await recordIssue9Intent(stateDir);
+  const before = await loadMetadata(stateDir, 'issue-9');
   const report = await doctor(configFixture(), 'codespaces', readinessRunner(), '/repo', { stateDir, workspaceName: 'issue-9' });
+  assert.deepEqual(await loadMetadata(stateDir, 'issue-9'), before, 'doctor must not persist a readiness observation');
   const ids = report.checks.filter((check) => check.id.startsWith('codespaces.runtime.')).map((check) => check.id);
   assert.deepEqual(ids, [
     'codespaces.runtime.provider',
