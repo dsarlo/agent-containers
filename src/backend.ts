@@ -7,6 +7,7 @@ import { waitCodespacesReady } from './codespaces-readiness.js';
 import { recordCodespacesEvent } from './codespaces-ops.js';
 import { attachRemoteCommand, cancelRemoteCommand, createNodeSshSpawner, executeRemoteCommand, type SshSpawner } from './codespaces-transport.js';
 import { listMetadata, type CodespacesWorkspaceMetadata } from './state.js';
+import { credentialArgvShaped, secretShaped } from './secrets.js';
 
 /** Local lifecycle hooks keep the backend boundary injectable without changing durable records. */
 export interface LocalExecutionLifecycle {
@@ -184,6 +185,7 @@ function isValidArgv(argv: readonly string[]): boolean {
 function assertRequest(request: { commandId: string; argv: readonly [string, ...string[]] }): void { if (!request.commandId || !isValidArgv(request.argv)) throw new Error('Execution request is invalid.'); }
 function assertRemoteRequest(request: RemoteCommandRequest): void {
   if (!request.commandId || !isValidArgv(request.argv)) throw new Error('Execution request is invalid.');
+  if (credentialArgvShaped(request.argv) || request.argv.some(secretShaped)) throw new Error('Remote execution rejects credential-shaped argv. Pass secrets only through approved remote secret configuration.');
   if (request.mode !== undefined && request.mode !== 'pipe' && request.mode !== 'pty') throw new Error('Remote execution mode must be pipe or pty.');
   if (request.cwd !== undefined && (!request.cwd || request.cwd.length > 1024 || /[\0\r\n]/.test(request.cwd))) throw new Error('Remote cwd is invalid.');
 }

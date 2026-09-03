@@ -449,22 +449,20 @@ static void command_run_dir(struct ac_run *run) {
   mkdir_p(run->log_dir);
 }
 
+/* Persist execution identity only. Never serialize argv: commands commonly carry
+ * bearer headers or tokens, and command records are readable by the Codespaces
+ * user after transport loss. */
 static void write_command_json(struct ac_run *run) {
   char path[AC_FPATH];
   snprintf(path, sizeof(path), "%s/command.json", run->log_dir);
   char buf[AC_MAX_CMDLINE];
-  size_t off = 0;
   char escaped[1024];
   json_string_escape(run->command_id, escaped, sizeof(escaped));
-  off += (size_t)snprintf(buf + off, sizeof(buf) - off, "{\"command_id\":\"%s\",\"request_hash\":\"%s\",\"workspace_id\":\"%s\",\"pid\":%ld,\"pgid\":%d,\"mode\":\"%s\",\"cwd\":\"",
-                          escaped, run->request_hash, run->workspace_id, (long)run->pid, run->pgid, run->mode[0] != '\0' ? run->mode : "pipe");
+  snprintf(buf, sizeof(buf), "{\"command_id\":\"%s\",\"request_hash\":\"%s\",\"workspace_id\":\"%s\",\"pid\":%ld,\"pgid\":%d,\"mode\":\"%s\",\"cwd\":\"",
+           escaped, run->request_hash, run->workspace_id, (long)run->pid, run->pgid, run->mode[0] != '\0' ? run->mode : "pipe");
   json_string_escape(run->workdir, escaped, sizeof(escaped));
-  off += (size_t)snprintf(buf + off, sizeof(buf) - off, "%s\",\"argv\":[", escaped);
-  for (int i = 0; i < run->argc && off + 1024 < sizeof(buf); i++) {
-    json_string_escape(run->argv[i], escaped, sizeof(escaped));
-    off += (size_t)snprintf(buf + off, sizeof(buf) - off, "%s\"%s\"", i == 0 ? "" : ",", escaped);
-  }
-  off += (size_t)snprintf(buf + off, sizeof(buf) - off, "]}");
+  size_t used = strlen(buf);
+  snprintf(buf + used, sizeof(buf) - used, "%s\",\"argv_count\":%d}", escaped, run->argc);
   atomic_write_file(path, buf);
 }
 
@@ -484,14 +482,14 @@ static void write_status_json(struct ac_run *run, const char *state, int exit_co
   atomic_write_file(path, buf);
 }
 
+/* Do not persist command output. Arbitrary child output can include inherited
+ * environment credentials and is readable by untrusted repository code running
+ * as the same Codespaces user. Live frames still carry output to the connected
+ * caller; reconnects retain status/cancellation only. */
 static void open_command_logs(struct ac_run *run) {
-  char path[AC_FPATH];
-  snprintf(path, sizeof(path), "%s/stdout.log", run->log_dir);
-  run->stdout_log = fopen(path, "ab");
-  snprintf(path, sizeof(path), "%s/stderr.log", run->log_dir);
-  run->stderr_log = fopen(path, "ab");
-  snprintf(path, sizeof(path), "%s/terminal.log", run->log_dir);
-  run->terminal_log = fopen(path, "ab");
+  run->stdout_log = NULL;
+  run->stderr_log = NULL;
+  run->terminal_log = NULL;
   char helper_path[AC_FPATH];
   snprintf(helper_path, sizeof(helper_path), "%s/helper.json", run->log_dir);
   char hj[512];
@@ -506,7 +504,8 @@ static void close_command_logs(struct ac_run *run) {
 }
 
 static void append_stream_log(FILE *log, uint64_t *offset, const unsigned char *bytes, size_t len) {
-  if (log == NULL) return;
+  /* Offsets remain live-stream cursors even though output is never durable. */
+  if (log == NULL) { *offset += (uint64_t)len; return; }
   if (fwrite(bytes, 1, len, log) == len) {
     fflush(log);
     *offset += (uint64_t)len;
@@ -1142,10 +1141,8 @@ static void handle_attach(struct ac_frame *frame, int grace_ms) {
   int stdout_fd = open_log_at(dir, "stdout.log", stdout_from, &stdout_end);
   int stderr_fd = open_log_at(dir, "stderr.log", stderr_from, &stderr_end);
   int terminal_fd = open_log_at(dir, "terminal.log", terminal_from, &terminal_end);
-  if (stdout_fd < 0 && stderr_fd < 0 && terminal_fd < 0) {
-    emit_jsonf(AC_E_REJECTED, "{\"command_id\":\"%s\",\"reason\":\"attach-offset-beyond-retention\"}", command_id);
-    return;
-  }
+  /* Output is intentionally never retained. Attachment is status/cancellation
+   * recovery only, so missing output logs are expected rather than rejected. */
   char ec[16];
   if (exit_code < 0) snprintf(ec, sizeof(ec), "null");
   else snprintf(ec, sizeof(ec), "%d", exit_code);

@@ -296,6 +296,25 @@ test('no token-shaped fixture appears in any persisted file or captured readines
   assert.ok(metadata && metadata.version === 2 && metadata.backend === 'codespaces');
 });
 
+test('the Codespaces backend rejects credential-shaped argv before it reaches the remote helper (SEC-2)', async () => {
+  const fixture = await transportFixture();
+  const previous = process.env.AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES;
+  try {
+    process.env.AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES = '1';
+    const backend = createCodespacesExecutionBackend({ stateDir: fixture.stateDir, config: fixture.deps.config, runner: fixture.runner, root: fixture.fixture.root, spawner: fixture.deps.spawner });
+    const handle = { kind: 'codespaces' as const, id: fixture.metadata.workspaceId, name: fixture.metadata.remote.name, environmentId: fixture.metadata.remote.environmentId };
+    await assert.rejects(async () => {
+      for await (const event of backend.execute(handle, { commandId: 'cmd-secret', argv: ['tool', '--token', TOKEN_FIXTURE], mode: 'pipe' })) {
+        assert.fail(`credential-shaped argv unexpectedly reached the remote helper: ${event.type}`);
+      }
+    }, /credential-shaped argv/i);
+    assert.equal(fixture.helper.records.has('cmd-secret'), false, 'credential-shaped argv must not reach the remote helper');
+  } finally {
+    if (previous === undefined) delete process.env.AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES;
+    else process.env.AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES = previous;
+  }
+});
+
 test('the Codespaces backend executes a durable pipe command behind the experimental gate', async () => {
   const fixture = await transportFixture();
   const previous = process.env.AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES;

@@ -72,8 +72,8 @@ export class RealHelperProcess {
   private ended = false;
   private readonly closeWaiters: Array<() => void> = [];
 
-  constructor(binPath: string, dataDir: string) {
-    this.child = spawn(binPath, ['serve'], { stdio: ['pipe', 'pipe', 'pipe'], env: { ...process.env, AC_HELPER_DATA_DIR: dataDir } });
+  constructor(binPath: string, dataDir: string, environment: NodeJS.ProcessEnv = {}) {
+    this.child = spawn(binPath, ['serve'], { stdio: ['pipe', 'pipe', 'pipe'], env: { ...process.env, ...environment, AC_HELPER_DATA_DIR: dataDir } });
     this.child.stderr!.on('data', () => { /* helper diagnostics are not framed */ });
     this.child.stdout!.on('data', (chunk: string | Uint8Array) => {
       const bytes = typeof chunk === 'string' ? new TextEncoder().encode(chunk) : new Uint8Array(chunk);
