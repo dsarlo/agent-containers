@@ -45,6 +45,7 @@ export interface MockCommandRecord {
 export class MockRemoteHelper {
   readonly behaviors = new Map<string, MockCommandBehavior>();
   readonly records = new Map<string, MockCommandRecord>();
+  readonly cancelRequests: string[] = [];
   readonly resizes: Array<{ commandId: string; cols: number; rows: number }> = [];
   protocol = 1;
   helperArch = 'x86_64';
@@ -60,6 +61,7 @@ export class MockRemoteHelper {
 
   reset(): void {
     this.records.clear();
+    this.cancelRequests.length = 0;
     this.behaviors.clear();
   }
 }
@@ -237,6 +239,7 @@ async function handleRequest(helper: MockRemoteHelper, session: MockSshSession, 
     }
     case HelperFrameType.cancel: {
       const request = parseJson<{ command_id: string; request_hash: string }>(frame.payload);
+      helper.cancelRequests.push(request.command_id);
       const record = helper.records.get(request.command_id);
       if (!record) {
         await session.sendJson(HelperFrameType.rejected, { command_id: request.command_id, reason: 'unknown-command' });

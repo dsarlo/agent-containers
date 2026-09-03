@@ -20,6 +20,14 @@ const OID = '0123456789abcdef0123456789abcdef01234567';
 const BLOB = '1234567890abcdef1234567890abcdef12345678';
 const TOKEN_FIXTURE = 'ghp_' + 'abcdefghijklmnopqrstuvwxyz123456';
 
+async function waitForCondition(condition: () => boolean, failure: string, timeoutMs = 1_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!condition()) {
+    if (Date.now() >= deadline) throw new Error(failure);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
 function configFixture(): CodespacesAgentContainersConfig {
   return {
     version: 2,
@@ -341,7 +349,7 @@ test('the Codespaces backend executes a durable pipe command behind the experime
     const waiting = (async () => {
       for await (const event of run) started.push(event);
     })();
-    await new Promise((resolve) => setTimeout(resolve, 30));
+    await waitForCondition(() => started.some((event) => event.type === 'started'), 'remote command never reached the durable started state before cancellation');
     await backend.cancel(handle, commandId);
     controller.abort();
     await waiting;
@@ -365,9 +373,9 @@ test('backend forwards a second interrupt so a pending cancel proof records unkn
     const second = new AbortController();
     const events: import('../src/types.js').CommandEvent[] = [];
     const consume = (async () => { for await (const event of backend.execute(handle, { commandId, argv: ['sleep', '9'], mode: 'pipe' }, first.signal, second.signal)) events.push(event); })();
-    await new Promise((resolve) => setTimeout(resolve, 20));
+    await waitForCondition(() => events.some((event) => event.type === 'started'), 'remote command never reached the durable started state before the first interrupt');
     first.abort();
-    await new Promise((resolve) => setTimeout(resolve, 20));
+    await waitForCondition(() => fixture.helper.cancelRequests.includes(commandId), 'first interrupt never reached the remote cancel-proof request');
     second.abort();
     let timer: NodeJS.Timeout | undefined;
     try {
