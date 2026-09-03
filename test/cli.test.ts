@@ -42,7 +42,7 @@ test('CLI list, probe, and stale are read-only while status keeps its legacy met
   assert.equal(JSON.parse(legacy[0])[0].worktree, entry.worktree);
   const stale: string[] = [];
   assert.equal(await runCli(['stale', '--older-than', '1d'], root, (message) => stale.push(message)), 0);
-  assert.match(stale[0], /safe/);
+  assert.match(stale[0], /No managed workspaces/);
 });
 
 test('CLI parses destructive confirmation options strictly', async () => {

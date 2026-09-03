@@ -21,7 +21,7 @@ test('inventory reports dirty worktrees, manual recovery, and only read-only pro
   await saveMetadata(stateDir, entry, { expectedGeneration: null });
   await recordManualRecovery(stateDir, entry.name, { reason: 'operation-may-be-active', containerIds: [id], worktree: entry.worktree });
   const calls: string[] = [];
-  const runner = { async run(command: string, args: string[]) { calls.push([command, ...args].join(' ')); if (command === 'git' && args[1] === 'status') return { code: 0, stdout: '?? report.txt\n', stderr: '' }; if (command === 'docker' && args[0] === 'inspect') return { code: 0, stdout: `${id}\n${entry.worktree}\n`, stderr: '' }; return { code: 0, stdout: '', stderr: '' }; } };
+  const runner = { async run(command: string, args: string[]) { calls.push([command, ...args].join(' ')); if (command === 'git' && args[1] === 'status') return { code: 0, stdout: '?? report.txt\n', stderr: '' }; if (command === 'docker' && args[0] === 'ps') return { code: 0, stdout: `${id}\n`, stderr: '' }; if (command === 'docker' && args[0] === 'inspect') return { code: 0, stdout: `${id}\n${entry.worktree}\n`, stderr: '' }; return { code: 0, stdout: '', stderr: '' }; } };
   const [observed] = await inventoryWorkspaces(stateDir, runner, { probe: true });
   assert.equal(observed.worktree.state, 'dirty');
   assert.equal(observed.recovery, 'required');
@@ -34,7 +34,7 @@ test('inventory marks missing worktrees, Docker absence, and label mismatch with
   const root = await mkdtemp(join(tmpdir(), 'agent-containers-inventory-repo-'));
   const entry = metadata(root, 'missing');
   await saveMetadata(stateDir, entry, { expectedGeneration: null });
-  const runner = { async run(command: string) { if (command === 'docker') return { code: 0, stdout: `${id}\n${join(root, 'other')}\n`, stderr: '' }; return { code: 0, stdout: '', stderr: '' }; } };
+  const runner = { async run(command: string, args: string[]) { if (command === 'docker' && args[0] === 'ps') return { code: 0, stdout: `${id}\n`, stderr: '' }; if (command === 'docker') return { code: 0, stdout: `${id}\n${join(root, 'other')}\n`, stderr: '' }; return { code: 0, stdout: '', stderr: '' }; } };
   const [observed] = await inventoryWorkspaces(stateDir, runner, { probe: true });
   assert.equal(observed.worktree.state, 'missing');
   assert.equal(observed.container.state, 'ambiguous');
