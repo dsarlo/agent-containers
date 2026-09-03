@@ -11,6 +11,7 @@ import { doctor } from '../src/setup.js';
 import { GhCodespacesProvider } from '../src/codespaces.js';
 import { loadCreateIntent, recordCreateIntent } from '../src/codespaces-ops.js';
 import { loadMetadata, saveMetadata, type CodespacesWorkspaceMetadata } from '../src/state.js';
+import { saveCommandStatus } from '../src/codespaces-command.js';
 import { runCli } from '../src/cli.js';
 import { nodeProcessRunner } from '../src/workspaces.js';
 import { reconcileCodespacesWorkspace, removeCodespacesWorkspace, startCodespacesWorkspace, stopCodespacesWorkspace } from '../src/codespaces-lifecycle.js';
@@ -466,6 +467,55 @@ test('Codespaces removal reads remote dirty and unpushed Git risk before deletio
   await assert.rejects(() => removeCodespacesWorkspace(deps, true), /octo\/agent-containers.*agent-containers\/issue-9.*dirty.*unpushed/i);
   assert.ok(calls.some((args) => args.join(' ').includes('git status --porcelain=v1 --branch')), 'remote Git state must be observed before deletion');
   assert.equal(calls.some((args) => args.includes('DELETE')), false, 'remote risk refusal must not delete');
+});
+
+test('a dirty remote Git refusal does not poison a later separately acknowledged clean deletion', async () => {
+  const stateDir = join(await mkdtemp(join(tmpdir(), 'agent-containers-lifecycle-remove-retry-')), 'state');
+  await saveMetadata(stateDir, { ...recordedWorkspace(), lifecycle: { ...recordedWorkspace().lifecycle, activeOperation: null } }, { expectedGeneration: null });
+  let dirty = true;
+  let deletes = 0;
+  const runner: ProcessRunner = { async run(command, args) {
+    if (args.includes('/user')) return { code: 0, stdout: JSON.stringify({ id: 1, login: 'octo' }), stderr: '' };
+    if (/^\/user\/codespaces\//.test(args.at(-1) ?? '') && args.includes('GET')) return deletes > 0 ? { code: 1, stdout: '', stderr: 'HTTP 404: Not Found' } : { code: 0, stdout: JSON.stringify(resourceFixture()), stderr: '' };
+    if (command === 'gh' && args[0] === 'codespace' && args[1] === 'ssh') return { code: 0, stdout: dirty ? '## agent-containers/issue-9...origin/agent-containers/issue-9 [ahead 1]\n M important.txt\n' : '## agent-containers/issue-9...origin/agent-containers/issue-9\n', stderr: '' };
+    if (/^\/user\/codespaces\//.test(args.at(-1) ?? '') && args.includes('DELETE')) { deletes += 1; return { code: 0, stdout: '', stderr: '' }; }
+    throw new Error(`unexpected lifecycle call ${JSON.stringify(args)}`);
+  } };
+  const deps = { stateDir, name: 'issue-9', config: configFixture(), provider: new GhCodespacesProvider(runner) };
+  await assert.rejects(() => removeCodespacesWorkspace(deps, true), /dirty.*unpushed/i);
+  const refused = await loadMetadata(stateDir, 'issue-9');
+  assert.ok(refused && refused.version === 2 && refused.backend === 'codespaces');
+  assert.equal(refused.recovery, null, 'a known-safe preflight refusal must not create an ambiguous recovery barrier');
+  dirty = false;
+  await removeCodespacesWorkspace(deps, true);
+  assert.equal(deletes, 1, 'the distinct force acknowledgement reaches the exact guarded deletion path after risk is resolved');
+});
+
+test('Codespaces removal preserves exact recovery evidence for drift, interruption, and active command guards without broad deletion', async () => {
+  for (const guard of ['actor', 'identity', 'checkpoint', 'active-command', 'unknown-command'] as const) {
+    const stateDir = join(await mkdtemp(join(tmpdir(), `agent-containers-lifecycle-remove-${guard}-`)), 'state');
+    const initial = { ...recordedWorkspace(), lifecycle: { ...recordedWorkspace().lifecycle, activeOperation: guard === 'checkpoint' ? recordedWorkspace().lifecycle.activeOperation : null } };
+    await saveMetadata(stateDir, initial, { expectedGeneration: null });
+    if (guard === 'active-command' || guard === 'unknown-command') {
+      await saveCommandStatus(stateDir, { schemaVersion: 1, commandId: `cmd-${guard}`, state: guard === 'active-command' ? 'running' : 'outcome-unknown', exitCode: null, transport: 'connected', createdAt: '2026-09-02T12:00:00.000Z', startedAt: '2026-09-02T12:00:00.000Z', exitedAt: null, updatedAt: '2026-09-02T12:00:00.000Z' });
+    }
+    let deletes = 0;
+    const runner: ProcessRunner = { async run(command, args) {
+      if (args.includes('/user')) return { code: 0, stdout: JSON.stringify({ id: guard === 'actor' ? 2 : 1, login: 'octo' }), stderr: '' };
+      if (/^\/user\/codespaces\//.test(args.at(-1) ?? '') && args.includes('GET')) return { code: 0, stdout: JSON.stringify(resourceFixture(guard === 'identity' ? { id: '9876543211' } : {})), stderr: '' };
+      if (command === 'gh' && args[0] === 'codespace' && args[1] === 'ssh') return { code: 0, stdout: '## agent-containers/issue-9...origin/agent-containers/issue-9\n', stderr: '' };
+      if (/^\/user\/codespaces\//.test(args.at(-1) ?? '') && args.includes('DELETE')) { deletes += 1; return { code: 0, stdout: '', stderr: '' }; }
+      throw new Error(`unexpected lifecycle call ${JSON.stringify(args)}`);
+    } };
+    const deps = { stateDir, name: 'issue-9', config: configFixture(), provider: new GhCodespacesProvider(runner) };
+    await assert.rejects(() => removeCodespacesWorkspace(deps, true), /BLOCKED|refused/i, guard);
+    assert.equal(deletes, 0, `${guard} must never invoke broad deletion`);
+    const preserved = await loadMetadata(stateDir, 'issue-9');
+    assert.ok(preserved && preserved.version === 2 && preserved.backend === 'codespaces');
+    if (guard === 'actor' || guard === 'identity') assert.match(preserved.recovery?.reason ?? '', /remove-ambiguous/);
+    else if (guard === 'checkpoint') assert.ok(preserved.lifecycle.activeOperation, 'an interrupted checkpoint remains durable');
+    else assert.equal(preserved.recovery, null, 'known command lifecycle guards do not invent destructive uncertainty');
+  }
 });
 
 test('Codespaces removal tombstones an exact resource when DELETE reports 404', async () => {

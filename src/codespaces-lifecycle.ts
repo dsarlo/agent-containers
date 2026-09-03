@@ -19,6 +19,9 @@ export interface CodespacesLifecycleDependencies {
 
 export type ReconcileOutcome = 'matched' | 'missing' | 'mismatch' | 'unreachable' | 'ambiguous';
 
+/** A fully observed remote Git risk refusal is safe to retry after the user resolves it. */
+class KnownSafePreflightRefusal extends Error {}
+
 export async function reconcileCodespacesWorkspace(deps: CodespacesLifecycleDependencies): Promise<ReconcileOutcome> {
   const metadata = await exactMetadata(deps);
   try {
@@ -62,13 +65,14 @@ export async function startCodespacesWorkspace(deps: CodespacesLifecycleDependen
 export async function removeCodespacesWorkspace(deps: CodespacesLifecycleDependencies, forceRemoteDataLoss: boolean): Promise<void> {
   if (!forceRemoteDataLoss) throw new Error('Codespaces removal requires --force-remote-data-loss; this is distinct from --yes.');
   const metadata = await exactMetadata(deps);
+  if (metadata.lifecycle.activeOperation) throw new Error('Codespaces lifecycle is BLOCKED by an interrupted durable operation checkpoint.');
   await assertNoActiveCommand(deps.stateDir);
   await mutate(deps, metadata, 'remove', 'remove-requested', async () => {
     await verifyBeforeMutation(deps, metadata);
     const risk = await deps.provider.remoteGitRisk(metadata.remote.name);
     if (risk.dirty || risk.unpushed) {
       const detail = [risk.dirty ? 'dirty' : null, risk.unpushed ? 'unpushed' : null].filter(Boolean).join(' and ');
-      throw new Error(`Remote deletion is refused: ${metadata.repository.owner}/${metadata.repository.name} branch ${risk.branch} is ${detail}; preserve or explicitly resolve the remote Git state before data loss.`);
+      throw new KnownSafePreflightRefusal(`Remote deletion is refused: ${metadata.repository.owner}/${metadata.repository.name} branch ${risk.branch} is ${detail}; preserve or explicitly resolve the remote Git state before data loss.`);
     }
     try {
       await deps.provider.delete(metadata.remote.name);
@@ -114,7 +118,13 @@ async function mutate(deps: CodespacesLifecycleDependencies, metadata: Codespace
     await recordCodespacesEvent(deps.stateDir, { event: kind === 'remove' ? 'tombstone-written' : kind === 'stop' ? 'stop-verified' : 'start-verified', workspaceName: metadata.name, operationId, requestId: null, actorId: metadata.control.actorId, repositoryId: metadata.repository.id, codespaceId: metadata.remote.codespaceId, previous: kind, next: next.lifecycle.normalized, detail: null });
   } catch (error) {
     const current = await loadMetadata(deps.stateDir, deps.name);
-    if (current?.version === 2 && current.backend === 'codespaces') await saveMetadata(deps.stateDir, { ...current, recovery: { reason: `${kind}-ambiguous`, operationId, recordedAt: now() }, lifecycle: { ...current.lifecycle, normalized: 'recovery-required', activeOperation: null } }, { expectedGeneration: metadataGeneration(current) });
+    if (current?.version === 2 && current.backend === 'codespaces') {
+      if (error instanceof KnownSafePreflightRefusal) {
+        await saveMetadata(deps.stateDir, { ...current, lifecycle: { ...current.lifecycle, activeOperation: null } }, { expectedGeneration: metadataGeneration(current) });
+      } else {
+        await saveMetadata(deps.stateDir, { ...current, recovery: { reason: `${kind}-ambiguous`, operationId, recordedAt: now() }, lifecycle: { ...current.lifecycle, normalized: 'recovery-required', activeOperation: null } }, { expectedGeneration: metadataGeneration(current) });
+      }
+    }
     throw error;
   }
 }

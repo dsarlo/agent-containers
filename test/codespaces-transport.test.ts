@@ -166,6 +166,23 @@ test('stdin is forwarded as frames and half-closed before the output is drained 
   assert.equal(status?.state, 'exited');
 });
 
+test('stdin overflow reaches the caller promptly while the remote child remains running', async () => {
+  const fixture = await transportFixture({ reconnectBudgetMs: 60_000 });
+  fixture.helper.configure({ commandId: COMMAND_ID, stdinOverflow: true, stayRunning: true });
+  async function* endlessStdin() {
+    yield bytes(1);
+    await new Promise<void>(() => undefined);
+  }
+  const started = Date.now();
+  await assert.rejects(
+    () => withSettleGuard(executeToEnd(fixture, pipeInput({ stdin: 'stream', stdinSource: endlessStdin() })), 'stdin overflow was not caller-visible', 500),
+    /stdin.*overflow/i,
+  );
+  assert.ok(Date.now() - started < 500, 'overflow must not wait for the long-running remote child');
+  assert.equal((await loadCommandStatus(fixture.stateDir, COMMAND_ID))?.state, 'outcome-unknown');
+  assert.ok(await loadCommandRecovery(fixture.stateDir, COMMAND_ID));
+});
+
 test('disconnect/reconnect resumes by offsets and delivers the exact retained exit (N6)', async () => {
   const firstChunk = new Uint8Array(5000).fill(1);
   const secondChunk = new Uint8Array(5000).fill(2);

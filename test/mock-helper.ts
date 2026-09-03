@@ -22,6 +22,8 @@ export interface MockCommandBehavior {
   cancelPolicy?: MockCancelPolicy;
   /** Do not auto-send the scheduled exit (keep the command running remotely). */
   stayRunning?: boolean;
+  /** Emit the helper's bounded-stdin terminal error while keeping the child alive. */
+  stdinOverflow?: boolean;
   /** Pause between output frames to exercise socket backpressure. */
   sendOutputDelayMs?: number;
   /** Reported helper_arch in hello-ok (default 'x86_64'); used to cross-check N1. */
@@ -219,6 +221,7 @@ async function handleRequest(helper: MockRemoteHelper, session: MockSshSession, 
         return;
       }
       await session.sendJson(HelperFrameType.started, { command_id: request.command_id, pid: 5252, started_at: record.begin ?? new Date().toISOString(), remote_boot_id: MOCK_BOOT_ID });
+      if (behavior?.stdinOverflow) await session.sendJson(HelperFrameType.error, { command_id: request.command_id, message: 'stdin-overflow' });
       await pump(helper, session, record, behavior, { stdout: 0n, stderr: 0n, terminal: 0n });
       break;
     }

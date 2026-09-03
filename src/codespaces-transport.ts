@@ -148,6 +148,10 @@ export class HelperSession {
   private closing: Promise<void> | undefined;
 
   constructor(private readonly child: FramedChildProcess) {
+    child.stdin.on('error', () => {
+      // A terminal helper outcome can race an in-flight stdin write; send()
+      // converts that closed transport into a fail-closed transport error.
+    });
     child.stdout.on('data', (chunk: string | Uint8Array) => {
       const bytes = typeof chunk === 'string' ? new TextEncoder().encode(chunk) : new Uint8Array(chunk);
       let frames: HelperFrame[];
@@ -248,6 +252,7 @@ export class HelperSession {
       let settled = false;
       const settle = () => { if (!settled) { settled = true; resolve(); } };
       this.child.once('close', settle);
+      this.endStdin();
       try { if (!this.child.kill()) settle(); } catch { settle(); }
     });
     await this.closing;
@@ -369,6 +374,7 @@ export async function* executeRemoteCommand(deps: RemoteTransportDependencies, i
       if (attempt >= 1 && Date.now() >= deadline) break;
       attempt += 1;
       const connect = attachNext ? openAttachSession : openExecSession;
+      let stdinFailure: unknown;
       try {
         const opened = await connect(deps, helper, commandId, requestHash, input, offsets, now);
         attachNext = true;
@@ -387,21 +393,27 @@ export async function* executeRemoteCommand(deps: RemoteTransportDependencies, i
         if (cancelRequested) { session.close(); session = undefined; continue; }
         yield { type: 'started', commandId };
         if (input.stdin === 'stream' && input.stdinSource) {
-          for await (const chunk of input.stdinSource) {
-            if (deps.signal?.aborted) { void session.close(); break; }
-            if (chunk.length > MAX_STDIN_FRAME_BYTES) throw new Error('A user stdin chunk exceeded the bounded frame size; refusing the oversized chunk.');
-            await session.send(HelperFrameType.stdin, chunk);
+          // Keep reading helper events while stdin is backpressured or its source
+          // is still open: stdin-overflow is terminal and must not wait for child exit.
+          void (async () => {
+            try {
+              for await (const chunk of input.stdinSource as AsyncIterable<Uint8Array>) {
+                if (deps.signal?.aborted) { void session.close(); break; }
+                if (chunk.length > MAX_STDIN_FRAME_BYTES) throw new Error('A user stdin chunk exceeded the bounded frame size; refusing the oversized chunk.');
+                await session.send(HelperFrameType.stdin, chunk);
+              }
+              await session.send(HelperFrameType.stdinEof, { command_id: commandId, request_hash: requestHash });
+            } catch (error) {
+              stdinFailure = error;
+              void session.close();
+            }
+          })();
+        } else {
+          try {
+            await session.send(HelperFrameType.stdinEof, { command_id: commandId, request_hash: requestHash });
+          } catch (error) {
+            if (!(error instanceof TransportLostError)) throw error;
           }
-        }
-        /* Half-close stdin with an explicit protocol frame so the child keeps
-         * running detached from the stream (spec 9.4). This is never a transport
-         * half-close of the connection itself (B4). If the remote helper already
-         * closed the transport, the queued output is still drained below and
-         * the loss is handled by the reconnect loop, not by discarding bytes. */
-        try {
-          await session.send(HelperFrameType.stdinEof, { command_id: commandId, request_hash: requestHash });
-        } catch (error: unknown) {
-          if (!(error instanceof TransportLostError)) throw error;
         }
         if (input.mode === 'pty' && input.resizeSource) {
           void forwardResizes(session, commandId, input.resizeSource);
@@ -434,6 +446,7 @@ export async function* executeRemoteCommand(deps: RemoteTransportDependencies, i
         const persisted = await loadCommandOffsets(deps.stateDir, commandId);
         if (persisted) offsets = persisted;
         if (cancelRequested) continue;
+        if (stdinFailure) throw stdinFailure;
         if (!(error instanceof TransportLostError)) throw error;
       }
       if (cancelRequested) continue;
