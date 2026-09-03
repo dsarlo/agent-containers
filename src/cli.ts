@@ -287,7 +287,7 @@ export async function runCli(args: string[], cwd = process.cwd(), write: (messag
     }
   } catch (error: unknown) {
     if (args[0] === 'doctor' && args.includes('--json')) {
-      write(JSON.stringify({ schemaVersion: 1, selectedBackends: [], overall: 'action-required', checks: [{ id: 'configuration', backend: 'local', phase: 'pre-provision', state: 'action-required', summary: 'Configuration or invocation prerequisites could not be verified; no runtime probes were attempted.', remediation: ['Correct the prerequisite.', 'Run ac doctor again.'] }] }, null, 2));
+      write(JSON.stringify({ schemaVersion: 1, selectedBackends: [], overall: 'action-required', checks: [{ id: 'configuration', backend: 'local', phase: 'pre-provision', status: 'fail', state: 'action-required', summary: 'Configuration or invocation prerequisites could not be verified; no runtime probes were attempted.', remediation: ['Correct the prerequisite.', 'Run ac doctor again.'] }] }, null, 2));
       return 1;
     }
     write(`agent-containers: ${redactDiagnostic(error instanceof Error ? error.message : String(error))}`);

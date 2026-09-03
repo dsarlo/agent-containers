@@ -86,6 +86,36 @@ test('project discovery accepts one committed regular Dev Container and rejects 
   await assert.rejects(() => discoverProjectSetup('/repo', ambiguous), /exactly one/i);
 });
 
+test('local doctor reports unsupported committed Dev Container fields', async () => {
+  const oid = '0123456789012345678901234567890123456789';
+  const runner: ProcessRunner = { async run(command, args) {
+    const invocation = args.join(' ');
+    if (command === 'git' && invocation === 'worktree add -h') return { code: 129, stdout: '', stderr: 'usage: git worktree add [--relative-paths] <path>' };
+    if (command === 'git' && invocation === 'rev-parse --verify main^{commit}') return { code: 0, stdout: `${oid}\n`, stderr: '' };
+    if (command === 'git' && invocation === `ls-tree -r -z ${oid} -- .devcontainer/devcontainer.json`) return { code: 0, stdout: `100644 blob ${oid}\t.devcontainer/devcontainer.json\0`, stderr: '' };
+    if (command === 'git' && invocation === `show ${oid}:.devcontainer/devcontainer.json`) return { code: 0, stdout: '{"workspaceMount":"source=host,target=/workspaces/project,type=bind"}', stderr: '' };
+    return { code: 0, stdout: invocation === 'rev-parse --is-inside-work-tree' ? 'true\n' : 'available', stderr: '' };
+  } };
+  const report = await doctor({ version: 1, workspace: { worktreeRoot: 'worktrees', baseBranch: 'main' }, environment: { devcontainerPath: '.devcontainer/devcontainer.json' }, commands: {} }, 'local', runner);
+  assert.equal(report.checks.find((check) => check.id === 'local.devcontainer')?.state, 'action-required');
+});
+
+test('local doctor reports path sharing as unknown without a safe read-only probe', async () => {
+  const oid = '0123456789012345678901234567890123456789';
+  const runner: ProcessRunner = { async run(command, args) {
+    const invocation = args.join(' ');
+    if (command === 'git' && invocation === 'worktree add -h') return { code: 129, stdout: '', stderr: 'usage: git worktree add [--relative-paths] <path>' };
+    if (command === 'git' && invocation === 'rev-parse --verify main^{commit}') return { code: 0, stdout: `${oid}\n`, stderr: '' };
+    if (command === 'git' && invocation === `ls-tree -r -z ${oid} -- .devcontainer/devcontainer.json`) return { code: 0, stdout: `100644 blob ${oid}\t.devcontainer/devcontainer.json\0`, stderr: '' };
+    if (command === 'git' && invocation === `show ${oid}:.devcontainer/devcontainer.json`) return { code: 0, stdout: '{}', stderr: '' };
+    return { code: 0, stdout: invocation === 'rev-parse --is-inside-work-tree' ? 'true\n' : 'available', stderr: '' };
+  } };
+  const report = await doctor({ version: 1, workspace: { worktreeRoot: 'worktrees', baseBranch: 'main' }, environment: { devcontainerPath: '.devcontainer/devcontainer.json' }, commands: {} }, 'local', runner);
+  const pathSharing = report.checks.find((check) => check.id === 'local.path-sharing');
+  assert.equal(pathSharing?.state, 'action-required');
+  assert.equal(pathSharing?.status, 'unknown');
+});
+
 test('local doctor accepts Git worktree capability from bounded help output when Git exits 129', async () => {
   const runner: ProcessRunner = { async run(command, args) {
     if (command === 'git' && args.join(' ') === 'worktree add -h') return { code: 129, stdout: '', stderr: 'usage: git worktree add [--relative-paths] <path>' };

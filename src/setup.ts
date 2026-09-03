@@ -5,6 +5,7 @@ import { isCanonicalContainerId, loadManualRecovery, loadMetadata, type Codespac
 import { getProductionStateDurabilityAdapter } from './durability.js';
 import { helperArchForUname, helperRoot, inspectRemoteHelper, loadHelperManifest } from './codespaces-helper.js';
 import { redactSecretDiagnostic } from './secrets.js';
+import { assertSupportedDevcontainerConfig } from './runtime.js';
 import type { AgentContainersConfig, BackendKind, BackendSelection, DoctorCheck, DoctorReport, ProcessResult, ProcessRunner, SetupState } from './types.js';
 
 export interface CodespacesSetupEvidence { repository: string; requestedRef: string; expectedOid: string; devcontainerPath: string; devcontainerBlobOid: string }
@@ -79,7 +80,7 @@ export async function doctor(config: AgentContainersConfig, selection: BackendSe
   return { schemaVersion: 1, selectedBackends, overall: overall(checks), checks };
 }
 function configurationAction(): DoctorCheck {
-  return { id: 'configuration', backend: 'local', phase: 'pre-provision', state: 'action-required', summary: 'Configuration is missing, malformed, or inconsistent; no runtime probes were attempted.', remediation: ['Correct the strict Agent Containers configuration.', 'Run ac doctor again.'] };
+  return { id: 'configuration', backend: 'local', phase: 'pre-provision', status: 'fail', state: 'action-required', summary: 'Configuration is missing, malformed, or inconsistent; no runtime probes were attempted.', remediation: ['Correct the strict Agent Containers configuration.', 'Run ac doctor again.'] };
 }
 function select(config: AgentContainersConfig, selection: BackendSelection): BackendKind[] {
   const enabled: BackendKind[] = config.version === 1 ? ['local'] : config.backends.enabled;
@@ -95,6 +96,7 @@ async function localChecks(config: AgentContainersConfig, runner: ProcessRunner,
   const dockerDaemon = docker?.code === 0 ? await attempt(runner, 'docker', ['info'], root) : undefined;
   const devcontainer = await attempt(runner, 'devcontainer', ['--version'], root);
   const configured = config.version === 1 || config.backends.enabled.includes('local');
+  const devcontainerChecks = await localDevcontainerChecks(config, runner, root);
   let durabilityReady = true;
   try { await getProductionStateDurabilityAdapter().assertStateWriteSupport(); } catch { durabilityReady = false; }
   const workspaceChecks: DoctorCheck[] = [];
@@ -137,10 +139,33 @@ async function localChecks(config: AgentContainersConfig, runner: ProcessRunner,
     result('local.docker', docker?.code === 0 && dockerDaemon?.code === 0, 'Docker CLI and daemon are available.', docker?.code === 0 ? 'Docker daemon is unavailable.' : 'Docker CLI is unavailable.'),
     result('local.devcontainers', devcontainer?.code === 0, 'Dev Containers CLI is available.', 'Dev Containers CLI is unavailable.'),
     result('local.config', configured, 'Local backend is enabled by configuration.', 'Local backend is disabled by configuration.'),
+    ...devcontainerChecks,
+    unknown('local.path-sharing', 'Host-to-container path sharing cannot be proven without starting a container; no safe read-only probe is available.'),
     result('local.state.durability', durabilityReady, 'Packaged native durability capability is available (read-only probe).', 'Packaged native durability capability is unavailable; lifecycle writes remain blocked.'),
     ...workspaceChecks,
   ];
 }
+
+/** Inspect the configured Dev Container from the configured base commit, never from a mutable checkout. */
+async function localDevcontainerChecks(config: AgentContainersConfig, runner: ProcessRunner, root: string): Promise<DoctorCheck[]> {
+  const base = await attempt(runner, 'git', ['rev-parse', '--verify', `${config.workspace.baseBranch}^{commit}`], root);
+  const oid = base?.code === 0 && /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(base.stdout.trim()) ? base.stdout.trim() : undefined;
+  if (!oid) return [action('local.base', `Configured base branch ${config.workspace.baseBranch} cannot be resolved to a commit.`), action('local.devcontainer', 'Dev Container compatibility cannot be checked until the configured base branch resolves.')];
+  const path = config.environment.devcontainerPath;
+  const tree = await attempt(runner, 'git', ['ls-tree', '-r', '-z', oid, '--', path], root);
+  const expectedEntry = `${path}`;
+  const committed = tree?.code === 0 && tree.stdout.split('\0').some((entry) => /^(100644|100755) blob [0-9a-f]{40,64}\t/.test(entry) && entry.endsWith(`\t${expectedEntry}`));
+  if (!committed) return [ready('local.base', `Configured base branch ${config.workspace.baseBranch} resolves to ${oid}.`), action('local.devcontainer', `Configured Dev Container ${path} is not a regular file tracked on ${config.workspace.baseBranch}.`)];
+  const source = await attempt(runner, 'git', ['show', `${oid}:${path}`], root);
+  if (source?.code !== 0) return [ready('local.base', `Configured base branch ${config.workspace.baseBranch} resolves to ${oid}.`), action('local.devcontainer', `Committed Dev Container ${path} could not be read from ${config.workspace.baseBranch}.`)];
+  try {
+    await assertSupportedDevcontainerConfig(`${oid}:${path}`, async () => source.stdout);
+    return [ready('local.base', `Configured base branch ${config.workspace.baseBranch} resolves to ${oid}.`), ready('local.devcontainer', `Committed Dev Container ${path} is parseable and supported by v0.1.`)];
+  } catch (error: unknown) {
+    return [ready('local.base', `Configured base branch ${config.workspace.baseBranch} resolves to ${oid}.`), action('local.devcontainer', redactSecretDiagnostic(error instanceof Error ? error.message : String(error)))];
+  }
+}
+
 async function codespacesChecks(config: AgentContainersConfig, runner: ProcessRunner, root: string, options: DoctorOptions): Promise<DoctorCheck[]> {
   const v2 = config.version === 2 ? config : undefined;
   const gh = await attempt(runner, 'gh', ['--version'], root);
@@ -244,6 +269,7 @@ async function attempt(runner: ProcessRunner, command: string, args: string[], c
 async function attemptValue<T>(operation: () => Promise<T>): Promise<T | undefined> { try { return await operation(); } catch { return undefined; } }
 async function observe<T>(operation: () => Promise<T>): Promise<{ value: T; error?: undefined } | { value?: undefined; error: true }> { try { return { value: await operation() }; } catch { return { error: true }; } }
 function result(id: string, ok: boolean, yes: string, no: string): DoctorCheck { return ok ? ready(id, yes) : action(id, no); }
-function ready(id: string, summary: string): DoctorCheck { return { id, backend: id.startsWith('local.') ? 'local' : 'codespaces', phase: 'pre-provision', state: 'ready', summary, remediation: [] }; }
-function action(id: string, summary: string, phase: 'pre-provision' | 'provisioned-runtime' = 'pre-provision'): DoctorCheck { return { id, backend: id.startsWith('local.') ? 'local' : 'codespaces', phase, state: 'action-required', summary, remediation: [`Correct ${id} prerequisite.`, `Run ac doctor --backend ${id.startsWith('local.') ? 'local' : 'codespaces'} again.`] }; }
+function ready(id: string, summary: string): DoctorCheck { return { id, backend: id.startsWith('local.') ? 'local' : 'codespaces', phase: 'pre-provision', status: 'pass', state: 'ready', summary, remediation: [] }; }
+function unknown(id: string, summary: string, phase: 'pre-provision' | 'provisioned-runtime' = 'pre-provision'): DoctorCheck { return { id, backend: id.startsWith('local.') ? 'local' : 'codespaces', phase, status: 'unknown', state: 'action-required', summary, remediation: ['Complete a real workspace startup to verify this observation.', `Run ac doctor --backend ${id.startsWith('local.') ? 'local' : 'codespaces'} again.`] }; }
+function action(id: string, summary: string, phase: 'pre-provision' | 'provisioned-runtime' = 'pre-provision'): DoctorCheck { return { id, backend: id.startsWith('local.') ? 'local' : 'codespaces', phase, status: 'fail', state: 'action-required', summary, remediation: [`Correct ${id} prerequisite.`, `Run ac doctor --backend ${id.startsWith('local.') ? 'local' : 'codespaces'} again.`] }; }
 function overall(checks: readonly DoctorCheck[]): SetupState { return checks.some((check) => check.state === 'unsupported') ? 'unsupported' : checks.some((check) => check.state === 'action-required') ? 'action-required' : 'ready'; }

@@ -312,14 +312,14 @@ export function readinessGateDoctorChecks(metadata: CodespacesWorkspaceMetadata,
   ];
   return mapping.map(([gateId, checkId]) => {
     const gate = report.gates.find((entry) => entry.id === gateId);
-    if (!gate) return { id: checkId, backend: 'codespaces', phase: 'provisioned-runtime', state: 'action-required', summary: `${gateId} was not independently reached by the bounded readiness probes.`, remediation: [`Run ac doctor --backend codespaces --workspace ${metadata.name}.`] };
-    if (gate.state === 'skipped') return { id: checkId, backend: 'codespaces', phase: 'provisioned-runtime', state: 'action-required', summary: `${gate.id}: no post-create proof reached runtime readiness, so runtime readiness is not claimed.`, remediation: [`Run a configured post-create readiness argv (for example: ac exec ${metadata.name} -- <argv>) to prove runtime readiness, or accept ready-without-setup-proof.`, `Run ac doctor --backend codespaces --workspace ${metadata.name} again.`] };
-    if (gate.state === 'passed') return { id: checkId, backend: 'codespaces', phase: 'provisioned-runtime', state: 'ready', summary: `${gate.id}: ${gate.detail}`, remediation: [] };
+    if (!gate) return { id: checkId, backend: 'codespaces', phase: 'provisioned-runtime', status: 'fail', state: 'action-required', summary: `${gateId} was not independently reached by the bounded readiness probes.`, remediation: [`Run ac doctor --backend codespaces --workspace ${metadata.name}.`] };
+    if (gate.state === 'skipped') return { id: checkId, backend: 'codespaces', phase: 'provisioned-runtime', status: 'unknown', state: 'action-required', summary: `${gate.id}: no post-create proof reached runtime readiness, so runtime readiness is not claimed.`, remediation: [`Run a configured post-create readiness argv (for example: ac exec ${metadata.name} -- <argv>) to prove runtime readiness, or accept ready-without-setup-proof.`, `Run ac doctor --backend codespaces --workspace ${metadata.name} again.`] };
+    if (gate.state === 'passed') return { id: checkId, backend: 'codespaces', phase: 'provisioned-runtime', status: 'pass', state: 'ready', summary: `${gate.id}: ${gate.detail}`, remediation: [] };
     const unsupported = gateId === 'ssh-ready' && /SSHD appears absent|unreachable/.test(gate.detail);
     const state = unsupported ? 'unsupported' : 'action-required';
     const remediation = unsupported
       ? ['Add a reachable SSH server to the committed Dev Container image.', `Run ac doctor --backend codespaces --workspace ${metadata.name} again.`]
       : [gate.detail, `Run ac doctor --backend codespaces --workspace ${metadata.name} again.`];
-    return { id: checkId, backend: 'codespaces', phase: 'provisioned-runtime', state, summary: `${gate.id}: ${gate.detail}`, remediation };
+    return { id: checkId, backend: 'codespaces', phase: 'provisioned-runtime', status: 'fail', state, summary: `${gate.id}: ${gate.detail}`, remediation };
   });
 }
