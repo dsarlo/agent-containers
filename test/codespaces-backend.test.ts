@@ -114,12 +114,16 @@ test('Codespaces execution backend stays phase-gated without the experimental en
   }
 });
 
-test('doctor runs the same bounded provisioned-runtime probes only for exactly recorded workspaces', async () => {
+test('doctor reports recorded Codespaces runtime checks as unknown without SSH or metadata writes', async () => {
   const stateDir = join(await mkdtemp(join(tmpdir(), 'agent-containers-backend-')), 'state');
   await saveMetadata(stateDir, recordedWorkspace(), { expectedGeneration: null });
   await recordIssue9Intent(stateDir);
   const before = await loadMetadata(stateDir, 'issue-9');
-  const report = await doctor(configFixture(), 'codespaces', readinessRunner(), '/repo', { stateDir, workspaceName: 'issue-9' });
+  const calls: string[] = [];
+  const readiness = readinessRunner();
+  const runner: ProcessRunner = { run: async (command, args, options) => { calls.push([command, ...args].join(' ')); return readiness.run(command, args, options); } };
+  const report = await doctor(configFixture(), 'codespaces', runner, '/repo', { stateDir, workspaceName: 'issue-9' });
+  assert.ok(calls.every((call) => !call.startsWith('gh codespace ssh ')), 'doctor must not invoke SSH because gh may create a local key');
   assert.deepEqual(await loadMetadata(stateDir, 'issue-9'), before, 'doctor must not persist a readiness observation');
   const ids = report.checks.filter((check) => check.id.startsWith('codespaces.runtime.')).map((check) => check.id);
   assert.deepEqual(ids, [
@@ -131,6 +135,7 @@ test('doctor runs the same bounded provisioned-runtime probes only for exactly r
     'codespaces.runtime.readiness-command',
     'codespaces.runtime.helper',
   ]);
+  assert.ok(report.checks.filter((check) => check.id.startsWith('codespaces.runtime.')).every((check) => check.status === 'unknown'));
   const provisioned = report.checks.filter((check) => check.id === 'codespaces.workspace.metadata' || check.id.startsWith('codespaces.runtime.'));
   assert.ok(provisioned.every((check) => check.phase === 'provisioned-runtime' && ['ready', 'action-required', 'unsupported'].includes(check.state)));
   const gateway = report.checks.find((check) => check.id === 'codespaces.workspace.metadata');
