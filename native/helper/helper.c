@@ -530,10 +530,6 @@ static void command_run_dir(struct ac_run *run) {
   mkdir_p(run->log_dir);
 }
 
-/* Persist execution identity plus a bounded argv record. Credential-shaped argv
- * is retained only as a stable redacted hash; the raw values are never
- * displayed, stored, or logged (the transport rejects credential argv at the
- * API boundary as an additional hardening layer). */
 static void write_command_json(struct ac_run *run) {
   char path[AC_FPATH];
   snprintf(path, sizeof(path), "%s/command.json", run->log_dir);
@@ -585,10 +581,6 @@ static void write_status_json(struct ac_run *run, const char *state, int exit_co
   atomic_write_file(path, buf);
 }
 
-/* Retain command output in bounded ring logs. Environment credentials cannot
- * reach the child (controlled_environment clears inherited secrets unless the
- * owner whitelists them), and recognized remote secret values are redacted
- * before retention, so durable records never expose credential material. */
 static void open_command_logs(struct ac_run *run) {
   char path[AC_FPATH];
   snprintf(path, sizeof(path), "%s/stdout.log", run->log_dir);
