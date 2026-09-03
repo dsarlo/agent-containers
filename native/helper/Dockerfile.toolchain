@@ -2,7 +2,9 @@
 # The digest and package versions reproduce the committed Bookworm GCC 12.2 pins.
 FROM debian@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171
 
-RUN apt-get update \
+RUN rm -f /etc/apt/sources.list.d/debian.sources \
+ && printf '%s\n' 'deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/20260824T000000Z bookworm main' > /etc/apt/sources.list \
+ && apt-get -o Acquire::Check-Valid-Until=false update \
  && apt-get install -y --no-install-recommends \
       binutils=2.40-2 \
       coreutils=9.1-1 \

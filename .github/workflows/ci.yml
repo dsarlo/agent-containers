@@ -189,6 +189,9 @@ jobs:
           node-version: 20.19.0
           cache: npm
       - run: npm ci
+      - name: Verify committed static Linux helper pins before any rebuild
+        run: npm run verify:native-helper-packaging-contract
+      - run: npm run test:native-helper-packaging-contract
       - name: Build the pinned helper toolchain
         run: docker build --pull=false --tag agent-containers-helper-toolchain:ci --file native/helper/Dockerfile.toolchain .
       - name: Rebuild static Linux helpers in the pinned toolchain and compare committed pins

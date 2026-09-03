@@ -116,6 +116,7 @@ assert.match(buildHelper, /AGENT_CONTAINERS_HELPER_REBUILD_DIR/, 'the comparison
 // Toolchain provenance is part of the artifact pin: Bookworm base digest and
 // exact compiler/header packages produce the committed helper ELF bytes.
 assert.match(toolchainDockerfile, /^FROM debian@sha256:[0-9a-f]{64}$/m, 'helper toolchain must pin the Debian base image by digest');
+assert.match(toolchainDockerfile, /snapshot\.debian\.org\/archive\/debian\/[0-9]{8}T[0-9]{6}Z/, 'helper toolchain must use an immutable Debian package snapshot');
 for (const packagePin of ['gcc=4:12.2.0-3', 'gcc-aarch64-linux-gnu=4:12.2.0-3', 'libc6-dev=2.36-9+deb12u14', 'libc6-dev-arm64-cross=2.36-8cross1', 'make=4.3-4.1']) {
   assert.ok(toolchainDockerfile.includes(packagePin), `helper toolchain must pin ${packagePin}`);
 }
@@ -124,13 +125,15 @@ for (const packagePin of ['gcc=4:12.2.0-3', 'gcc-aarch64-linux-gnu=4:12.2.0-3', 
 // immutable toolchain and compare a clean outside-tree rebuild. It must never
 // repin the reviewed artifacts or use the runner's arbitrary compiler.
 assert.doesNotMatch(workflow, /npm run build:helper/, 'ci must not repin committed helper artifacts before validation');
-const committedPinCheck = workflow.indexOf('npm run verify:native-helper-packaging-contract');
-const toolchainBuild = workflow.indexOf('docker build --pull=false');
-const reproducibleCheck = workflow.indexOf('AGENT_CONTAINERS_HELPER_REBUILD_DIR=.helper-rebuild npm run verify:helper-reproducible');
-assert.ok(committedPinCheck >= 0 && toolchainBuild > committedPinCheck && reproducibleCheck > toolchainBuild, 'ci must verify committed helper pins before rebuilding under the pinned toolchain');
-assert.match(workflow, /Dockerfile\.toolchain/, 'ci must build the repository-owned pinned helper toolchain');
-assert.match(workflow, /docker create -v "\$GITHUB_WORKSPACE:\/workspace:ro"/, 'ci must compile helper sources from a read-only checkout');
-assert.match(workflow, /test:native-helper-packaging-contract/, 'ci quality must run the helper packaging negative test');
+const helperJob = workflow.match(/^ {2}helper-artifacts:\n([\s\S]*?)(?=^ {2}[a-z][a-z-]*:\n|(?![\s\S]))/m)?.[1];
+assert.ok(helperJob, 'ci must define the helper-artifacts job');
+const committedPinCheck = helperJob.indexOf('npm run verify:native-helper-packaging-contract');
+const toolchainBuild = helperJob.indexOf('docker build --pull=false');
+const reproducibleCheck = helperJob.indexOf('AGENT_CONTAINERS_HELPER_REBUILD_DIR=.helper-rebuild npm run verify:helper-reproducible');
+assert.ok(committedPinCheck >= 0 && toolchainBuild > committedPinCheck && reproducibleCheck > toolchainBuild, 'the helper-artifacts job must verify committed helper pins before rebuilding under the pinned toolchain');
+assert.match(helperJob, /Dockerfile\.toolchain/, 'helper-artifacts must build the repository-owned pinned helper toolchain');
+assert.match(helperJob, /docker create -v "\$GITHUB_WORKSPACE:\/workspace:ro"/, 'helper-artifacts must compile helper sources from a read-only checkout');
+assert.match(helperJob, /test:native-helper-packaging-contract/, 'helper-artifacts must run the helper packaging negative test');
 assert.match(workflow, /actions\/upload-artifact@[0-9a-f]{40}/, 'ci must upload the pinned helper artifacts with an immutable action SHA');
 
 process.stdout.write('Native helper packaging contract passed.\n');

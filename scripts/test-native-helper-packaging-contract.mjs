@@ -69,6 +69,15 @@ async function rewriteManifest(root, mutate) {
 
 try {
   {
+    const workflow = await readFile(join(repository, '.github', 'workflows', 'ci.yml'), 'utf8');
+    const helperJob = workflow.match(/^ {2}helper-artifacts:\n([\s\S]*?)(?=^ {2}[a-z][a-z-]*:\n|(?![\s\S]))/m)?.[1] ?? '';
+    const pinCheck = helperJob.indexOf('npm run verify:native-helper-packaging-contract');
+    const toolchainBuild = helperJob.indexOf('docker build --pull=false');
+    assert.ok(pinCheck >= 0 && pinCheck < toolchainBuild, 'the helper-artifacts job must validate committed pins before building its toolchain');
+    const dockerfile = await readFile(join(repository, 'native', 'helper', 'Dockerfile.toolchain'), 'utf8');
+    assert.match(dockerfile, /snapshot\.debian\.org\/archive\/debian\/[0-9]{8}T[0-9]{6}Z/, 'the helper toolchain must use an immutable Debian snapshot repository');
+  }
+  {
     // Baseline: the real repository mirror must pass.
     const root = await writeFixture(async () => undefined);
     const result = verifyFixture(root);
