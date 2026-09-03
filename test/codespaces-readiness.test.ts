@@ -29,7 +29,7 @@ function configFixture(): CodespacesAgentContainersConfig {
         enabled: true, machine: 'basicLinux32gb', geo: 'auto', idleTimeoutMinutes: 30, retentionPeriodMinutes: 10080,
         maxTotal: 4, maxRunning: 2, maxCreating: 1, maxParallelCommandsPerWorkspace: 1,
         readiness: { providerTimeoutSeconds: 5, sshTimeoutSeconds: 5, command: [], commandTimeoutSeconds: 5 },
-        transport: { reconnectWindowSeconds: 60, cancelGraceSeconds: 10, remoteLogBytesPerStream: 1, remoteLogRetentionHours: 1 },
+        transport: { reconnectWindowSeconds: 60, cancelGraceSeconds: 10 },
         ports: { allowVisibilityChanges: false, allowPublic: false },
         secrets: { allowedRemoteSecretNames: [], allowCodespaceGitCredential: false },
       },

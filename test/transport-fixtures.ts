@@ -70,7 +70,7 @@ export function transportConfigFixture(): CodespacesAgentContainersConfig {
         enabled: true, machine: 'basicLinux32gb', geo: 'auto', idleTimeoutMinutes: 30, retentionPeriodMinutes: 10080,
         maxTotal: 4, maxRunning: 2, maxCreating: 1, maxParallelCommandsPerWorkspace: 1,
         readiness: { providerTimeoutSeconds: 2, sshTimeoutSeconds: 2, command: [], commandTimeoutSeconds: 2 },
-        transport: { reconnectWindowSeconds: 1, cancelGraceSeconds: 1, remoteLogBytesPerStream: 1024 * 1024, remoteLogRetentionHours: 24 },
+        transport: { reconnectWindowSeconds: 1, cancelGraceSeconds: 1 },
         ports: { allowVisibilityChanges: false, allowPublic: false },
         secrets: { allowedRemoteSecretNames: [], allowCodespaceGitCredential: false },
       },

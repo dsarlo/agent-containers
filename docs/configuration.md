@@ -58,12 +58,12 @@ backends:
     maxCreating: 1
     maxParallelCommandsPerWorkspace: 1
     readiness: { providerTimeoutSeconds: 1200, sshTimeoutSeconds: 120, command: [], commandTimeoutSeconds: 600 }
-    transport: { reconnectWindowSeconds: 60, cancelGraceSeconds: 10, remoteLogBytesPerStream: 67108864, remoteLogRetentionHours: 168 }
+    transport: { reconnectWindowSeconds: 60, cancelGraceSeconds: 10 }
     ports: { allowVisibilityChanges: false, allowPublic: false }
     secrets: { allowedRemoteSecretNames: [], allowCodespaceGitCredential: false }
 ```
 
-For Codespaces commands, output is streamed only to the connected caller and is never written to durable helper logs. After a transport interruption, `attach` can recover command status or cancel it, but does not replay prior output. The retained `remoteLogBytesPerStream` and `remoteLogRetentionHours` schema fields are accepted for configuration compatibility and do not enable output retention.
+For Codespaces commands, output is streamed only to the connected caller and is never written to durable helper logs. After a transport interruption, `attach` can recover command status or cancel it, but does not replay prior output.
 
 `ac doctor --backend local|codespaces|all [--json]` is noninteractive and read-only. Its JSON has the documented stable `schemaVersion: 1` contract: each check has an `id`, `backend`, `phase`, `status` (`pass`, `fail`, or `unknown`), legacy lifecycle `state`, human `summary`, and concrete `remediation`. `unknown` means the observation cannot be proved safely (for example, host-to-container path sharing without starting a container), not a pass. Local checks verify the package Node engine, resolve the configured local base branch to an immutable commit, and inspect the Dev Container file from that immutable tree, never a mutable checkout. Local-only configurations do not require the Codespaces gate; a selected Codespaces diagnostic requires `AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES=1`. Its Codespaces provider calls are pinned-version, machine-readable `gh api` GET requests only. Machine availability uses GitHub's documented repository machine inventory endpoint. Owner/billing, port, secret, and runtime facts are action-required when no documented read-only endpoint proves them. It never retrieves a token, alters authentication, creates an SSH key, changes a resource/configuration/secret/port, or starts a Codespace.
 

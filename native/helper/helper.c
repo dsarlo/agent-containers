@@ -9,12 +9,11 @@
  * Design rules (spec section 9):
  *  - No shell string is ever executed. User argv travels inside length-prefixed
  *    frames on stdin and is passed to fork()+execvp() directly.
- *  - stdout/stderr (pipe mode) or the merged PTY terminal (pty mode) are logged
- *    durably under /workspaces/.agent-containers/<workspace_id>/commands/<id>/
- *    (spec 9.3 / N5) with byte offsets before offsets are acknowledged. Attach
- *    re-emits retained logs from the requested stream offsets (B2).
+ *  - stdout/stderr (pipe mode) or the merged PTY terminal (pty mode) stream
+ *    only to the connected caller. Child output is never written under
+ *    /workspaces/.agent-containers and attach never replays it (SEC-1).
  *  - The owning serve process survives transport loss: on EOF it switches to a
- *    durable orphan pump that drains the child streams into the log files,
+ *    durable orphan pump that drains child streams without retaining output,
  *    reaps the child and records the final status. Transport loss and stdin
  *    half-close never SIGKILL the process group (B4).
  *  - Cancel proof requires the recorded owning process group; CANCEL_VERIFIED
@@ -28,8 +27,8 @@
  *    writes so a child that reads stdin slowly while emitting stdout cannot
  *    deadlock (B6).
  *  - The hello handshake reports a compile-time architecture (N1).
- *  - Credential-shaped argv is retained only as a stable redacted hash in the
- *    durable command record; raw values are never displayed, stored, or logged.
+ *  - No token, secret value, or credential-shaped data is ever accepted,
+ *    displayed, stored, or logged.
  */
 #define _GNU_SOURCE 1
 #define _POSIX_C_SOURCE 200809L
@@ -51,7 +50,6 @@
 #include <sys/wait.h>
 #include <termios.h>
 #include <time.h>
-#include <dirent.h>
 #include <unistd.h>
 
 /* === Wire protocol constants (mirror src/codespaces-protocol.ts) === */
@@ -213,10 +211,10 @@ static void free_frame(struct ac_frame *frame) {
 
 /* === Durable command tree (spec section 9.3 / N5) ===
  * <data_root>/<workspace_id>/commands/<command_id>/
- *   command.json  identity (argv, mode, pid, pgid)
- *   status.json   { state, exit_code, stdout_offset, stderr_offset, terminal_offset }
+ *   command.json  identity and lifecycle ownership (never argv or request hash)
+ *   status.json   { state, exit_code, timestamps }
  *   helper.json   { protocol, arch, version }
- *   stdout.log / stderr.log (pipe) or terminal.log (pty) retained appends. */
+ * Child output is never written into this tree. */
 static const char *helper_data_root(void) {
   const char *env = getenv("AC_HELPER_DATA_DIR");
   return (env != NULL && env[0] != '\0') ? env : "/workspaces/.agent-containers";
@@ -441,13 +439,8 @@ struct ac_run {
   uint64_t stdout_offset;
   uint64_t stderr_offset;
   uint64_t terminal_offset;
-  FILE *stdout_log;
-  FILE *stderr_log;
-  FILE *terminal_log;
   int live;
-  int framed; /* false once the transport is lost and we only log durably */
-  uint64_t retention_bytes;
-  int retention_hours;
+  int framed; /* false once the transport is lost and no frames are emitted */
   char *secret_names[32];
   char *secret_values[32];
   int secret_count;
@@ -517,13 +510,6 @@ static void controlled_environment(struct ac_run *run) {
   }
 }
 
-static int is_remote_secret_value(const struct ac_run *run, const char *value) {
-  for (int i = 0; i < run->secret_count; i++) {
-    if (run->secret_values[i] != NULL && strcmp(value, run->secret_values[i]) == 0) return 1;
-  }
-  return 0;
-}
-
 /* Derive the command directory from the validated identity fields. */
 static void command_run_dir(struct ac_run *run) {
   command_dir_path(run->workspace_id, run->command_id, run->log_dir, sizeof(run->log_dir));
@@ -534,34 +520,13 @@ static void write_command_json(struct ac_run *run) {
   char path[AC_FPATH];
   snprintf(path, sizeof(path), "%s/command.json", run->log_dir);
   char buf[AC_MAX_CMDLINE];
-  size_t off = 0;
   char escaped[1024];
   json_string_escape(run->command_id, escaped, sizeof(escaped));
-  off += (size_t)snprintf(buf + off, sizeof(buf) - off, "{\"command_id\":\"%s\",\"request_hash\":\"%s\",\"workspace_id\":\"%s\",\"pid\":%ld,\"pgid\":%d,\"mode\":\"%s\",\"cwd\":\"",
-                          escaped, run->request_hash, run->workspace_id, (long)run->pid, run->pgid, run->mode[0] != '\0' ? run->mode : "pipe");
+  snprintf(buf, sizeof(buf), "{\"command_id\":\"%s\",\"workspace_id\":\"%s\",\"pid\":%ld,\"pgid\":%d,\"mode\":\"%s\",\"cwd\":\"",
+           escaped, run->workspace_id, (long)run->pid, run->pgid, run->mode[0] != '\0' ? run->mode : "pipe");
   json_string_escape(run->workdir, escaped, sizeof(escaped));
-  off += (size_t)snprintf(buf + off, sizeof(buf) - off, "%s\",\"argv\":[", escaped);
-  for (int i = 0; i < run->argc && off + 1024 < sizeof(buf); i++) {
-    const char *recorded = run->argv[i];
-    char redacted[64];
-    if (strstr(recorded, "ghp_") != NULL || strstr(recorded, "github_pat_") != NULL
-        || strstr(recorded, "Bearer ") != NULL || strstr(recorded, "token=") != NULL
-        || strstr(recorded, "TOKEN=") != NULL || strstr(recorded, "password=") != NULL
-        || is_remote_secret_value(run, recorded)) {
-      /* FNV-1a provides a stable opaque correlation value without retaining
-       * credential-shaped argv in the recoverable remote record. */
-      uint64_t hash = UINT64_C(1469598103934665603);
-      for (const unsigned char *p = (const unsigned char *)recorded; *p != '\0'; p++) {
-        hash ^= (uint64_t)*p;
-        hash *= UINT64_C(1099511628211);
-      }
-      snprintf(redacted, sizeof(redacted), "redacted-fnv1a64-%016" PRIx64, hash);
-      recorded = redacted;
-    }
-    json_string_escape(recorded, escaped, sizeof(escaped));
-    off += (size_t)snprintf(buf + off, sizeof(buf) - off, "%s\"%s\"", i == 0 ? "" : ",", escaped);
-  }
-  off += (size_t)snprintf(buf + off, sizeof(buf) - off, "]}");
+  size_t used = strlen(buf);
+  snprintf(buf + used, sizeof(buf) - used, "%s\",\"argv_count\":%d}", escaped, run->argc);
   atomic_write_file(path, buf);
 }
 
@@ -571,24 +536,17 @@ static void write_status_json(struct ac_run *run, const char *state, int exit_co
   char buf[1024];
   if (exit_code < 0) {
     snprintf(buf, sizeof(buf),
-             "{\"command_id\":\"%s\",\"state\":\"%s\",\"exit_code\":null,\"stdout_offset\":%" PRIu64 ",\"stderr_offset\":%" PRIu64 ",\"terminal_offset\":%" PRIu64 ",\"started_at\":\"%ld\",\"exited_at\":null}\n",
-             run->command_id, state, run->stdout_offset, run->stderr_offset, run->terminal_offset, (long)time(NULL));
+              "{\"command_id\":\"%s\",\"state\":\"%s\",\"exit_code\":null,\"started_at\":\"%ld\",\"exited_at\":null}\n",
+              run->command_id, state, (long)time(NULL));
   } else {
     snprintf(buf, sizeof(buf),
-             "{\"command_id\":\"%s\",\"state\":\"%s\",\"exit_code\":%d,\"stdout_offset\":%" PRIu64 ",\"stderr_offset\":%" PRIu64 ",\"terminal_offset\":%" PRIu64 ",\"started_at\":\"%ld\",\"exited_at\":\"%ld\"}\n",
-             run->command_id, state, exit_code, run->stdout_offset, run->stderr_offset, run->terminal_offset, (long)time(NULL), (long)time(NULL));
+              "{\"command_id\":\"%s\",\"state\":\"%s\",\"exit_code\":%d,\"started_at\":\"%ld\",\"exited_at\":\"%ld\"}\n",
+              run->command_id, state, exit_code, (long)time(NULL), (long)time(NULL));
   }
   atomic_write_file(path, buf);
 }
 
 static void open_command_logs(struct ac_run *run) {
-  char path[AC_FPATH];
-  snprintf(path, sizeof(path), "%s/stdout.log", run->log_dir);
-  run->stdout_log = fopen(path, "ab");
-  snprintf(path, sizeof(path), "%s/stderr.log", run->log_dir);
-  run->stderr_log = fopen(path, "ab");
-  snprintf(path, sizeof(path), "%s/terminal.log", run->log_dir);
-  run->terminal_log = fopen(path, "ab");
   char helper_path[AC_FPATH];
   snprintf(helper_path, sizeof(helper_path), "%s/helper.json", run->log_dir);
   char hj[512];
@@ -597,69 +555,11 @@ static void open_command_logs(struct ac_run *run) {
 }
 
 static void close_command_logs(struct ac_run *run) {
-  if (run->stdout_log != NULL) { fclose(run->stdout_log); run->stdout_log = NULL; }
-  if (run->stderr_log != NULL) { fclose(run->stderr_log); run->stderr_log = NULL; }
-  if (run->terminal_log != NULL) { fclose(run->terminal_log); run->terminal_log = NULL; }
+  (void)run;
 }
 
-/* Retention is enforced by the remote owner, never merely trusted from the
- * client. Expired command trees are removed before accepting a new EXEC. */
-static void remove_tree(const char *path) {
-  DIR *dir = opendir(path);
-  if (dir == NULL) { (void)unlink(path); return; }
-  struct dirent *entry;
-  while ((entry = readdir(dir)) != NULL) {
-    if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
-    char child[AC_JPATH + 256];
-    snprintf(child, sizeof(child), "%s/%s", path, entry->d_name);
-    struct stat st;
-    if (lstat(child, &st) != 0) continue;
-    if (S_ISDIR(st.st_mode)) remove_tree(child); else (void)unlink(child);
-  }
-  closedir(dir);
-  (void)rmdir(path);
-}
-
-static void purge_expired_commands(const char *workspace_id, int retention_hours) {
-  if (retention_hours <= 0) return;
-  char commands[AC_JPATH];
-  snprintf(commands, sizeof(commands), "%s/%s/commands", helper_data_root(), workspace_id);
-  DIR *dir = opendir(commands);
-  if (dir == NULL) return;
-  time_t now = time(NULL);
-  struct dirent *entry;
-  while ((entry = readdir(dir)) != NULL) {
-    if (entry->d_name[0] == '.') continue;
-    char child[AC_JPATH + 256];
-    struct stat st;
-    snprintf(child, sizeof(child), "%s/%s", commands, entry->d_name);
-    if (lstat(child, &st) == 0 && S_ISDIR(st.st_mode) && now >= st.st_mtime
-        && now - st.st_mtime >= (time_t)retention_hours * 3600) remove_tree(child);
-  }
-  closedir(dir);
-}
-
-static void append_stream_log(FILE *log, uint64_t *offset, const unsigned char *bytes, size_t len, uint64_t retention_bytes) {
-  if (log == NULL) return;
-  size_t logical_len = len;
-  if (retention_bytes > 0) {
-    long current = ftell(log);
-    /* A single read can exceed the limit. Retain its final bytes rather than
-     * writing an over-limit record or making rotation input-size dependent. */
-    if ((uint64_t)len >= retention_bytes) {
-      int fd = fileno(log);
-      if (fd < 0 || fflush(log) != 0 || ftruncate(fd, 0) != 0 || fseek(log, 0, SEEK_SET) != 0) return;
-      bytes += len - (size_t)retention_bytes;
-      len = (size_t)retention_bytes;
-    } else if (current < 0 || (uint64_t)current + (uint64_t)len > retention_bytes) {
-      int fd = fileno(log);
-      if (fd < 0 || fflush(log) != 0 || ftruncate(fd, 0) != 0 || fseek(log, 0, SEEK_SET) != 0) return;
-    }
-  }
-  if (fwrite(bytes, 1, len, log) == len) {
-    fflush(log);
-    *offset += (uint64_t)logical_len;
-  }
+static void advance_output_offset(uint64_t *offset, size_t len) {
+  *offset += (uint64_t)len;
 }
 
 /* Emit output event frames carrying the durable offset for the given stream. */
@@ -722,7 +622,7 @@ static void stdin_q_flush(int fd, struct ac_stdin_q *q) {
   }
 }
 
-/* Poll-based drain of child output streams into durable logs + frames.
+/* Poll-based drain of child output streams into connected frames.
  * Reads at most one full buffer per fd per call so a chatty stream can never
  * starve concurrent stdin frames (B6). */
 static void pump_once(struct ac_run *run) {
@@ -744,16 +644,13 @@ static void pump_once(struct ac_run *run) {
     if (n > 0) {
       redact_output(run, buf, (size_t)n);
       if (fd == run->stdout_fd) {
-        append_stream_log(run->stdout_log, &run->stdout_offset, buf, (size_t)n, run->retention_bytes);
-        write_status_json(run, "running", -1);
+        advance_output_offset(&run->stdout_offset, (size_t)n);
         if (run->framed) emit_output(AC_OUTPUT_STDOUT, run->stdout_offset - (uint64_t)n, buf, (size_t)n);
       } else if (fd == run->stderr_fd) {
-        append_stream_log(run->stderr_log, &run->stderr_offset, buf, (size_t)n, run->retention_bytes);
-        write_status_json(run, "running", -1);
+        advance_output_offset(&run->stderr_offset, (size_t)n);
         if (run->framed) emit_output(AC_OUTPUT_STDERR, run->stderr_offset - (uint64_t)n, buf, (size_t)n);
       } else {
-        append_stream_log(run->terminal_log, &run->terminal_offset, buf, (size_t)n, run->retention_bytes);
-        write_status_json(run, "running", -1);
+        advance_output_offset(&run->terminal_offset, (size_t)n);
         if (run->framed) emit_output(AC_OUTPUT_TERMINAL, run->terminal_offset - (uint64_t)n, buf, (size_t)n);
       }
       continue;
@@ -1007,31 +904,6 @@ static int load_status_json(const char *workspace_id, const char *command_id, ch
   return 1;
 }
 
-static int load_status_offsets(const char *workspace_id, const char *command_id, uint64_t *stdout_offset, uint64_t *stderr_offset, uint64_t *terminal_offset) {
-  char dir[AC_JPATH];
-  command_dir_path(workspace_id, command_id, dir, sizeof(dir));
-  char path[AC_FPATH];
-  snprintf(path, sizeof(path), "%s/status.json", dir);
-  FILE *f = fopen(path, "r");
-  if (f == NULL) return 0;
-  char buf[2048];
-  size_t n = fread(buf, 1, sizeof(buf) - 1, f);
-  fclose(f);
-  buf[n] = '\0';
-  char value[32];
-  uint64_t *offsets[] = { stdout_offset, stderr_offset, terminal_offset };
-  const char *keys[] = { "stdout_offset", "stderr_offset", "terminal_offset" };
-  for (size_t i = 0; i < 3; i++) {
-    if (json_value(buf, keys[i], value, sizeof(value)) == NULL) return 0;
-    char *end = NULL;
-    errno = 0;
-    uint64_t parsed = (uint64_t)strtoull(value, &end, 10);
-    if (errno != 0 || end == value || *end != '\0') return 0;
-    *offsets[i] = parsed;
-  }
-  return 1;
-}
-
 /* Cross-session (fresh connection) cancel: the fresh run has no owning pgid,
  * so the recorded pgid is used and proof is reported only after the owning
  * server observed the completion in status.json within the bounded grace (B3). */
@@ -1187,9 +1059,9 @@ static int drive_exec(struct ac_run *run, int grace_ms) {
   return 0;
 }
 
-/* Durable orphan pump after transport loss: no frames are emitted, the child
- * streams keep draining into the durable logs, the child is reaped and the
- * final status recorded. This is the ONLY post-loss owner (B4). */
+/* Durable orphan pump after transport loss: no frames are emitted; child
+ * streams keep draining without retention, the child is reaped and the final
+ * status recorded. This is the ONLY post-loss owner (B4). */
 static void orphan_pump(struct ac_run *run) {
   run->framed = 0;
   while (run->live) {
@@ -1209,100 +1081,33 @@ static void orphan_pump(struct ac_run *run) {
   if (run->stdin_fd >= 0) { close(run->stdin_fd); run->stdin_fd = -1; }
 }
 
-/* Open a retained log at a logical stream offset. The retained file's base is
- * derived from the durable stream end, so evicted bytes remain detectable. */
-static int open_retained_log_at(const char *dir, const char *name, uint64_t from, uint64_t logical_end, uint64_t *end) {
-  char path[AC_FPATH];
-  snprintf(path, sizeof(path), "%s/%s", dir, name);
-  int fd = open(path, O_RDONLY);
-  if (fd < 0) return -1;
-  struct stat st;
-  if (fstat(fd, &st) != 0) { close(fd); return -1; }
-  uint64_t size = (uint64_t)st.st_size;
-  if (logical_end < size) { close(fd); return -1; }
-  uint64_t base = logical_end - size;
-  if (from < base || from > logical_end) { close(fd); return -1; }
-  *end = logical_end;
-  if (lseek(fd, (off_t)(from - base), SEEK_SET) < 0) { close(fd); return -1; }
-  return fd;
-}
-
-/* Emit every retained byte from the current position of an open log fd. */
-static void emit_log_remaining(uint8_t stream, uint64_t from, uint64_t end, int fd) {
-  unsigned char buf[65536];
-  uint64_t offset = from;
-  while (offset < end) {
-    size_t want = (uint64_t)sizeof(buf) > end - offset ? (size_t)(end - offset) : sizeof(buf);
-    ssize_t n = read(fd, buf, want);
-    if (n <= 0) break;
-    emit_output(stream, offset, buf, (size_t)n);
-    offset += (uint64_t)n;
-  }
-}
-
 static void write_status_direct(const char *dir, const char *command_id, const char *state, int exit_code) {
   char path[AC_FPATH];
   snprintf(path, sizeof(path), "%s/status.json", dir);
-  uint64_t so = 0;
-  uint64_t se = 0;
-  uint64_t to = 0;
-  {
-    char p[AC_FPATH];
-    struct stat st;
-    snprintf(p, sizeof(p), "%s/stdout.log", dir);
-    if (stat(p, &st) == 0) so = (uint64_t)st.st_size;
-    snprintf(p, sizeof(p), "%s/stderr.log", dir);
-    if (stat(p, &st) == 0) se = (uint64_t)st.st_size;
-    snprintf(p, sizeof(p), "%s/terminal.log", dir);
-    if (stat(p, &st) == 0) to = (uint64_t)st.st_size;
-  }
   char buf[1024];
   if (exit_code < 0) {
     snprintf(buf, sizeof(buf),
-             "{\"command_id\":\"%s\",\"state\":\"%s\",\"exit_code\":null,\"stdout_offset\":%" PRIu64 ",\"stderr_offset\":%" PRIu64 ",\"terminal_offset\":%" PRIu64 ",\"started_at\":\"%ld\",\"exited_at\":null}\n",
-             command_id, state, so, se, to, (long)time(NULL));
+              "{\"command_id\":\"%s\",\"state\":\"%s\",\"exit_code\":null,\"started_at\":\"%ld\",\"exited_at\":null}\n",
+              command_id, state, (long)time(NULL));
   } else {
     snprintf(buf, sizeof(buf),
-             "{\"command_id\":\"%s\",\"state\":\"%s\",\"exit_code\":%d,\"stdout_offset\":%" PRIu64 ",\"stderr_offset\":%" PRIu64 ",\"terminal_offset\":%" PRIu64 ",\"started_at\":\"%ld\",\"exited_at\":\"%ld\"}\n",
-             command_id, state, exit_code, so, se, to, (long)time(NULL), (long)time(NULL));
+              "{\"command_id\":\"%s\",\"state\":\"%s\",\"exit_code\":%d,\"started_at\":\"%ld\",\"exited_at\":\"%ld\"}\n",
+              command_id, state, exit_code, (long)time(NULL), (long)time(NULL));
   }
   atomic_write_file(path, buf);
 }
 
-/* AC_R_ATTACH: re-emit retained logs from the requested stream offsets, then
- * live-tail the durable logs appended by the owning serve process until the
- * recorded status flips to exited (then the exact exit status is delivered) or
- * the client cancels (B2/N5). Unknown or unrecorded commands are rejected. */
+/* AC_R_ATTACH recovers only durable status and cancellation. It deliberately
+ * never reads or emits child output after a connection has been lost. */
 static void handle_attach(struct ac_frame *frame, int grace_ms) {
   char workspace_id[128];
   char command_id[129];
-  uint64_t stdout_from = 0;
-  uint64_t stderr_from = 0;
-  uint64_t terminal_from = 0;
   if (json_value((const char *)frame->payload, "command_id", command_id, sizeof(command_id)) == NULL) {
     emit_jsonf(AC_E_REJECTED, "{\"command_id\":null,\"reason\":\"missing-command-id\"}");
     return;
   }
   if (json_value((const char *)frame->payload, "workspace_id", workspace_id, sizeof(workspace_id)) == NULL) {
     workspace_id[0] = '\0';
-  }
-  {
-    char s[64];
-    if (json_value((const char *)frame->payload, "stdout_offset", s, sizeof(s)) != NULL) {
-      char *end = NULL;
-      uint64_t v = (uint64_t)strtoull(s, &end, 10);
-      if (end != s) stdout_from = v;
-    }
-    if (json_value((const char *)frame->payload, "stderr_offset", s, sizeof(s)) != NULL) {
-      char *end = NULL;
-      uint64_t v = (uint64_t)strtoull(s, &end, 10);
-      if (end != s) stderr_from = v;
-    }
-    if (json_value((const char *)frame->payload, "terminal_offset", s, sizeof(s)) != NULL) {
-      char *end = NULL;
-      uint64_t v = (uint64_t)strtoull(s, &end, 10);
-      if (end != s) terminal_from = v;
-    }
   }
   char dir[AC_JPATH];
   command_dir_path(workspace_id, command_id, dir, sizeof(dir));
@@ -1326,74 +1131,16 @@ static void handle_attach(struct ac_frame *frame, int grace_ms) {
     emit_jsonf(AC_E_REJECTED, "{\"command_id\":\"%s\",\"reason\":\"attach-not-recorded\"}", command_id);
     return;
   }
-  uint64_t stdout_end = 0;
-  uint64_t stderr_end = 0;
-  uint64_t terminal_end = 0;
-  if (!load_status_offsets(workspace_id, command_id, &stdout_end, &stderr_end, &terminal_end)) {
-    emit_jsonf(AC_E_REJECTED, "{\"command_id\":\"%s\",\"reason\":\"attach-offset-beyond-retention\"}", command_id);
-    return;
-  }
-  int stdout_fd = open_retained_log_at(dir, "stdout.log", stdout_from, stdout_end, &stdout_end);
-  int stderr_fd = open_retained_log_at(dir, "stderr.log", stderr_from, stderr_end, &stderr_end);
-  int terminal_fd = open_retained_log_at(dir, "terminal.log", terminal_from, terminal_end, &terminal_end);
-  if (stdout_fd < 0 || stderr_fd < 0 || terminal_fd < 0) {
-    if (stdout_fd >= 0) close(stdout_fd);
-    if (stderr_fd >= 0) close(stderr_fd);
-    if (terminal_fd >= 0) close(terminal_fd);
-    emit_jsonf(AC_E_REJECTED, "{\"command_id\":\"%s\",\"reason\":\"attach-offset-beyond-retention\"}", command_id);
-    return;
-  }
   char ec[16];
   if (exit_code < 0) snprintf(ec, sizeof(ec), "null");
   else snprintf(ec, sizeof(ec), "%d", exit_code);
-  emit_jsonf(AC_E_STATUS, "{\"command_id\":\"%s\",\"state\":\"%s\",\"exit_code\":%s,\"stdout_offset\":%" PRIu64 ",\"stderr_offset\":%" PRIu64 ",\"terminal_offset\":%" PRIu64 "}",
-             command_id, state, ec, stdout_end, stderr_end, terminal_end);
-  if (stdout_fd >= 0) { emit_log_remaining(AC_OUTPUT_STDOUT, stdout_from, stdout_end, stdout_fd); close(stdout_fd); }
-  if (stderr_fd >= 0) { emit_log_remaining(AC_OUTPUT_STDERR, stderr_from, stderr_end, stderr_fd); close(stderr_fd); }
-  if (terminal_fd >= 0) { emit_log_remaining(AC_OUTPUT_TERMINAL, terminal_from, terminal_end, terminal_fd); close(terminal_fd); }
+  emit_jsonf(AC_E_STATUS, "{\"command_id\":\"%s\",\"state\":\"%s\",\"exit_code\":%s}", command_id, state, ec);
 
   if (strcmp(state, "running") == 0 && group_alive(run.pgid)) {
-    /* Live-tail durable logs appended by the owning serve process (B2). */
     struct ac_stdin_q q;
     memset(&q, 0, sizeof(q));
     int transport_open = 1;
     for (;;) {
-      uint64_t durable_stdout_end = 0;
-      uint64_t durable_stderr_end = 0;
-      uint64_t durable_terminal_end = 0;
-      if (!load_status_offsets(workspace_id, command_id, &durable_stdout_end, &durable_stderr_end, &durable_terminal_end)) {
-        free(q.buf);
-        emit_jsonf(AC_E_ERROR, "{\"command_id\":\"%s\",\"message\":\"attach-output-lost\"}", command_id);
-        return;
-      }
-      uint64_t e = 0;
-      int fd = open_retained_log_at(dir, "stdout.log", stdout_end, durable_stdout_end, &e);
-      if (fd < 0) {
-        free(q.buf);
-        emit_jsonf(AC_E_ERROR, "{\"command_id\":\"%s\",\"message\":\"attach-output-lost\"}", command_id);
-        return;
-      }
-      emit_log_remaining(AC_OUTPUT_STDOUT, stdout_end, e, fd);
-      close(fd);
-      stdout_end = e;
-      fd = open_retained_log_at(dir, "stderr.log", stderr_end, durable_stderr_end, &e);
-      if (fd < 0) {
-        free(q.buf);
-        emit_jsonf(AC_E_ERROR, "{\"command_id\":\"%s\",\"message\":\"attach-output-lost\"}", command_id);
-        return;
-      }
-      emit_log_remaining(AC_OUTPUT_STDERR, stderr_end, e, fd);
-      close(fd);
-      stderr_end = e;
-      fd = open_retained_log_at(dir, "terminal.log", terminal_end, durable_terminal_end, &e);
-      if (fd < 0) {
-        free(q.buf);
-        emit_jsonf(AC_E_ERROR, "{\"command_id\":\"%s\",\"message\":\"attach-output-lost\"}", command_id);
-        return;
-      }
-      emit_log_remaining(AC_OUTPUT_TERMINAL, terminal_end, e, fd);
-      close(fd);
-      terminal_end = e;
       int wstatus = 0;
       if (waitpid(run.pid, &wstatus, WNOHANG) == run.pid) {
         int code = WIFEXITED(wstatus) ? WEXITSTATUS(wstatus) : (WIFSIGNALED(wstatus) ? 128 + WTERMSIG(wstatus) : 1);
@@ -1523,29 +1270,6 @@ static void serve(void) {
           long v = strtol(s, &end, 10);
           if (end != s && v > 0 && v < 3600000) grace_ms = (int)v;
         }
-        run.retention_bytes = 64u * 1024u * 1024u;
-        if (json_value((const char *)frame.payload, "retention_bytes", s, sizeof(s)) != NULL) {
-          char *end = NULL;
-          errno = 0;
-          unsigned long long v = strtoull(s, &end, 10);
-          if (errno != 0 || end == s || *end != '\0' || v == 0 || v > UINT64_MAX) {
-            emit_jsonf(AC_E_REJECTED, "{\"command_id\":\"%s\",\"reason\":\"invalid-retention-bytes\"}", run.command_id);
-            break;
-          }
-          run.retention_bytes = (uint64_t)v;
-        }
-        run.retention_hours = 168;
-        if (json_value((const char *)frame.payload, "retention_hours", s, sizeof(s)) != NULL) {
-          char *end = NULL;
-          errno = 0;
-          long v = strtol(s, &end, 10);
-          if (errno != 0 || end == s || *end != '\0' || v <= 0 || v > 8760) {
-            emit_jsonf(AC_E_REJECTED, "{\"command_id\":\"%s\",\"reason\":\"invalid-retention-hours\"}", run.command_id);
-            break;
-          }
-          run.retention_hours = (int)v;
-        }
-        purge_expired_commands(run.workspace_id, run.retention_hours);
         run.secret_count = parse_string_array((const char *)frame.payload, "secret_names", run.secret_names, 32);
         if (run.secret_count < 0) {
           emit_jsonf(AC_E_REJECTED, "{\"command_id\":\"%s\",\"reason\":\"invalid-secret-names\"}", run.command_id);

@@ -562,8 +562,6 @@ async function openExecSession(deps: RemoteTransportDependencies, helper: Remote
     rows: input.mode === 'pty' ? (input.rows ?? 24) : undefined,
     workspace_id: deps.metadata.workspaceId,
     grace_ms: deps.cancelGraceMs ?? deps.config.backends.codespaces.transport.cancelGraceSeconds * 1000,
-    retention_bytes: deps.config.backends.codespaces.transport.remoteLogBytesPerStream,
-    retention_hours: deps.config.backends.codespaces.transport.remoteLogRetentionHours,
     // Names are capabilities only. Values stay in the Codespace and are never
     // included in local state, audit records, or the framed request.
     secret_names: deps.config.backends.codespaces.secrets.allowedRemoteSecretNames,
@@ -596,6 +594,9 @@ async function acknowledgeStarted(deps: RemoteTransportDependencies, session: He
   if (first.kind === 'rejected') {
     session.close();
     return { kind: 'rejected', reason: first.reason };
+  }
+  if (reattaching && first.kind === 'status') {
+    return { kind: 'session', session };
   }
   if (first.kind !== 'started') {
     session.close();

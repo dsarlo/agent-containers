@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict';
 import test, { type TestContext } from 'node:test';
 import { createHash } from 'node:crypto';
-import { readFile, readdir, access, mkdir, utimes, writeFile } from 'node:fs/promises';
-import { readFileSync, readdirSync } from 'node:fs';
+import { readFile, readdir } from 'node:fs/promises';
+import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { COMMAND_ID, FIXTURE_ARM64, FIXTURE_X64, WORKSPACE_ID } from './transport-fixtures.js';
 import {
@@ -12,7 +12,7 @@ import {
 import { HelperFrameType } from '../src/codespaces-protocol.js';
 import { executeRemoteCommand } from '../src/codespaces-transport.js';
 import { loadCommandStatus } from '../src/codespaces-command.js';
-import { transportConfigFixture, transportFixture } from './transport-fixtures.js';
+import { transportFixture } from './transport-fixtures.js';
 import type { CommandEvent } from '../src/types.js';
 
 const BIN = realHelperBinaryPath();
@@ -93,7 +93,7 @@ test('real helper binary: the handshake subcommand matches the package format (N
   void data;
 });
 
-test('real helper never durably retains output that may contain a remote environment secret (SEC-1)', async (t: TestContext) => {
+test('real helper redacts configured named-secret output and persists no command output or argv (SEC-1)', async (t: TestContext) => {
   if (skipIfUnsupported(t)) return;
   const bin = BIN as string;
   const data = await helperDataRoot();
@@ -103,13 +103,17 @@ test('real helper never durably retains output that may contain a remote environ
     await client.autoHello();
     client.writeFrame(HelperFrameType.exec, {
       command_id: COMMAND_ID, request_hash: 'h-secret-output', workspace_id: WORKSPACE_ID,
-      argv: ['printenv', 'AC_TEST_SECRET'], mode: 'pipe', cwd: null,
+      argv: ['printenv', 'AC_TEST_SECRET'], mode: 'pipe', cwd: null, secret_names: ['AC_TEST_SECRET'],
     });
     const events = await collectUntilExit(client);
-    assert.equal(reassembleOutput(events, 'stdout').toString(), `${secret}\n`);
+    assert.equal(reassembleOutput(events, 'stdout').toString(), `${'*'.repeat(secret.length)}\n`);
     const files = await readdir(commandDir(data, WORKSPACE_ID, COMMAND_ID));
     const contents = await Promise.all(files.map((file) => readFile(join(commandDir(data, WORKSPACE_ID, COMMAND_ID), file), 'utf8')));
-    assert.ok(contents.every((content) => !content.includes(secret)), 'remote command records must never retain secret-bearing output');
+    assert.deepEqual(files.sort(), ['command.json', 'helper.json', 'status.json']);
+    assert.ok(contents.every((content) => !content.includes(secret)), 'remote command records must never retain a configured secret');
+    const command = JSON.parse(requireF(data, WORKSPACE_ID, COMMAND_ID, 'command.json'));
+    assert.equal(command.argv, undefined, 'durable command records must not contain argv');
+    assert.equal(command.request_hash, undefined, 'durable command records must not contain command hashes');
   } finally {
     groupKill(data, WORKSPACE_ID, COMMAND_ID);
     client.kill();
@@ -152,7 +156,7 @@ test('real helper binary: execute → disconnect → attach preserves exact exit
     const status = JSON.parse(requireF(data, WORKSPACE_ID, COMMAND_ID, 'status.json'));
     assert.equal(status.state, 'exited');
     assert.equal(status.exit_code, 42);
-    assert.deepEqual(readdirSyncWithin(data, WORKSPACE_ID, COMMAND_ID).sort(), ['command.json', 'helper.json', 'status.json']);
+    assert.deepEqual((await readdir(commandDir(data, WORKSPACE_ID, COMMAND_ID))).sort(), ['command.json', 'helper.json', 'status.json']);
     const helperJson = JSON.parse(requireF(data, WORKSPACE_ID, COMMAND_ID, 'helper.json'));
     assert.equal(helperJson.protocol, 1);
     assert.match(helperJson.arch, /^(x86_64|aarch64)$/);
@@ -195,7 +199,7 @@ test('real helper binary: PTY mode produces one merged terminal stream with \\r\
     assert.match(terminal, /40 100/, 'twsize(100x40) must be reflected by the child stty size');
     const status = JSON.parse(requireF(data, WORKSPACE_ID, COMMAND_ID, 'status.json'));
     assert.equal(status.state, 'exited');
-    assert.equal(readdirSyncWithin(data, WORKSPACE_ID, COMMAND_ID).includes('terminal.log'), false, 'PTY output must not persist after the session ends');
+    assert.deepEqual((await readdir(commandDir(data, WORKSPACE_ID, COMMAND_ID))).sort(), ['command.json', 'helper.json', 'status.json']);
   } finally {
     groupKill(data, WORKSPACE_ID, COMMAND_ID);
     client.endStdin();
@@ -349,7 +353,7 @@ test('real helper binary: empty argv tokens flow end to end with no deadlock (N3
   }
 });
 
-test('real helper binary: credential-shaped argv is hashed in durable command.json (L2)', async (t: TestContext) => {
+test('real helper binary: credential-shaped argv is absent from durable command.json (L2)', async (t: TestContext) => {
   if (skipIfUnsupported(t)) return;
   const data = await helperDataRoot();
   const client = new RealHelperProcess(BIN as string, data);
@@ -363,7 +367,8 @@ test('real helper binary: credential-shaped argv is hashed in durable command.js
     await collectUntilExit(client);
     const record = requireF(data, WORKSPACE_ID, COMMAND_ID, 'command.json');
     assert.doesNotMatch(record, new RegExp(credential));
-    assert.match(record, /redacted-fnv1a64-[0-9a-f]{16}/);
+    assert.doesNotMatch(record, /redacted-fnv1a64/);
+    assert.doesNotMatch(record, /"argv"|"request_hash"/);
   } finally {
     client.endStdin();
     client.kill();
@@ -416,132 +421,6 @@ test('real helper binary: stdin overflow is caller-visible and never reconnects 
   }
 });
 
-test('real helper binary: byte retention rejects evicted offsets and resumes its deterministic tail (N5)', async (t: TestContext) => {
-  if (skipIfUnsupported(t)) return;
-  const data = await helperDataRoot();
-  const client = new RealHelperProcess(BIN as string, data);
-  try {
-    await client.autoHello();
-    client.writeFrame(HelperFrameType.exec, {
-      command_id: COMMAND_ID, request_hash: 'h-retention', workspace_id: WORKSPACE_ID,
-      argv: ['sh', '-c', 'printf 1234567890'], mode: 'pipe', cwd: null, retention_bytes: 4,
-    });
-    await collectUntilExit(client);
-    assert.equal(requireF(data, WORKSPACE_ID, COMMAND_ID, 'stdout.log'), '7890');
-    const attach = new RealHelperProcess(BIN as string, data);
-    try {
-      await attach.autoHello();
-      attach.writeFrame(HelperFrameType.attach, { command_id: COMMAND_ID, request_hash: 'h-retention', workspace_id: WORKSPACE_ID, stdout_offset: '0', stderr_offset: '0', terminal_offset: '0' });
-      const rejected = await attach.nextTyped();
-      assert.equal(rejected?.kind, 'rejected');
-      assert.equal(rejected?.reason, 'attach-offset-beyond-retention');
-    } finally { attach.kill(); }
-    const resumed = new RealHelperProcess(BIN as string, data);
-    try {
-      await resumed.autoHello();
-      resumed.writeFrame(HelperFrameType.attach, { command_id: COMMAND_ID, request_hash: 'h-retention', workspace_id: WORKSPACE_ID, stdout_offset: '6', stderr_offset: '0', terminal_offset: '0' });
-      const events = await collectUntilExit(resumed);
-      assert.equal(reassembleOutput(events, 'stdout').toString(), '7890');
-    } finally { resumed.kill(); }
-  } finally { client.kill(); }
-});
-
-test('real helper binary: invalid retention settings are rejected fail-closed with exact reasons (F4/L3)', async (t: TestContext) => {
-  if (skipIfUnsupported(t)) return;
-  const data = await helperDataRoot();
-  for (const [field, value, reason] of [['retention_bytes', 0, 'invalid-retention-bytes'], ['retention_hours', 0, 'invalid-retention-hours']] as const) {
-    const client = new RealHelperProcess(BIN as string, data);
-    try {
-      await client.autoHello();
-      client.writeFrame(HelperFrameType.exec, { command_id: `${COMMAND_ID}-${field}`, request_hash: `h-${field}`, workspace_id: WORKSPACE_ID, argv: ['true'], mode: 'pipe', cwd: null, [field]: value });
-      const rejected = await client.nextTyped();
-      assert.equal(rejected?.kind, 'rejected');
-      assert.equal(rejected?.reason, reason);
-    } finally { client.kill(); }
-  }
-});
-
-test('real helper binary: EXEC purges only expired command directories before creating its durable record (F4/L3)', async (t: TestContext) => {
-  if (skipIfUnsupported(t)) return;
-  const data = await helperDataRoot();
-  const expired = commandDir(data, WORKSPACE_ID, 'expired-command');
-  const current = commandDir(data, WORKSPACE_ID, 'current-command');
-  await Promise.all([mkdir(expired, { recursive: true }), mkdir(current, { recursive: true })]);
-  await Promise.all([writeFile(join(expired, 'marker'), 'expired'), writeFile(join(current, 'marker'), 'current')]);
-  const now = new Date();
-  await Promise.all([utimes(expired, new Date(now.getTime() - 7_200_000), new Date(now.getTime() - 7_200_000)), utimes(current, now, now)]);
-  const client = new RealHelperProcess(BIN as string, data);
-  try {
-    await client.autoHello();
-    client.writeFrame(HelperFrameType.exec, { command_id: COMMAND_ID, request_hash: 'h-purge', workspace_id: WORKSPACE_ID, argv: ['true'], mode: 'pipe', cwd: null, retention_hours: 1 });
-    await collectUntilExit(client);
-    await assert.rejects(() => access(expired), { code: 'ENOENT' });
-    await access(current);
-    await access(commandDir(data, WORKSPACE_ID, COMMAND_ID));
-  } finally { client.kill(); }
-});
-
-test('real helper binary: a running attach fails closed when retention evicts its live continuation (R4)', async (t: TestContext) => {
-  if (skipIfUnsupported(t)) return;
-  const data = await helperDataRoot();
-  const first = new RealHelperProcess(BIN as string, data);
-  try {
-    await first.autoHello();
-    first.writeFrame(HelperFrameType.exec, {
-      command_id: COMMAND_ID, request_hash: 'h-retention-live-tail', workspace_id: WORKSPACE_ID,
-      argv: ['sh', '-c', 'printf 1234567890; sleep 3; printf ABCDEF'], mode: 'pipe', cwd: null, retention_bytes: 4,
-    });
-    await first.until((event) => event.kind === 'output', 5000);
-    first.endStdin();
-    await sleep(80);
-
-    const attach = new RealHelperProcess(BIN as string, data);
-    try {
-      await attach.autoHello();
-      attach.writeFrame(HelperFrameType.attach, {
-        command_id: COMMAND_ID, request_hash: 'h-retention-live-tail', workspace_id: WORKSPACE_ID,
-        stdout_offset: '10', stderr_offset: '0', terminal_offset: '0',
-      });
-      const events = await collectTerminal(attach, 8000);
-      assert.equal(reassembleOutput(events, 'stdout').toString(), '', 'the attach must not claim evicted continuation bytes were delivered');
-      assert.equal(events.some((event) => event.kind === 'exit'), false, 'an attach with an evicted continuation must not exit cleanly');
-      const failure = events.find((event) => event.kind === 'error');
-      assert.equal(failure?.message, 'attach-output-lost');
-    } finally { attach.kill(); }
-
-    const status = JSON.parse(requireF(data, WORKSPACE_ID, COMMAND_ID, 'status.json'));
-    assert.equal(status.stdout_offset, 16, 'the durable logical end must include the evicted continuation');
-  } finally {
-    groupKill(data, WORKSPACE_ID, COMMAND_ID);
-    first.kill();
-  }
-});
-
-test('real helper binary: a live chunk larger than retention reaches executeRemoteCommand intact and exits durably (N5)', async (t: TestContext) => {
-  if (skipIfUnsupported(t)) return;
-  const data = await helperDataRoot();
-  try {
-    const config = transportConfigFixture();
-    config.backends.codespaces.transport.remoteLogBytesPerStream = 4;
-    const fixture = await transportFixture({
-      config,
-      spawner: createRealHelperSpawner(BIN as string, data),
-      runner: realBootstrapRunner(BIN as string, digestOf(process.arch === 'arm64' ? FIXTURE_ARM64 : FIXTURE_X64)),
-    });
-    const events: CommandEvent[] = [];
-    for await (const event of executeRemoteCommand(fixture.deps, {
-      commandId: COMMAND_ID, argv: ['sh', '-c', 'printf 1234567890'], mode: 'pipe', stdin: 'closed',
-    })) events.push(event);
-    assert.equal(Buffer.concat(events.filter((event) => event.type === 'stdout').map((event) => Buffer.from((event as { bytes: Uint8Array }).bytes))).toString(), '1234567890');
-    assert.deepEqual(events.at(-1), { type: 'exit', commandId: COMMAND_ID, code: 0 });
-    const status = await loadCommandStatus(fixture.stateDir, COMMAND_ID);
-    assert.equal(status?.state, 'exited');
-    assert.equal(status?.exitCode, 0);
-  } finally {
-    killSpawnedRelays();
-  }
-});
-
 test('real helper binary: execute through the full backend transport yields the exact corpus output and exit (N2)', async (t: TestContext) => {
   if (skipIfUnsupported(t)) return;
   const bin = BIN as string;
@@ -567,10 +446,5 @@ function digestOf(bytes: Buffer): string {
   return createHash('sha256').update(bytes).digest('hex');
 }
 
-function readdirSyncWithin(dataDir: string, workspaceId: string, commandId: string): string[] {
-  return readdirSync(commandDir(dataDir, workspaceId, commandId));
-}
-
 void readFile;
 void readdir;
-void access;

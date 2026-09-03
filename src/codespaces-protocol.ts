@@ -4,8 +4,7 @@ import { createHash } from 'node:crypto';
  * Wire protocol for the package-owned remote execution helper. Every frame is
  * `[type:u8][length:u32 big-endian][payload]`, length-prefixed and therefore
  * binary-safe. ASCII/JSON request/event headers carry nonsecret metadata; the
- * output event carries raw bytes with a durable 64-bit stream offset so
- * attach/reconnect can resume without ambiguity. Nothing on this wire ever
+ * output event carries raw bytes only for the connected caller. Nothing on this wire ever
  * carries a credential-shaped value.
  */
 export const HELPER_PROTOCOL_VERSION = 1;
