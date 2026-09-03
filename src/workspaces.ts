@@ -63,7 +63,8 @@ export function createNodeProcessRunner({
         }
         const stdio = options.stdio ?? 'pipe';
         const child = spawnProcess(command, args, { cwd: options.cwd, shell: false, stdio, detached: platform !== 'win32' });
-        if (options.input !== undefined) child.stdin?.end(options.input);
+        if (options.binaryInput !== undefined) child.stdin?.end(Buffer.from(options.binaryInput));
+        else if (options.input !== undefined) child.stdin?.end(options.input);
         let stdout = '';
         let stderr = '';
         const stdoutDecoder = new TextDecoder();

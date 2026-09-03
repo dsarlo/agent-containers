@@ -1,9 +1,10 @@
+import { randomUUID } from 'node:crypto';
 import { join, resolve } from 'node:path';
 import { readFile } from 'node:fs/promises';
 import { createInterface } from 'node:readline/promises';
 import { assertDevcontainerPathCommittedOnBaseBranch, configurationDiff, hashConfig, initConfigV2, loadConfig, parseCodespacesDraft, parseConfig, redactConfig, redactDiagnostic, saveConfigAtomic, snapshotInitConfig } from './config.js';
 import { discoverProjectSetup, doctor, validateCodespacesSetup } from './setup.js';
-import type { CodespacesAgentContainersConfig, CodespacesConfig, ExecutionBackend, ReadinessEvent, WorkspaceHandle } from './types.js';
+import type { CodespacesAgentContainersConfig, CodespacesConfig, CommandEvent, ExecutionBackend, ReadinessEvent, RemoteCommandRequest, WorkspaceHandle } from './types.js';
 import { acknowledgeUnconfirmedProcessReap, clearManualRecoveryIfCurrent, defaultStateDir, deleteMetadata, isLocalWorkspaceMetadata, listMetadata, loadManualRecovery, loadMetadata, recordManualRecovery, releaseStaleWorkspaceLock, saveMetadata, withWorkspaceLock } from './state.js';
 import { execNamedWorkspaceLifecycle } from './runtime.js';
 import { createWorkspace, findGitRoot, nodeProcessRunner, removeWorkspace } from './workspaces.js';
@@ -201,7 +202,15 @@ export async function runCli(args: string[], cwd = process.cwd(), write: (messag
         // backend. Unknown future metadata is rejected by loadMetadata.
         const recorded = await loadMetadata(stateDir, name);
         if (!recorded) throw new Error(`No Agent Containers workspace named "${name}".`);
-        if (!('repoRoot' in recorded)) await resolveExecutionBackend('codespaces').execute({ kind: 'codespaces', id: recorded.workspaceId, name: recorded.name, environmentId: recorded.remote.environmentId }, { commandId: 'phase-gated', argv: [rest[separator + 1] ?? 'true', ...rest.slice(separator + 2)] });
+        if (!('repoRoot' in recorded)) {
+          const root = await findGitRoot(cwd, nodeProcessRunner);
+          const config = await loadConfig(join(root, '.agent-containers.yml'));
+          if (config.version !== 2 || !config.backends.enabled.includes('codespaces')) throw new Error('The recorded workspace requires an enabled Codespaces backend configuration.');
+          const backend = createCodespacesExecutionBackend({ stateDir, config, runner: nodeProcessRunner, root });
+          const request: RemoteCommandRequest = { commandId: `cli-${randomUUID()}`, argv: [rest[separator + 1] ?? 'true', ...rest.slice(separator + 2)] };
+          for await (const event of executeWithInterruptRelay(backend, { kind: 'codespaces', id: recorded.workspaceId, name: recorded.name, environmentId: recorded.remote.environmentId }, request)) { void event; }
+          return 0;
+        }
         const backend = resolveExecutionBackend('local', { execute: async function* (_handle, request) {
           const result = await execNamedWorkspaceLifecycle(name, [...request.argv], nodeProcessRunner, stateDir);
           yield { type: 'exit', commandId: request.commandId, code: result.code };
@@ -327,6 +336,23 @@ function ensureOptions(args: string[], allowed: string[], flags: string[] = []):
     if (flags.includes(args[index])) continue;
     index += 1;
     if (!args[index]) throw new UsageError(`${args[index - 1]} requires a value.`);
+  }
+}
+
+async function* executeWithInterruptRelay(backend: ExecutionBackend, handle: WorkspaceHandle, request: RemoteCommandRequest): AsyncGenerator<CommandEvent> {
+  const first = new AbortController();
+  const second = new AbortController();
+  let interrupts = 0;
+  const onInterrupt = () => {
+    if (interrupts === 0) first.abort();
+    else second.abort();
+    interrupts += 1;
+  };
+  process.on('SIGINT', onInterrupt);
+  try {
+    yield* backend.execute(handle, request, first.signal, second.signal);
+  } finally {
+    process.off('SIGINT', onInterrupt);
   }
 }
 

@@ -1,9 +1,11 @@
 import { randomUUID } from 'node:crypto';
 import type { CommandEvent, ExecutionBackend, WorkspaceHandle, WorkspaceObservation } from './types.js';
-import type { BackendKind, CodespacesAgentContainersConfig, ProcessRunner } from './types.js';
+import type { BackendKind, CodespacesAgentContainersConfig, ProcessRunner, RemoteCommandRequest } from './types.js';
 import { GhCodespacesProvider } from './codespaces.js';
 import { createCodespacesWorkspace, type CodespacesCreateOutcome } from './codespaces-create.js';
 import { waitCodespacesReady } from './codespaces-readiness.js';
+import { recordCodespacesEvent } from './codespaces-ops.js';
+import { attachRemoteCommand, cancelRemoteCommand, createNodeSshSpawner, executeRemoteCommand, type SshSpawner } from './codespaces-transport.js';
 import { listMetadata, type CodespacesWorkspaceMetadata } from './state.js';
 
 /** Local lifecycle hooks keep the backend boundary injectable without changing durable records. */
@@ -57,6 +59,8 @@ export interface CodespacesExecutionBackendDependencies {
   root: string;
   ghVersion?: string;
   displayNameHint?: string | null;
+  /** Test seam: streamed `gh codespace ssh` transport used for execution. */
+  spawner?: SshSpawner;
 }
 
 /**
@@ -100,9 +104,50 @@ export function createCodespacesExecutionBackend(deps: CodespacesExecutionBacken
       const metadata = await loadCodespacesHandleRecord(deps.stateDir, handle);
       yield* waitCodespacesReady({ stateDir: deps.stateDir, name: metadata.name, provider, config: deps.config, signal });
     },
-    execute() { gated(); },
-    attach() { gated(); },
-    async cancel() { gated(); },
+    async *execute(handle, request, signal, detachSignal) {
+      requireGate();
+      if (handle.kind !== 'codespaces') throw new Error('Backend handle mismatch: expected codespaces.');
+      assertRemoteRequest(request);
+      const metadata = await loadCodespacesHandleRecord(deps.stateDir, handle);
+      const logger = (input: Parameters<typeof recordCodespacesEvent>[1]) => recordCodespacesEvent(deps.stateDir, input);
+      yield* executeRemoteCommand({
+        stateDir: deps.stateDir, metadata, provider, root: deps.root, config: deps.config,
+        spawner: deps.spawner ?? createNodeSshSpawner(), signal, detachSignal, logger,
+      }, {
+        commandId: request.commandId,
+        argv: request.argv,
+        mode: request.mode ?? 'pipe',
+        cwd: request.cwd,
+        stdin: request.stdin ?? 'closed',
+        cols: request.cols,
+        rows: request.rows,
+      });
+    },
+    async *attach(handle, commandId, signal) {
+      requireGate();
+      if (handle.kind !== 'codespaces') throw new Error('Backend handle mismatch: expected codespaces.');
+      if (!commandId) throw new Error('Command ID is invalid.');
+      const metadata = await loadCodespacesHandleRecord(deps.stateDir, handle);
+      const logger = (input: Parameters<typeof recordCodespacesEvent>[1]) => recordCodespacesEvent(deps.stateDir, input);
+      yield* attachRemoteCommand({
+        stateDir: deps.stateDir, metadata, provider, root: deps.root, config: deps.config,
+        spawner: deps.spawner ?? createNodeSshSpawner(), signal, logger,
+      }, commandId);
+    },
+    async cancel(handle, commandId, signal) {
+      requireGate();
+      if (handle.kind !== 'codespaces') throw new Error('Backend handle mismatch: expected codespaces.');
+      if (!commandId) throw new Error('Command ID is invalid.');
+      const metadata = await loadCodespacesHandleRecord(deps.stateDir, handle);
+      const logger = (input: Parameters<typeof recordCodespacesEvent>[1]) => recordCodespacesEvent(deps.stateDir, input);
+      const outcome = await cancelRemoteCommand({
+        stateDir: deps.stateDir, metadata, provider, root: deps.root, config: deps.config,
+        spawner: deps.spawner ?? createNodeSshSpawner(), signal, logger,
+      }, commandId);
+      if (outcome.outcome === 'cancel-outcome-unknown') {
+        throw new Error(`Cancellation could not be proven for remote command ${commandId}; the process group may still be running remotely. Agent Containers recorded a cancel-outcome-unknown recovery barrier and never claims the command stopped.`);
+      }
+    },
     async recover() { gated(); },
     async remove() { gated(); },
   };
@@ -127,4 +172,18 @@ type codespacesCreateOutcomeType = Exclude<CodespacesCreateOutcome, { outcome: '
 function requireOperation<T>(operation: T | undefined, name: string): T { if (!operation) throw new Error(`Local ${name} lifecycle is unavailable.`); return operation; }
 function assertHandle(handle: WorkspaceHandle, expected: 'local'): void { if (handle.kind !== expected) throw new Error(`Backend handle mismatch: expected ${expected}.`); }
 function assertRequestName(request: { name: string; backend: BackendKind }): void { if (request.backend !== 'local' || !request.name || request.name.includes('\0')) throw new Error('Workspace creation request is invalid.'); }
-function assertRequest(request: { commandId: string; argv: readonly [string, ...string[]] }): void { if (!request.commandId || !request.argv.length || request.argv.some((value) => !value || value.includes('\0'))) throw new Error('Execution request is invalid.'); }
+/** Max byte length of a single argv token; must match the C helper's 1024-byte
+ * token bound (helper.c parse_argv) so validators never accept a token the
+ * helper would reject. Empty-string tokens ARE valid (they are safe without a
+ * shell — the helper execvp's argv directly) but argv[0] must be non-empty. */
+const MAX_ARGV_TOKEN_BYTES = 1023;
+function isValidArgv(argv: readonly string[]): boolean {
+  if (!argv.length || argv[0] === undefined || argv[0].length === 0) return false;
+  return argv.every((value) => typeof value === 'string' && value.length <= MAX_ARGV_TOKEN_BYTES && !value.includes('\0'));
+}
+function assertRequest(request: { commandId: string; argv: readonly [string, ...string[]] }): void { if (!request.commandId || !isValidArgv(request.argv)) throw new Error('Execution request is invalid.'); }
+function assertRemoteRequest(request: RemoteCommandRequest): void {
+  if (!request.commandId || !isValidArgv(request.argv)) throw new Error('Execution request is invalid.');
+  if (request.mode !== undefined && request.mode !== 'pipe' && request.mode !== 'pty') throw new Error('Remote execution mode must be pipe or pty.');
+  if (request.cwd !== undefined && (!request.cwd || request.cwd.length > 1024 || /[\0\r\n]/.test(request.cwd))) throw new Error('Remote cwd is invalid.');
+}

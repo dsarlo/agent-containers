@@ -66,7 +66,14 @@ export type CodespacesJournalKind =
   | 'recovery-set'
   | 'recovery-cleared'
   | 'ambiguous-create'
-  | 'provider-error';
+  | 'provider-error'
+  | 'command-accepted'
+  | 'command-started'
+  | 'command-detached'
+  | 'command-terminal'
+  | 'cancel-requested'
+  | 'cancel-verified'
+  | 'cancel-unknown';
 
 export interface CodespacesJournalEvent {
   schemaVersion: 1;
@@ -78,6 +85,10 @@ export interface CodespacesJournalEvent {
   actorId: string | null;
   repositoryId: string | null;
   codespaceId: string | null;
+  /** Stable remote command ID for command-lifecycle events; null otherwise. */
+  commandId: string | null;
+  /** Non-secret argv hash only; argv plaintext is never written to the audit log. */
+  requestHash: string | null;
   previous: string | null;
   next: string | null;
   occurredAt: string;
@@ -85,7 +96,7 @@ export interface CodespacesJournalEvent {
   detail: string | null;
 }
 
-export type CodespacesJournalEventInput = Omit<CodespacesJournalEvent, 'schemaVersion' | 'eventId' | 'occurredAt'>;
+export type CodespacesJournalEventInput = Omit<CodespacesJournalEvent, 'schemaVersion' | 'eventId' | 'occurredAt' | 'commandId' | 'requestHash'> & { commandId?: string | null; requestHash?: string | null };
 
 interface CheckedCodespacesJournalEvent extends CodespacesJournalEvent {
   checksum: string;
@@ -169,7 +180,23 @@ export async function listCreateIntents(stateDir: string): Promise<CodespacesInt
 }
 
 export async function recordCodespacesEvent(stateDir: string, input: CodespacesJournalEventInput): Promise<void> {
-  const event: CodespacesJournalEvent = { schemaVersion: 1, eventId: randomUUID(), occurredAt: new Date().toISOString(), ...input };
+  const event: CodespacesJournalEvent = {
+    schemaVersion: 1,
+    event: input.event,
+    eventId: randomUUID(),
+    occurredAt: new Date().toISOString(),
+    commandId: input.commandId ?? null,
+    requestHash: input.requestHash ?? null,
+    workspaceName: input.workspaceName,
+    operationId: input.operationId,
+    requestId: input.requestId,
+    actorId: input.actorId,
+    repositoryId: input.repositoryId,
+    codespaceId: input.codespaceId,
+    previous: input.previous,
+    next: input.next,
+    detail: input.detail,
+  };
   validateEvent(event);
   const adapter = durability();
   await adapter.assertStateWriteSupport();
@@ -230,6 +257,7 @@ function validateEvent(event: CodespacesJournalEvent): void {
     || !isUuid(event.operationId) || (event.requestId !== null && !isUuid(event.requestId))
     || (event.actorId !== null && !losslessId(event.actorId)) || (event.repositoryId !== null && !losslessId(event.repositoryId))
     || (event.codespaceId !== null && !losslessId(event.codespaceId))
+    || (event.commandId != null && !isCommandId(event.commandId)) || (event.requestHash != null && !isRequestHash(event.requestHash))
     || (event.previous !== null && !safeDetail(event.previous)) || (event.next !== null && !safeDetail(event.next))
     || !isTimestamp(event.occurredAt)) throw new Error('Codespaces journal event fields are invalid.');
   if (event.detail !== null && !safeDetail(event.detail)) throw new Error('Codespaces journal detail must be nonsecret and bounded.');
@@ -326,5 +354,7 @@ function safeRepositoryPath(value: unknown): value is string { return typeof val
 function safeDetail(value: unknown): value is string { return typeof value === 'string' && !secretShaped(value) && value.length > 0 && value.length <= 2048 && !/[\0\r\n]/.test(value); }
 function safeRef(value: unknown): value is string { return typeof value === 'string' && !secretShaped(value) && /^refs\/(?:heads|tags)\/(?:[A-Za-z0-9][A-Za-z0-9._-]*)(?:\/[A-Za-z0-9][A-Za-z0-9._-]*)*$/.test(value) && !value.includes('..') && !value.split('/').some((part) => part.endsWith('.') || part.endsWith('.lock')); }
 function isOperationState(value: unknown): value is CodespacesOperationState { return typeof value === 'string' && ['intent-recorded', 'create-dispatched', 'resource-recorded', 'identity-verified', 'identity-mismatch', 'revision-mismatch', 'provider-error', 'ambiguous-create', 'recovery-required', 'recovery-cleared'].includes(value); }
-function isJournalKind(value: unknown): value is CodespacesJournalKind { return typeof value === 'string' && ['operation-created', 'provider-request-dispatched', 'provider-response-recorded', 'identity-verified', 'identity-mismatch', 'readiness-transition', 'recovery-set', 'recovery-cleared', 'ambiguous-create', 'provider-error'].includes(value); }
+function isJournalKind(value: unknown): value is CodespacesJournalKind { return typeof value === 'string' && ['operation-created', 'provider-request-dispatched', 'provider-response-recorded', 'identity-verified', 'identity-mismatch', 'readiness-transition', 'recovery-set', 'recovery-cleared', 'ambiguous-create', 'provider-error', 'command-accepted', 'command-started', 'command-detached', 'command-terminal', 'cancel-requested', 'cancel-verified', 'cancel-unknown'].includes(value); }
+function isCommandId(value: unknown): value is string { return typeof value === 'string' && /^[0-9A-Za-z-]{1,128}$/.test(value) && !secretShaped(value); }
+function isRequestHash(value: unknown): value is string { return typeof value === 'string' && /^[0-9a-f]{64}$/.test(value); }
 function isNodeError(error: unknown, code: string): error is NodeJS.ErrnoException { return typeof error === 'object' && error !== null && 'code' in error && error.code === code; }

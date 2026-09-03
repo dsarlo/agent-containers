@@ -40,13 +40,29 @@ export type WorkspaceObservation = { backend: BackendKind; state: string; observ
 export type CommandEvent =
   | { type: 'accepted' | 'started'; commandId: string }
   | { type: 'stdout' | 'stderr' | 'terminal'; commandId: string; offset: bigint; bytes: Uint8Array }
-  | { type: 'exit'; commandId: string; code: number | null };
+  | { type: 'exit'; commandId: string; code: number | null }
+  | { type: 'rejected'; commandId: string; reason: string }
+  | { type: 'detached'; commandId: string; offsets: { stdout: bigint; stderr: bigint; terminal: bigint } }
+  | { type: 'cancelled'; commandId: string }
+  | { type: 'cancel-unknown'; commandId: string };
+
+/** Remote command request surfaces for the Codespaces backend. */
+export interface RemoteCommandRequest {
+  commandId: string;
+  argv: readonly [string, ...string[]];
+  mode?: 'pipe' | 'pty';
+  cwd?: string;
+  stdin?: 'closed' | 'stream';
+  cols?: number;
+  rows?: number;
+}
+
 export interface ExecutionBackend {
   readonly kind: BackendKind;
   create(request: { name: string; backend: BackendKind }, signal?: AbortSignal): Promise<WorkspaceHandle>;
   observe(handle: WorkspaceHandle, signal?: AbortSignal): Promise<WorkspaceObservation>;
   waitReady(handle: WorkspaceHandle, signal?: AbortSignal): AsyncIterable<WorkspaceObservation | ReadinessEvent>;
-  execute(handle: WorkspaceHandle, request: { commandId: string; argv: readonly [string, ...string[]] }, signal?: AbortSignal): AsyncIterable<CommandEvent>;
+  execute(handle: WorkspaceHandle, request: RemoteCommandRequest, signal?: AbortSignal, detachSignal?: AbortSignal): AsyncIterable<CommandEvent>;
   attach(handle: WorkspaceHandle, commandId: string, signal?: AbortSignal): AsyncIterable<CommandEvent>;
   cancel(handle: WorkspaceHandle, commandId: string, signal?: AbortSignal): Promise<void>;
   recover(handle: WorkspaceHandle, signal?: AbortSignal): Promise<void>;
@@ -115,6 +131,8 @@ export interface ProcessRunOptions {
   stdio?: 'inherit' | 'pipe';
   /** UTF-8 input written to the child stdin before it is closed. */
   input?: string;
+  /** Raw binary input written to the child stdin before it is closed. */
+  binaryInput?: Uint8Array | Buffer;
   /** Receives bounded, incrementally decoded pipe output without retaining it. */
   onOutput?: (event: ProcessOutputEvent) => void;
   /** Aborts the active process, which is reaped before run() settles. */

@@ -126,12 +126,24 @@ export class GhCodespacesProvider {
    * remote argv is always package-owned; no user input is ever interpolated.
    */
   async remoteSshProbe(name: string, command: readonly [string, ...string[]], options: { timeoutMs?: number; signal?: AbortSignal } = {}): Promise<string> {
+    return this.remoteCommand(name, command as readonly string[], { ...options, kind: 'readonly-probe' });
+  }
+
+  /**
+   * Bounded, argv-framed `gh codespace ssh` transport for a package-owned
+   * remote command. An optional binary stdin payload (for example the helper
+   * copy stream) is written before the child closes; stdout is returned as the
+   * bounded result. No user argv is ever concatenated into a remote shell.
+   */
+  async remoteCommand(name: string, command: readonly string[], options: { timeoutMs?: number; signal?: AbortSignal; input?: Uint8Array; kind?: ProcessRunOptions['kind'] } = {}): Promise<string> {
     if (!safeName(name)) throw new Error('Invalid Codespaces name.');
-    if (!command.length || command.some((value) => !value || value.includes('\0'))) throw new Error('SSH probe argv is invalid.');
-    const runOptions: ProcessRunOptions = { kind: 'readonly-probe' };
+    if (!command.length || command.some((value) => !value || value.includes('\0'))) throw new Error('SSH argv is invalid.');
+    const runOptions: ProcessRunOptions = { kind: options.kind ?? 'lifecycle' };
+    if (options.input !== undefined) runOptions.binaryInput = options.input;
     const controller = new AbortController();
     const timer = options.timeoutMs ? setTimeout(() => controller.abort(), options.timeoutMs) : undefined;
     options.signal?.addEventListener('abort', () => controller.abort(), { once: true });
+    if (options.signal?.aborted) controller.abort();
     try {
       const result = await this.process.run('gh', ['codespace', 'ssh', '-c', name, '--', ...command], { ...runOptions, signal: controller.signal });
       if (result.code !== 0) throw providerError('ssh', name, result);
@@ -196,7 +208,8 @@ export class GhCodespacesProvider {
 export interface SafeExecuteRequest { commandId: string; argv: readonly [string, ...string[]]; cwd?: string; mode: 'pipe' | 'pty'; stdin: 'closed' | 'stream' }
 export function assertSafeExecuteRequest(request: SafeExecuteRequest): void {
   if (!/^[0-9A-Za-z-]{1,128}$/.test(request.commandId)) throw new Error('commandId must be a validated durable identifier.');
-  if (!request.argv.length || request.argv.some((value) => !value || value.includes('\0'))) throw new Error('Remote argv must be nonempty and must not contain NUL.');
+  if (!request.argv.length || request.argv[0] === undefined || request.argv[0].length === 0) throw new Error('Remote argv must be nonempty and argv[0] must be nonempty.');
+  if (request.argv.some((value) => typeof value !== 'string' || value.length > 1023 || value.includes('\0'))) throw new Error('Remote argv tokens must be bounded plain strings without NUL.');
   if (request.cwd && (!/^[^\\/][^\\]*$/.test(request.cwd) || request.cwd.split('/').some((part) => !part || part === '.' || part === '..'))) throw new Error('Remote cwd must be a safe repository-relative path.');
 }
 
