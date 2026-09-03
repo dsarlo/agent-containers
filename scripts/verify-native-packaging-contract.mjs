@@ -181,7 +181,7 @@ function assertSupplyChainControls() {
     for (const step of job?.steps ?? []) {
       if (typeof step?.run !== 'string') continue;
       if (/\bnpm ci\b/.test(step.run)) assert.match(step.run, /\bnpm ci --ignore-scripts\b/, `${jobName} must disable dependency lifecycle scripts during npm ci`);
-      if (/\bnpm install --global\b/.test(step.run)) assert.match(step.run, /\bnpm install --global --ignore-scripts\b/, `${jobName} must disable dependency lifecycle scripts during global npm installation`);
+      if (/\bnpm install\b/.test(step.run)) assert.ok(step.run.includes('--ignore-scripts'), `${jobName} must disable dependency lifecycle scripts during npm installation`);
     }
     for (const step of job?.steps ?? []) {
       if (typeof step?.uses !== 'string' || !step.uses.startsWith('actions/checkout@')) continue;
@@ -245,7 +245,7 @@ const nativePackageDownload = artifactStep('native-package-smoke', 'actions/down
 assertUnconditional(nativePackageDownload, 'native-package-smoke package download step');
 assert.equal(nativePackageDownload.with?.name, 'native-package', 'package smoke tests must download the assembled tarball artifact');
 assert.equal(nativePackageDownload.with?.path, packageArchiveDirectory, 'package smoke tests must restore the assembled tarball to its non-hidden archive directory');
-const nativePackageInstall = runStep('native-package-smoke', `mkdir .packed-native && npm install --prefix .packed-native ${packageInstallArchiveGlob}`, 'package smoke tests must install the exact assembled tarball with an unambiguous filesystem path and without lifecycle downloads', (run) => /\bnpm install\b/.test(run));
+const nativePackageInstall = runStep('native-package-smoke', `mkdir .packed-native && npm install --ignore-scripts --prefix .packed-native ${packageInstallArchiveGlob}`, 'package smoke tests must install the exact assembled tarball with an unambiguous filesystem path and without lifecycle downloads', (run) => /\bnpm install\b/.test(run));
 const nativePackageSmokeExecution = runStep('native-package-smoke', 'node scripts/test-native.mjs', 'package smoke tests must execute the installed production package smoke command', (run) => /\bnode scripts\/test-native\.mjs\b/.test(run));
 assertUnconditional(nativePackageInstall, 'native-package-smoke package installation step');
 assertUnconditional(nativePackageSmokeExecution, 'native-package-smoke production package smoke step');

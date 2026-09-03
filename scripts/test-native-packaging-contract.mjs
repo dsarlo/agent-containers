@@ -76,7 +76,7 @@ ${actionStep('actions/download-artifact', refs['actions/download-artifact'])}
         with:
           name: native-package
           path: ${archiveDirectory}
-      - run: mkdir .packed-native && npm install --prefix .packed-native ./${archiveDirectory}/*.tgz
+      - run: mkdir .packed-native && npm install --ignore-scripts --prefix .packed-native ./${archiveDirectory}/*.tgz
       - run: node scripts/test-native.mjs
         env:
           PACKED_NATIVE_PACKAGE_DIR: ${'${{ github.workspace }}'}/.packed-native/node_modules/@dsarlo/agent-containers
@@ -393,6 +393,10 @@ try {
       workflow: (fixture) => fixture.replace('      - run: npm install --global --ignore-scripts @devcontainers/cli@0.89.0', '      - continue-on-error: true\n        run: npm install --global --ignore-scripts @devcontainers/cli@0.89.0'),
     },
     {
+      name: 'packed package install runs lifecycle scripts',
+      workflow: (fixture) => fixture.replace(`npm install --ignore-scripts --prefix .packed-native ${packageInstallArchiveGlob}`, `npm install --prefix .packed-native ${packageInstallArchiveGlob}`),
+    },
+    {
       name: 'prerequisite if',
       workflow: (fixture) => fixture.replace('      - name: Require Docker, Dev Containers, and relative linked-worktree support', '      - name: Require Docker, Dev Containers, and relative linked-worktree support\n        if: always()'),
     },
@@ -483,8 +487,8 @@ try {
   }
 
   const legacyPackageInstallWorkflow = workflowFor(allSupportedArchitectures).replace(
-    `npm install --prefix .packed-native ${packageInstallArchiveGlob}`,
-    `npm install --prefix .packed-native ${packageArchiveDirectory}/*.tgz`,
+    `npm install --ignore-scripts --prefix .packed-native ${packageInstallArchiveGlob}`,
+    `npm install --ignore-scripts --prefix .packed-native ${packageArchiveDirectory}/*.tgz`,
   );
   await writeFixture(legacyPackageInstallWorkflow);
   const legacyPackageInstallResult = verifyFixture();
@@ -554,7 +558,7 @@ try {
     },
     {
       name: 'smoke package installation if',
-      workflow: (fixture) => fixture.replace(`      - run: mkdir .packed-native && npm install --prefix .packed-native ${packageInstallArchiveGlob}`, `      - if: always()\n        run: mkdir .packed-native && npm install --prefix .packed-native ${packageInstallArchiveGlob}`),
+      workflow: (fixture) => fixture.replace(`      - run: mkdir .packed-native && npm install --ignore-scripts --prefix .packed-native ${packageInstallArchiveGlob}`, `      - if: always()\n        run: mkdir .packed-native && npm install --ignore-scripts --prefix .packed-native ${packageInstallArchiveGlob}`),
     },
     {
       name: 'removed production package smoke command',

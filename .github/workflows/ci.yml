@@ -178,7 +178,7 @@ jobs:
           path: native-package
       - name: Install assembled package without lifecycle downloads
         shell: bash
-        run: mkdir .packed-native && npm install --prefix .packed-native ./native-package/*.tgz
+        run: mkdir .packed-native && npm install --ignore-scripts --prefix .packed-native ./native-package/*.tgz
       - name: Load and smoke-test installed production native adapter
         run: node scripts/test-native.mjs
         env:
