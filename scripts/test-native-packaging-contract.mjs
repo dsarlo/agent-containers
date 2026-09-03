@@ -36,7 +36,7 @@ const legacyV4ActionRefs = Object.freeze({
 });
 
 function actionStep(action, ref = actionRefs[action]) {
-  return `      # ${action} v5\n      - uses: ${action}@${ref}`;
+  return `      # ${action} v5\n      - uses: ${action}@${ref}${action === 'actions/checkout' ? '\n        with:\n          persist-credentials: false' : ''}`;
 }
 
 function sourceBuildSteps(refs = actionRefs) {
@@ -93,9 +93,9 @@ ${actionStep('actions/setup-node', refs['actions/setup-node'])}
         with:
           node-version: 20.19.0
           cache: npm
-      - run: npm ci
+      - run: npm ci --ignore-scripts
 ${nativeBuildStep}
-      - run: npm install --global @devcontainers/cli@0.89.0
+      - run: npm install --global --ignore-scripts @devcontainers/cli@0.89.0
       - name: Require Docker, Dev Containers, and relative linked-worktree support
         run: |
           docker version
@@ -225,8 +225,8 @@ try {
     {
       name: 'build:native after prerequisites',
       workflow: (fixture) => fixture.replace(
-        `${liveNativeBuildStep}\n      - run: npm install --global @devcontainers/cli@0.89.0`,
-        '      - run: npm install --global @devcontainers/cli@0.89.0',
+        `${liveNativeBuildStep}\n      - run: npm install --global --ignore-scripts @devcontainers/cli@0.89.0`,
+        '      - run: npm install --global --ignore-scripts @devcontainers/cli@0.89.0',
       ).replace(
         '      - run: AGENT_CONTAINERS_REQUIRE_LIVE_INTEGRATION=1 npm run test:integration',
         `${liveNativeBuildStep}\n      - run: AGENT_CONTAINERS_REQUIRE_LIVE_INTEGRATION=1 npm run test:integration`,
@@ -386,11 +386,11 @@ try {
     },
     {
       name: 'npm ci if',
-      workflow: (fixture) => fixture.replace('      - run: npm ci', '      - if: always()\n        run: npm ci'),
+      workflow: (fixture) => fixture.replace('      - run: npm ci --ignore-scripts', '      - if: always()\n        run: npm ci --ignore-scripts'),
     },
     {
       name: 'Dev Containers CLI install continue-on-error',
-      workflow: (fixture) => fixture.replace('      - run: npm install --global @devcontainers/cli@0.89.0', '      - continue-on-error: true\n        run: npm install --global @devcontainers/cli@0.89.0'),
+      workflow: (fixture) => fixture.replace('      - run: npm install --global --ignore-scripts @devcontainers/cli@0.89.0', '      - continue-on-error: true\n        run: npm install --global --ignore-scripts @devcontainers/cli@0.89.0'),
     },
     {
       name: 'prerequisite if',

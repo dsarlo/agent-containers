@@ -137,9 +137,9 @@ function assertLiveDevcontainerContract() {
 
   const checkout = artifactStep('live-devcontainer', 'actions/checkout');
   const setupNode = artifactStep('live-devcontainer', 'actions/setup-node');
-  const npmCi = runStep('live-devcontainer', 'npm ci', 'live-devcontainer must install locked dependencies with npm ci');
+  const npmCi = runStep('live-devcontainer', 'npm ci --ignore-scripts', 'live-devcontainer must install locked dependencies with npm ci while disabling third-party lifecycle scripts');
   const nativeBuild = runStep('live-devcontainer', 'npm run build:native', 'live-devcontainer must source-build the native addon after npm ci');
-  const installDevContainersCli = runStep('live-devcontainer', 'npm install --global @devcontainers/cli@0.89.0', 'live-devcontainer must install the exact reviewed Dev Containers CLI globally');
+  const installDevContainersCli = runStep('live-devcontainer', 'npm install --global --ignore-scripts @devcontainers/cli@0.89.0', 'live-devcontainer must install the exact reviewed Dev Containers CLI with third-party lifecycle scripts disabled');
 
   const prerequisiteSteps = (job.steps ?? []).filter(({ run }) => (
     typeof run === 'string'
@@ -176,7 +176,22 @@ function isDisabledIncludeHiddenFilesInput(inputs) {
   return value === false || (typeof value === 'string' && value.trim().toLowerCase() === 'false');
 }
 
+function assertSupplyChainControls() {
+  for (const [jobName, job] of Object.entries(workflowDefinition.jobs ?? {})) {
+    for (const step of job?.steps ?? []) {
+      if (typeof step?.run !== 'string') continue;
+      if (/\bnpm ci\b/.test(step.run)) assert.match(step.run, /\bnpm ci --ignore-scripts\b/, `${jobName} must disable dependency lifecycle scripts during npm ci`);
+      if (/\bnpm install --global\b/.test(step.run)) assert.match(step.run, /\bnpm install --global --ignore-scripts\b/, `${jobName} must disable dependency lifecycle scripts during global npm installation`);
+    }
+    for (const step of job?.steps ?? []) {
+      if (typeof step?.uses !== 'string' || !step.uses.startsWith('actions/checkout@')) continue;
+      assert.equal(step.with?.['persist-credentials'], false, `${jobName} checkout must not persist GITHUB_TOKEN in Git configuration`);
+    }
+  }
+}
+
 assertPinnedActions();
+assertSupplyChainControls();
 
 assert.ok(packageJson.files.includes('prebuilds'), 'published files must include bundled native prebuilds');
 assert.ok(packageJson.scripts['native:verify-prebuilds'], 'package must verify all bundled prebuilds before packing');
