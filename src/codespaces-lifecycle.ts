@@ -65,7 +65,17 @@ export async function removeCodespacesWorkspace(deps: CodespacesLifecycleDepende
   await assertNoActiveCommand(deps.stateDir);
   await mutate(deps, metadata, 'remove', 'remove-requested', async () => {
     await verifyBeforeMutation(deps, metadata);
-    await deps.provider.delete(metadata.remote.name);
+    const risk = await deps.provider.remoteGitRisk(metadata.remote.name);
+    if (risk.dirty || risk.unpushed) {
+      const detail = [risk.dirty ? 'dirty' : null, risk.unpushed ? 'unpushed' : null].filter(Boolean).join(' and ');
+      throw new Error(`Remote deletion is refused: ${metadata.repository.owner}/${metadata.repository.name} branch ${risk.branch} is ${detail}; preserve or explicitly resolve the remote Git state before data loss.`);
+    }
+    try {
+      await deps.provider.delete(metadata.remote.name);
+    } catch (error) {
+      if (!isNotFound(error)) throw error;
+      return { normalized: 'tombstoned', providerRawState: 'Deleted', cleanup: { ...metadata.cleanup, remoteDeleted: true, tombstoneWritten: true } };
+    }
     try {
       await deps.provider.get(metadata.remote.name);
       throw new Error('Delete readback still returned the exact Codespace; removal is blocked.');

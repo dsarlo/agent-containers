@@ -63,6 +63,14 @@ export class TransportLostError extends Error {
   }
 }
 
+/** The helper has refused part of stdin, so a later exit cannot prove the requested command completed. */
+export class StdinOverflowError extends Error {
+  constructor() {
+    super('Remote helper rejected stdin beyond its bounded queue; command outcome requires recovery.');
+    this.name = 'StdinOverflowError';
+  }
+}
+
 export type RemoteHelperEvent =
   | { kind: 'hello-ok'; protocol: number; helperVersion: string; helperArch: string; remoteBootId: string; helperPid: number }
   | { kind: 'rejected'; commandId: string | null; reason: string }
@@ -431,6 +439,10 @@ export async function* executeRemoteCommand(deps: RemoteTransportDependencies, i
       if (cancelRequested) continue;
     }
   } catch (error: unknown) {
+    if (error instanceof StdinOverflowError) {
+      await recordUnknownOutcome(deps, commandId, requestHash, offsets, now, savedStatus, 'outcome-unknown');
+      throw error;
+    }
     if (!cancelRequested) throw error;
     await recordUnknownOutcome(deps, commandId, requestHash, offsets, now, savedStatus, 'cancel-outcome-unknown');
     yield { type: 'cancel-unknown', commandId };
@@ -674,7 +686,7 @@ async function* streamSession(deps: RemoteTransportDependencies, now: () => stri
       }
       case 'error': {
         if (event.message === 'stdin-overflow') {
-          throw new TransportLostError('Remote helper rejected stdin beyond its bounded queue; command outcome requires recovery.');
+          throw new StdinOverflowError();
         }
         throw new Error(`Remote helper reported an error: ${redactSecretDiagnostic(event.message)}`);
       }

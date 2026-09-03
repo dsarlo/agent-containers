@@ -11,6 +11,7 @@ import {
 } from './real-helper-harness.js';
 import { HelperFrameType } from '../src/codespaces-protocol.js';
 import { executeRemoteCommand } from '../src/codespaces-transport.js';
+import { loadCommandStatus } from '../src/codespaces-command.js';
 import { transportFixture } from './transport-fixtures.js';
 import type { CommandEvent } from '../src/types.js';
 
@@ -389,6 +390,52 @@ test('real helper binary: stdin beyond the bounded queue reports an explicit err
     client.endStdin();
     client.kill();
   }
+});
+
+test('real helper binary: stdin overflow is caller-visible and never reconnects to report a truncated-input success (L4)', async (t: TestContext) => {
+  if (skipIfUnsupported(t)) return;
+  const data = await helperDataRoot();
+  try {
+    const fixture = await transportFixture({
+      spawner: createRealHelperSpawner(BIN as string, data),
+      runner: realBootstrapRunner(BIN as string, digestOf(process.arch === 'arm64' ? FIXTURE_ARM64 : FIXTURE_X64)),
+      reconnectBudgetMs: 5_000,
+    });
+    async function* oversizedInput() {
+      const bytes = new Uint8Array(64 * 1024).fill(65);
+      for (let index = 0; index < 80; index += 1) yield bytes;
+    }
+    await assert.rejects(async () => {
+      for await (const event of executeRemoteCommand(fixture.deps, {
+        commandId: COMMAND_ID, argv: ['sh', '-c', 'sleep 10'], mode: 'pipe', stdin: 'stream', stdinSource: oversizedInput(),
+      })) void event;
+    }, /bounded queue/);
+    assert.equal((await loadCommandStatus(fixture.stateDir, COMMAND_ID))?.state, 'outcome-unknown');
+  } finally {
+    killSpawnedRelays();
+  }
+});
+
+test('real helper binary: byte retention keeps a deterministic tail and attach does not duplicate that tail (N5)', async (t: TestContext) => {
+  if (skipIfUnsupported(t)) return;
+  const data = await helperDataRoot();
+  const client = new RealHelperProcess(BIN as string, data);
+  try {
+    await client.autoHello();
+    client.writeFrame(HelperFrameType.exec, {
+      command_id: COMMAND_ID, request_hash: 'h-retention', workspace_id: WORKSPACE_ID,
+      argv: ['sh', '-c', 'printf 1234567890'], mode: 'pipe', cwd: null, retention_bytes: 4,
+    });
+    await collectUntilExit(client);
+    assert.equal(requireF(data, WORKSPACE_ID, COMMAND_ID, 'stdout.log'), '7890');
+    const attach = new RealHelperProcess(BIN as string, data);
+    try {
+      await attach.autoHello();
+      attach.writeFrame(HelperFrameType.attach, { command_id: COMMAND_ID, request_hash: 'h-retention', workspace_id: WORKSPACE_ID, stdout_offset: '0', stderr_offset: '0', terminal_offset: '0' });
+      const events = await collectUntilExit(attach);
+      assert.equal(reassembleOutput(events, 'stdout').toString(), '7890');
+    } finally { attach.kill(); }
+  } finally { client.kill(); }
 });
 
 test('real helper binary: execute through the full backend transport yields the exact corpus output and exit (N2)', async (t: TestContext) => {

@@ -5,22 +5,22 @@
   "architectures": {
     "linux-x64": {
       "file": "agent-containers-helper-linux-x64",
-      "sha256": "7403d8a7b836aad3e46da558f061be22179cb757e376eba38985a32519ec2df7",
+      "sha256": "cf2bb918bec8312a892d493ffced0af964e9477610d4ced7cf9ad464cc70c7f4",
       "size": 867024,
       "mode": "0755"
     },
     "linux-arm64": {
       "file": "agent-containers-helper-linux-arm64",
-      "sha256": "87c3c5db004738cc6189ae55fb77e8b8b42ab39cd1e21d6bcb2e8ba377080118",
+      "sha256": "bce98534bf60ac55de3712f29e09752b0330bacce2723b4ba9c4700a20384ff2",
       "size": 731136,
       "mode": "0755"
     }
   },
   "sourcePins": {
-    "helper.c": "d17277fab4256b33503a8fc48dac8acacd3094fef546ba6581ca4e05076faefd",
+    "helper.c": "86ce8aee9523382fe7bb4c7e82c79a476ccc6eafc81846c782862c5d3cc4f575",
     "Makefile": "4eb1dc173337580a86c50e7ab9495d463c688df66f990c1f2ac4c35b426f643d"
   },
   "artifactsStaged": true,
-  "selfChecksum": "3627be8a9340f796fbe575ba9750a68ebcb83bc3785a59e07684fddef5c93bd5",
-  "generatedAt": "2026-09-03T00:48:21.967Z"
+  "selfChecksum": "820dd4d31af219a519286c923da4cafc6f782768f287213c2ff7024a2f94e843",
+  "generatedAt": "2026-09-03T01:13:00.218Z"
 }

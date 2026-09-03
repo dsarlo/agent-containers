@@ -13,7 +13,7 @@ import { loadCreateIntent, recordCreateIntent } from '../src/codespaces-ops.js';
 import { loadMetadata, saveMetadata, type CodespacesWorkspaceMetadata } from '../src/state.js';
 import { runCli } from '../src/cli.js';
 import { nodeProcessRunner } from '../src/workspaces.js';
-import { reconcileCodespacesWorkspace, startCodespacesWorkspace, stopCodespacesWorkspace } from '../src/codespaces-lifecycle.js';
+import { reconcileCodespacesWorkspace, removeCodespacesWorkspace, startCodespacesWorkspace, stopCodespacesWorkspace } from '../src/codespaces-lifecycle.js';
 import type { CodespacesAgentContainersConfig, ProcessRunner } from '../src/types.js';
 import { transportFixture, COMMAND_ID } from './transport-fixtures.js';
 
@@ -446,4 +446,43 @@ test('lifecycle stop/start uses exact identity, blocks active commands, and reco
   assert.equal(startedRecord.lifecycle.normalized, 'starting');
   assert.ok(calls.some((args) => args.includes('state=Shutdown')));
   assert.ok(calls.some((args) => args.includes('state=Running')));
+});
+
+test('Codespaces removal reads remote dirty and unpushed Git risk before deletion and requires its own data-loss acknowledgement', async () => {
+  const stateDir = join(await mkdtemp(join(tmpdir(), 'agent-containers-lifecycle-remove-risk-')), 'state');
+  const metadata = { ...recordedWorkspace(), lifecycle: { ...recordedWorkspace().lifecycle, activeOperation: null } };
+  await saveMetadata(stateDir, metadata, { expectedGeneration: null });
+  const calls: string[][] = [];
+  const runner: ProcessRunner = { async run(command, args) {
+    calls.push([command, ...args]);
+    if (args.includes('/user')) return { code: 0, stdout: JSON.stringify({ id: 1, login: 'octo' }), stderr: '' };
+    if (/^\/user\/codespaces\//.test(args.at(-1) ?? '') && args.includes('GET')) return { code: 0, stdout: JSON.stringify(resourceFixture()), stderr: '' };
+    if (command === 'gh' && args[0] === 'codespace' && args[1] === 'ssh') return { code: 0, stdout: '## agent-containers/issue-9...origin/agent-containers/issue-9 [ahead 2]\n M important.txt\n', stderr: '' };
+    if (/^\/user\/codespaces\//.test(args.at(-1) ?? '') && args.includes('DELETE')) return { code: 0, stdout: '', stderr: '' };
+    throw new Error(`unexpected lifecycle call ${JSON.stringify(args)}`);
+  } };
+  const deps = { stateDir, name: 'issue-9', config: configFixture(), provider: new GhCodespacesProvider(runner) };
+  await assert.rejects(() => removeCodespacesWorkspace(deps, false), /--force-remote-data-loss/);
+  await assert.rejects(() => removeCodespacesWorkspace(deps, true), /octo\/agent-containers.*agent-containers\/issue-9.*dirty.*unpushed/i);
+  assert.ok(calls.some((args) => args.join(' ').includes('git status --porcelain=v1 --branch')), 'remote Git state must be observed before deletion');
+  assert.equal(calls.some((args) => args.includes('DELETE')), false, 'remote risk refusal must not delete');
+});
+
+test('Codespaces removal tombstones an exact resource when DELETE reports 404', async () => {
+  const stateDir = join(await mkdtemp(join(tmpdir(), 'agent-containers-lifecycle-remove-404-')), 'state');
+  const metadata = { ...recordedWorkspace(), lifecycle: { ...recordedWorkspace().lifecycle, activeOperation: null } };
+  await saveMetadata(stateDir, metadata, { expectedGeneration: null });
+  const runner: ProcessRunner = { async run(command, args) {
+    if (args.includes('/user')) return { code: 0, stdout: JSON.stringify({ id: 1, login: 'octo' }), stderr: '' };
+    if (/^\/user\/codespaces\//.test(args.at(-1) ?? '') && args.includes('GET')) return { code: 0, stdout: JSON.stringify(resourceFixture()), stderr: '' };
+    if (command === 'gh' && args[0] === 'codespace' && args[1] === 'ssh') return { code: 0, stdout: '## agent-containers/issue-9...origin/agent-containers/issue-9\n', stderr: '' };
+    if (/^\/user\/codespaces\//.test(args.at(-1) ?? '') && args.includes('DELETE')) return { code: 1, stdout: '', stderr: 'HTTP 404: Not Found' };
+    throw new Error(`unexpected lifecycle call ${JSON.stringify(args)}`);
+  } };
+  const deps = { stateDir, name: 'issue-9', config: configFixture(), provider: new GhCodespacesProvider(runner) };
+  await removeCodespacesWorkspace(deps, true);
+  const tombstone = await loadMetadata(stateDir, 'issue-9');
+  assert.ok(tombstone && tombstone.version === 2 && tombstone.backend === 'codespaces');
+  assert.equal(tombstone.lifecycle.normalized, 'tombstoned');
+  assert.equal(tombstone.cleanup.remoteDeleted, true);
 });
