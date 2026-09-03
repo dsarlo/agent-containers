@@ -1,14 +1,14 @@
 import { GhCodespacesProvider } from './codespaces.js';
-import { runReadinessProbes, readinessGateDoctorChecks } from './codespaces-readiness.js';
 import { parseConfig } from './config.js';
+import { resolveDevcontainerInvocation } from './devcontainer.js';
 import { isCanonicalContainerId, loadManualRecovery, loadMetadata, type CodespacesWorkspaceMetadata } from './state.js';
 import { getProductionStateDurabilityAdapter } from './durability.js';
-import { helperArchForUname, helperRoot, inspectRemoteHelper, loadHelperManifest } from './codespaces-helper.js';
 import { redactSecretDiagnostic } from './secrets.js';
+import { assertSupportedDevcontainerConfig } from './runtime.js';
 import type { AgentContainersConfig, BackendKind, BackendSelection, DoctorCheck, DoctorReport, ProcessResult, ProcessRunner, SetupState } from './types.js';
 
 export interface CodespacesSetupEvidence { repository: string; requestedRef: string; expectedOid: string; devcontainerPath: string; devcontainerBlobOid: string }
-export interface DoctorOptions { abortSignal?: AbortSignal; timeoutMs?: number; stateDir?: string; workspaceName?: string }
+export interface DoctorOptions { abortSignal?: AbortSignal; timeoutMs?: number; stateDir?: string; workspaceName?: string; nodeVersion?: string }
 export interface DiscoveredProjectSetup { repository: string; ref: string; expectedOid: string; devcontainerPath: string }
 
 /** Discover only immutable Git-tree inputs suitable for first-project setup. */
@@ -79,7 +79,7 @@ export async function doctor(config: AgentContainersConfig, selection: BackendSe
   return { schemaVersion: 1, selectedBackends, overall: overall(checks), checks };
 }
 function configurationAction(): DoctorCheck {
-  return { id: 'configuration', backend: 'local', phase: 'pre-provision', state: 'action-required', summary: 'Configuration is missing, malformed, or inconsistent; no runtime probes were attempted.', remediation: ['Correct the strict Agent Containers configuration.', 'Run ac doctor again.'] };
+  return { id: 'configuration', backend: 'local', phase: 'pre-provision', status: 'fail', state: 'action-required', summary: 'Configuration is missing, malformed, or inconsistent; no runtime probes were attempted.', remediation: ['Correct the strict Agent Containers configuration.', 'Run ac doctor again.'] };
 }
 function select(config: AgentContainersConfig, selection: BackendSelection): BackendKind[] {
   const enabled: BackendKind[] = config.version === 1 ? ['local'] : config.backends.enabled;
@@ -93,8 +93,15 @@ async function localChecks(config: AgentContainersConfig, runner: ProcessRunner,
   const worktree = await attempt(runner, 'git', ['worktree', 'add', '-h'], root);
   const docker = await attempt(runner, 'docker', ['--version'], root);
   const dockerDaemon = docker?.code === 0 ? await attempt(runner, 'docker', ['info'], root) : undefined;
-  const devcontainer = await attempt(runner, 'devcontainer', ['--version'], root);
+  let devcontainer: ProcessResult | undefined;
+  try {
+    const invocation = resolveDevcontainerInvocation();
+    devcontainer = await attempt(runner, invocation.command, [...invocation.prefixArgs, '--version'], root);
+  } catch {
+    devcontainer = undefined;
+  }
   const configured = config.version === 1 || config.backends.enabled.includes('local');
+  const devcontainerChecks = await localDevcontainerChecks(config, runner, root);
   let durabilityReady = true;
   try { await getProductionStateDurabilityAdapter().assertStateWriteSupport(); } catch { durabilityReady = false; }
   const workspaceChecks: DoctorCheck[] = [];
@@ -131,16 +138,51 @@ async function localChecks(config: AgentContainersConfig, runner: ProcessRunner,
   }
   return [
     result('local.os', process.platform === 'win32' || process.platform === 'darwin' || process.platform === 'linux', 'Host OS is supported.', 'Host OS is unsupported.'),
+    result('local.node', supportsNodeEngine(options.nodeVersion ?? process.versions.node), `Node ${options.nodeVersion ?? process.versions.node} satisfies the package engine (>=20.19.0).`, `Node ${options.nodeVersion ?? process.versions.node} does not satisfy the package engine (>=20.19.0).`),
     result('local.git', git?.code === 0, 'Git is available.', 'Git is unavailable.'),
     result('local.repository', repository?.code === 0 && repository.stdout.trim() === 'true', 'Git repository is available.', 'Git repository cannot be verified.'),
-    result('local.worktree', Boolean(worktree && (worktree.code === 0 || worktree.code === 129) && /relative-paths/.test(`${worktree.stdout}${worktree.stderr}`)), 'Git worktree relative paths are supported.', 'Git worktree relative paths are unsupported.'),
+    result('local.worktree', Boolean(worktree && (worktree.code === 0 || worktree.code === 129) && /(?:^|\s)--(?:\[no-\])?relative-paths(?=\s|$)/m.test(`${worktree.stdout}\n${worktree.stderr}`)), 'Git worktree relative paths are supported.', 'Git worktree relative paths are unsupported.'),
     result('local.docker', docker?.code === 0 && dockerDaemon?.code === 0, 'Docker CLI and daemon are available.', docker?.code === 0 ? 'Docker daemon is unavailable.' : 'Docker CLI is unavailable.'),
     result('local.devcontainers', devcontainer?.code === 0, 'Dev Containers CLI is available.', 'Dev Containers CLI is unavailable.'),
     result('local.config', configured, 'Local backend is enabled by configuration.', 'Local backend is disabled by configuration.'),
+    ...devcontainerChecks,
+    unknown('local.path-sharing', 'Host-to-container path sharing cannot be proven without starting a container; no safe read-only probe is available.'),
     result('local.state.durability', durabilityReady, 'Packaged native durability capability is available (read-only probe).', 'Packaged native durability capability is unavailable; lifecycle writes remain blocked.'),
     ...workspaceChecks,
   ];
 }
+
+/** Matches package.json's Node >=20.19.0 engine without shelling out. */
+function supportsNodeEngine(version: string): boolean {
+  const match = /^(\d+)\.(\d+)\.(\d+)/.exec(version);
+  if (!match) return false;
+  const [major, minor, patch] = match.slice(1).map(Number);
+  return major > 20 || (major === 20 && (minor > 19 || (minor === 19 && patch >= 0)));
+}
+
+/** Inspect the configured Dev Container from the configured base commit, never from a mutable checkout. */
+async function localDevcontainerChecks(config: AgentContainersConfig, runner: ProcessRunner, root: string): Promise<DoctorCheck[]> {
+  const baseRef = `refs/heads/${config.workspace.baseBranch}`;
+  const branch = await attempt(runner, 'git', ['show-ref', '--verify', '--quiet', baseRef], root);
+  if (branch?.code !== 0) return [action('local.base', `Configured local base branch ${config.workspace.baseBranch} does not exist.`), action('local.devcontainer', 'Dev Container compatibility cannot be checked until the configured local base branch resolves.')];
+  const base = await attempt(runner, 'git', ['rev-parse', '--verify', `${baseRef}^{commit}`], root);
+  const oid = base?.code === 0 && /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(base.stdout.trim()) ? base.stdout.trim() : undefined;
+  if (!oid) return [action('local.base', `Configured base branch ${config.workspace.baseBranch} cannot be resolved to a commit.`), action('local.devcontainer', 'Dev Container compatibility cannot be checked until the configured base branch resolves.')];
+  const path = config.environment.devcontainerPath;
+  const tree = await attempt(runner, 'git', ['ls-tree', '-r', '-z', oid, '--', path], root);
+  const expectedEntry = `${path}`;
+  const committed = tree?.code === 0 && tree.stdout.split('\0').some((entry) => /^(100644|100755) blob [0-9a-f]{40,64}\t/.test(entry) && entry.endsWith(`\t${expectedEntry}`));
+  if (!committed) return [ready('local.base', `Configured base branch ${config.workspace.baseBranch} resolves to ${oid}.`), action('local.devcontainer', `Configured Dev Container ${path} is not a regular file tracked on ${config.workspace.baseBranch}.`)];
+  const source = await attempt(runner, 'git', ['show', `${oid}:${path}`], root);
+  if (source?.code !== 0) return [ready('local.base', `Configured base branch ${config.workspace.baseBranch} resolves to ${oid}.`), action('local.devcontainer', `Committed Dev Container ${path} could not be read from ${config.workspace.baseBranch}.`)];
+  try {
+    await assertSupportedDevcontainerConfig(`${oid}:${path}`, async () => source.stdout);
+    return [ready('local.base', `Configured base branch ${config.workspace.baseBranch} resolves to ${oid}.`), ready('local.devcontainer', `Committed Dev Container ${path} is parseable and supported by v0.1.`)];
+  } catch (error: unknown) {
+    return [ready('local.base', `Configured base branch ${config.workspace.baseBranch} resolves to ${oid}.`), action('local.devcontainer', redactSecretDiagnostic(error instanceof Error ? error.message : String(error)))];
+  }
+}
+
 async function codespacesChecks(config: AgentContainersConfig, runner: ProcessRunner, root: string, options: DoctorOptions): Promise<DoctorCheck[]> {
   const v2 = config.version === 2 ? config : undefined;
   const gh = await attempt(runner, 'gh', ['--version'], root);
@@ -170,10 +212,7 @@ async function codespacesChecks(config: AgentContainersConfig, runner: ProcessRu
       } else if (normalized === 'stopped' || normalized === 'deleted') {
         workspaceChecks.push(action('codespaces.workspace.runtime', `Workspace ${options.workspaceName} is ${normalized}; doctor never starts or restores a stopped Codespace.`, 'provisioned-runtime'));
       } else if (v2) {
-        const report = await observe(() => runReadinessProbes({ stateDir: options.stateDir!, name: options.workspaceName!, provider, config: v2, loadMetadata }));
-        if (report.error) workspaceChecks.push(action('codespaces.workspace.runtime', 'Provisioned-runtime readiness probes could not complete; no repair or restart was attempted.', 'provisioned-runtime'));
-        else workspaceChecks.push(...readinessGateDoctorChecks(record, report.value));
-        workspaceChecks.push(await remoteHelperDoctorCheck(provider, record));
+        workspaceChecks.push(...readonlyCodespacesRuntimeChecks());
       }
     }
   }
@@ -187,38 +226,25 @@ async function codespacesChecks(config: AgentContainersConfig, runner: ProcessRu
     defaults ? { ...ready('codespaces.owner-billing', 'Documented default billable owner and location were read.'), evidence: { billableOwner: defaults.billableOwner.login, defaultLocation: defaults.location, defaultDevcontainerPath: defaults.devcontainerPath } } : action('codespaces.owner-billing', 'Documented default billable owner and location could not be read.'),
     result('codespaces.machine', Boolean(selectedMachine), 'Configured machine appears in provider inventory.', 'Configured machine is absent from provider inventory.'),
     result('codespaces.geo', Boolean(geoEligible), v2?.backends.codespaces.geo === 'auto' ? 'geo:auto uses the documented default location.' : 'Configured geo is eligible for selected machine.', 'Configured geo is not eligible for selected machine.'),
-    action('codespaces.ports', 'Port policy is unavailable because no documented read-only endpoint proves it.'),
-    action('codespaces.secrets', 'Secret policy is unavailable because no documented read-only endpoint proves it.'),
-    action('codespaces.ssh-key', 'A pre-existing SSH key/config is required later and was not inspected.'),
+    unknown('codespaces.ports', 'Port policy is unavailable because no documented read-only endpoint proves it.'),
+    unknown('codespaces.secrets', 'Secret policy is unavailable because no documented read-only endpoint proves it.'),
+    unknown('codespaces.ssh-key', 'A pre-existing SSH key/config is required later and was not inspected.'),
     ...workspaceChecks,
   ];
 }
-/**
- * Read-only provisioned-runtime helper check: verifies the exact recorded
- * Codespace's installed helper digest/owner/mode/path/protocol against the
- * package-owned pinned artifact. Never copies, never repairs, and never falls
- * back to an arbitrary download.
- */
-async function remoteHelperDoctorCheck(provider: GhCodespacesProvider, record: CodespacesWorkspaceMetadata): Promise<DoctorCheck> {
-  const root = helperRoot();
-  try {
-    const manifest = await loadHelperManifest(root);
-    if (!manifest.artifactsStaged) {
-      return action('codespaces.runtime.helper', 'The package-owned remote helper artifacts are not staged in this package; execution is unavailable until the pinned helper-artifacts build stages them. Doctor performs read-only checks only.', 'provisioned-runtime');
-    }
-    const uname = (await provider.remoteSshProbe(record.remote.name, ['uname', '-m'], {})).trim();
-    const arch = helperArchForUname(uname);
-    if (!arch) return action('codespaces.runtime.helper', `The remote architecture ${uname} has no package-owned helper artifact; execution is unsupported.`, 'provisioned-runtime');
-    await inspectRemoteHelper({
-      stateDir: '', workspaceName: record.name, workspaceId: record.workspaceId, remoteName: record.remote.name,
-      provider, root, verifyKnown: true,
-    }, arch, `agent-containers-helper-${arch}`);
-    return { ...ready('codespaces.runtime.helper', 'The installed remote helper matches the package-owned pinned artifact (digest, owner, mode, path, and protocol).'), phase: 'provisioned-runtime' };
-  } catch (error: unknown) {
-    return action('codespaces.runtime.helper', `The remote helper is not verified for this exact recorded Codespace (${redactSecretDiagnostic(error instanceof Error ? error.message : String(error))}); doctor performs read-only verification only and never installs or repairs it.`, 'provisioned-runtime');
-  }
-}
 
+/** Codespaces runtime access uses gh codespace ssh, which may create a local key. Doctor therefore reports these facts as unknown rather than executing remote commands. */
+function readonlyCodespacesRuntimeChecks(): readonly DoctorCheck[] {
+  return [
+    unknown('codespaces.runtime.provider', 'The recorded Codespace is not remotely probed by doctor.' , 'provisioned-runtime'),
+    unknown('codespaces.runtime.readback', 'Remote runtime readback is not performed by doctor.', 'provisioned-runtime'),
+    unknown('codespaces.runtime.repository', 'Repository identity requires remote SSH and is not probed by doctor.', 'provisioned-runtime'),
+    unknown('codespaces.runtime.creation-logs', 'Creation logs for the recorded runtime are not read by doctor.', 'provisioned-runtime'),
+    unknown('codespaces.runtime.ssh', 'SSH reachability is not probed because gh may create a local key.', 'provisioned-runtime'),
+    unknown('codespaces.runtime.readiness-command', 'Configured readiness argv is not run by doctor.', 'provisioned-runtime'),
+    unknown('codespaces.runtime.helper', 'Installed helper verification requires remote SSH and is not run by doctor.', 'provisioned-runtime'),
+  ];
+}
 function boundedRunner(runner: ProcessRunner, options: DoctorOptions): ProcessRunner {
   return { run: async (command, args, runOptions) => {
     if (options.abortSignal?.aborted) throw new Error('Doctor operation aborted.');
@@ -244,6 +270,7 @@ async function attempt(runner: ProcessRunner, command: string, args: string[], c
 async function attemptValue<T>(operation: () => Promise<T>): Promise<T | undefined> { try { return await operation(); } catch { return undefined; } }
 async function observe<T>(operation: () => Promise<T>): Promise<{ value: T; error?: undefined } | { value?: undefined; error: true }> { try { return { value: await operation() }; } catch { return { error: true }; } }
 function result(id: string, ok: boolean, yes: string, no: string): DoctorCheck { return ok ? ready(id, yes) : action(id, no); }
-function ready(id: string, summary: string): DoctorCheck { return { id, backend: id.startsWith('local.') ? 'local' : 'codespaces', phase: 'pre-provision', state: 'ready', summary, remediation: [] }; }
-function action(id: string, summary: string, phase: 'pre-provision' | 'provisioned-runtime' = 'pre-provision'): DoctorCheck { return { id, backend: id.startsWith('local.') ? 'local' : 'codespaces', phase, state: 'action-required', summary, remediation: [`Correct ${id} prerequisite.`, `Run ac doctor --backend ${id.startsWith('local.') ? 'local' : 'codespaces'} again.`] }; }
+function ready(id: string, summary: string): DoctorCheck { return { id, backend: id.startsWith('local.') ? 'local' : 'codespaces', phase: 'pre-provision', status: 'pass', state: 'ready', summary, remediation: [] }; }
+function unknown(id: string, summary: string, phase: 'pre-provision' | 'provisioned-runtime' = 'pre-provision'): DoctorCheck { return { id, backend: id.startsWith('local.') ? 'local' : 'codespaces', phase, status: 'unknown', state: 'action-required', summary, remediation: ['Complete a real workspace startup to verify this observation.', `Run ac doctor --backend ${id.startsWith('local.') ? 'local' : 'codespaces'} again.`] }; }
+function action(id: string, summary: string, phase: 'pre-provision' | 'provisioned-runtime' = 'pre-provision'): DoctorCheck { return { id, backend: id.startsWith('local.') ? 'local' : 'codespaces', phase, status: 'fail', state: 'action-required', summary, remediation: [`Correct ${id} prerequisite.`, `Run ac doctor --backend ${id.startsWith('local.') ? 'local' : 'codespaces'} again.`] }; }
 function overall(checks: readonly DoctorCheck[]): SetupState { return checks.some((check) => check.state === 'unsupported') ? 'unsupported' : checks.some((check) => check.state === 'action-required') ? 'action-required' : 'ready'; }

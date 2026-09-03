@@ -13,6 +13,7 @@ export interface LocalAgentContainersConfig {
 export type BackendKind = 'local' | 'codespaces';
 export type BackendSelection = BackendKind | 'both';
 export type SetupState = 'ready' | 'action-required' | 'unsupported';
+export type DoctorCheckStatus = 'pass' | 'fail' | 'unknown';
 export type DoctorPhase = 'pre-provision' | 'provisioned-runtime';
 
 /** Independently observable readiness gate as yielded by the Codespaces backend. */
@@ -99,6 +100,8 @@ export interface DoctorCheck {
   id: string;
   backend: BackendKind;
   phase: DoctorPhase;
+  /** Stable machine-readable result: pass, fail, or unknown. */
+  status: DoctorCheckStatus;
   state: SetupState;
   summary: string;
   remediation: readonly string[];
