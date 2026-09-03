@@ -252,24 +252,24 @@ export async function runCli(args: string[], cwd = process.cwd(), write: (messag
       case 'list': {
         ensureOnly(rest, ['--json', '--probe']);
         const entries = await inventoryWorkspaces(stateDir, nodeProcessRunner, { probe: rest.includes('--probe') });
-        write(rest.includes('--json') ? JSON.stringify(entries, null, 2) : renderInventory(entries));
+        write(rest.includes('--json') ? JSON.stringify(redactConfig(entries), null, 2) : renderInventory(redactConfig(entries) as WorkspaceInventory[]));
         return 0;
       }
       case 'stale': {
         ensureOptions(rest, ['--older-than']);
         const olderThan = optionValue(rest, '--older-than') ?? '30d';
         const entries = staleCandidates(await inventoryWorkspaces(stateDir, nodeProcessRunner), parseStaleDuration(olderThan));
-        write(renderInventory(entries));
+        write(renderInventory(redactConfig(entries) as WorkspaceInventory[]));
         return 0;
       }
       case 'status': {
         const names = rest.filter((value) => !value.startsWith('--'));
         if (names.length > 1 || rest.some((value) => value.startsWith('--') && value !== '--probe')) throw new UsageError('Usage: agent-containers status [name] [--probe]');
         if (rest.includes('--probe')) {
-          const entries = await inventoryWorkspaces(stateDir, nodeProcessRunner, { probe: true });
-          const selected = names[0] ? entries.filter((entry) => entry.name === names[0]) : entries;
+          const entries = await inventoryWorkspaces(stateDir, nodeProcessRunner, { probe: true, names });
+          const selected = entries;
           if (names[0] && selected.length === 0) throw new Error(`No Agent Containers workspace named "${names[0]}".`);
-          write(JSON.stringify(selected, null, 2));
+          write(JSON.stringify(redactConfig(selected), null, 2));
           return 0;
         }
         const entries = names[0] ? [await loadMetadata(stateDir, names[0])] : await listMetadata(stateDir);
@@ -380,7 +380,7 @@ async function* executeWithInterruptRelay(backend: ExecutionBackend, handle: Wor
 
 function renderInventory(entries: readonly WorkspaceInventory[]): string {
   if (entries.length === 0) return 'No managed workspaces.';
-  return entries.map((entry) => `${entry.name}\t${entry.backend}\tworktree=${entry.worktree.state}\tcontainer=${entry.container.state}\tlock=${entry.lock}\trecovery=${entry.recovery}`).join('\n');
+  return entries.map((entry) => `${entry.name}\t${entry.backend}\tbranch=${entry.branch ?? '-'}\tbase=${entry.base ?? '-'}\tworktree=${entry.worktree.path ?? '-'}:${entry.worktree.state}\tcontainer=${entry.container.state}\tcreated=${entry.createdAt}\tactivity=${entry.activityAt}\tlock=${entry.lock}\trecovery=${entry.recovery}\tcleanup=${JSON.stringify(entry.cleanup)}`).join('\n');
 }
 
 function parseStaleDuration(value: string): number {

@@ -21,7 +21,7 @@ test('inventory reports dirty worktrees, manual recovery, and only read-only pro
   await saveMetadata(stateDir, entry, { expectedGeneration: null });
   await recordManualRecovery(stateDir, entry.name, { reason: 'operation-may-be-active', containerIds: [id], worktree: entry.worktree });
   const calls: string[] = [];
-  const runner = { async run(command: string, args: string[]) { calls.push([command, ...args].join(' ')); if (command === 'git' && args[0] === 'status') return { code: 0, stdout: '?? report.txt\n', stderr: '' }; if (command === 'docker' && args[0] === 'inspect') return { code: 0, stdout: `${id}\n${entry.worktree}\n`, stderr: '' }; return { code: 0, stdout: '', stderr: '' }; } };
+  const runner = { async run(command: string, args: string[]) { calls.push([command, ...args].join(' ')); if (command === 'git' && args[1] === 'status') return { code: 0, stdout: '?? report.txt\n', stderr: '' }; if (command === 'docker' && args[0] === 'inspect') return { code: 0, stdout: `${id}\n${entry.worktree}\n`, stderr: '' }; return { code: 0, stdout: '', stderr: '' }; } };
   const [observed] = await inventoryWorkspaces(stateDir, runner, { probe: true });
   assert.equal(observed.worktree.state, 'dirty');
   assert.equal(observed.recovery, 'required');
