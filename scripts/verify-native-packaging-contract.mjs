@@ -8,6 +8,8 @@ import { parse } from 'yaml';
 const defaultRepository = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const repository = resolve(process.env.NATIVE_PACKAGING_CONTRACT_ROOT ?? defaultRepository);
 const packageJson = JSON.parse(await readFile(resolve(repository, 'package.json'), 'utf8'));
+const devcontainerPath = resolve(repository, '.devcontainer/devcontainer.json');
+const devcontainer = JSON.parse(await readFile(devcontainerPath, 'utf8'));
 const workflowPath = resolve(repository, '.github/workflows/ci.yml');
 const workflow = await readFile(workflowPath, 'utf8');
 const workflowDefinition = parse(workflow);
@@ -190,8 +192,17 @@ function assertSupplyChainControls() {
   }
 }
 
+function assertDevcontainerSupplyChainControls() {
+  assert.equal(
+    devcontainer.postCreateCommand,
+    'npm ci --ignore-scripts',
+    'Dev Container post-create setup must install locked dependencies with lifecycle scripts disabled',
+  );
+}
+
 assertPinnedActions();
 assertSupplyChainControls();
+assertDevcontainerSupplyChainControls();
 
 assert.ok(packageJson.files.includes('prebuilds'), 'published files must include bundled native prebuilds');
 assert.ok(packageJson.scripts['native:verify-prebuilds'], 'package must verify all bundled prebuilds before packing');

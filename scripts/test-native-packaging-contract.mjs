@@ -156,11 +156,14 @@ const allSupportedArchitectures = [
   { runner: 'windows-11-arm', artifact: 'win32-arm64', publicationMode: 'recoverable' },
 ];
 
-async function writeFixture(workflow) {
+async function writeFixture(workflow, devcontainerPostCreateCommand = 'npm ci --ignore-scripts') {
   const workflowDirectory = join(fixtureRoot, '.github', 'workflows');
+  const devcontainerDirectory = join(fixtureRoot, '.devcontainer');
   await mkdir(workflowDirectory, { recursive: true });
+  await mkdir(devcontainerDirectory, { recursive: true });
   await writeFile(join(fixtureRoot, 'package.json'), `${JSON.stringify(requiredPackage, null, 2)}\n`, 'utf8');
   await writeFile(join(workflowDirectory, 'ci.yml'), workflow, 'utf8');
+  await writeFile(join(devcontainerDirectory, 'devcontainer.json'), `${JSON.stringify({ postCreateCommand: devcontainerPostCreateCommand }, null, 2)}\n`, 'utf8');
 }
 
 function verifyFixture() {
@@ -195,6 +198,14 @@ try {
     pinnedActionsResult.status,
     0,
     `the static packaging contract must accept full immutable actions/* commit SHAs with adjacent action/version comments:\n${pinnedActionsResult.output}`,
+  );
+
+  await writeFixture(workflowFor(allSupportedArchitectures), 'npm ci');
+  const unsafeDevcontainerInstallResult = verifyFixture();
+  assert.notEqual(
+    unsafeDevcontainerInstallResult.status,
+    0,
+    'the static packaging contract must reject a Dev Container post-create npm ci command that enables dependency lifecycle scripts',
   );
 
   await writeFixture(workflowFor(allSupportedArchitectures, '.', packageArchiveDirectory, '', legacyV4ActionRefs));
