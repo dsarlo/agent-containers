@@ -57,7 +57,7 @@ async function inspectContainer(id: string | undefined, worktree: string, runner
   if (!probe) return 'unprobed';
   const signal = AbortSignal.timeout(5_000);
   try {
-    const candidates = await runner.run('docker', ['ps', '-a', '--filter', `label=devcontainer.local_folder=${worktree}`, '--format', '{{.ID}}'], { kind: 'readonly-probe', signal });
+    const candidates = await runner.run('docker', ['ps', '-a', '--no-trunc', '--filter', `label=devcontainer.local_folder=${worktree}`, '--format', '{{.ID}}'], { kind: 'readonly-probe', signal });
     if (candidates.code !== 0) return 'unknown';
     const observed = terminalLines(candidates.stdout);
     if (observed.length === 0) return 'missing';
