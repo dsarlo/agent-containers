@@ -446,6 +446,42 @@ test('real helper binary: byte retention rejects evicted offsets and resumes its
   } finally { client.kill(); }
 });
 
+test('real helper binary: a running attach fails closed when retention evicts its live continuation (R4)', async (t: TestContext) => {
+  if (skipIfUnsupported(t)) return;
+  const data = await helperDataRoot();
+  const first = new RealHelperProcess(BIN as string, data);
+  try {
+    await first.autoHello();
+    first.writeFrame(HelperFrameType.exec, {
+      command_id: COMMAND_ID, request_hash: 'h-retention-live-tail', workspace_id: WORKSPACE_ID,
+      argv: ['sh', '-c', 'printf 1234567890; sleep 3; printf ABCDEF'], mode: 'pipe', cwd: null, retention_bytes: 4,
+    });
+    await first.until((event) => event.kind === 'output', 5000);
+    first.endStdin();
+    await sleep(80);
+
+    const attach = new RealHelperProcess(BIN as string, data);
+    try {
+      await attach.autoHello();
+      attach.writeFrame(HelperFrameType.attach, {
+        command_id: COMMAND_ID, request_hash: 'h-retention-live-tail', workspace_id: WORKSPACE_ID,
+        stdout_offset: '10', stderr_offset: '0', terminal_offset: '0',
+      });
+      const events = await collectTerminal(attach, 8000);
+      assert.equal(reassembleOutput(events, 'stdout').toString(), '', 'the attach must not claim evicted continuation bytes were delivered');
+      assert.equal(events.some((event) => event.kind === 'exit'), false, 'an attach with an evicted continuation must not exit cleanly');
+      const failure = events.find((event) => event.kind === 'error');
+      assert.equal(failure?.message, 'attach-output-lost');
+    } finally { attach.kill(); }
+
+    const status = JSON.parse(requireF(data, WORKSPACE_ID, COMMAND_ID, 'status.json'));
+    assert.equal(status.stdout_offset, 16, 'the durable logical end must include the evicted continuation');
+  } finally {
+    groupKill(data, WORKSPACE_ID, COMMAND_ID);
+    first.kill();
+  }
+});
+
 test('real helper binary: a live chunk larger than retention reaches executeRemoteCommand intact and exits durably (N5)', async (t: TestContext) => {
   if (skipIfUnsupported(t)) return;
   const data = await helperDataRoot();

@@ -1235,21 +1235,6 @@ static int open_retained_log_at(const char *dir, const char *name, uint64_t from
   return fd;
 }
 
-/* Open a log positioned at its physical file offset for the live tail. */
-static int open_log_at(const char *dir, const char *name, uint64_t from, uint64_t *end) {
-  char path[AC_FPATH];
-  snprintf(path, sizeof(path), "%s/%s", dir, name);
-  int fd = open(path, O_RDONLY);
-  if (fd < 0) return -1;
-  struct stat st;
-  if (fstat(fd, &st) != 0) { close(fd); return -1; }
-  uint64_t size = (uint64_t)st.st_size;
-  if (from > size) { close(fd); return -1; }
-  *end = size;
-  if (lseek(fd, (off_t)from, SEEK_SET) < 0) { close(fd); return -1; }
-  return fd;
-}
-
 /* Emit every retained byte from the current position of an open log fd. */
 static void emit_log_remaining(uint8_t stream, uint64_t from, uint64_t end, int fd) {
   unsigned char buf[65536];
@@ -1381,13 +1366,42 @@ static void handle_attach(struct ac_frame *frame, int grace_ms) {
     memset(&q, 0, sizeof(q));
     int transport_open = 1;
     for (;;) {
+      uint64_t durable_stdout_end = 0;
+      uint64_t durable_stderr_end = 0;
+      uint64_t durable_terminal_end = 0;
+      if (!load_status_offsets(workspace_id, command_id, &durable_stdout_end, &durable_stderr_end, &durable_terminal_end)) {
+        free(q.buf);
+        emit_jsonf(AC_E_ERROR, "{\"command_id\":\"%s\",\"message\":\"attach-output-lost\"}", command_id);
+        return;
+      }
       uint64_t e = 0;
-      int fd = open_log_at(dir, "stdout.log", stdout_end, &e);
-      if (fd >= 0) { emit_log_remaining(AC_OUTPUT_STDOUT, stdout_end, e, fd); close(fd); stdout_end = e; }
-      fd = open_log_at(dir, "stderr.log", stderr_end, &e);
-      if (fd >= 0) { emit_log_remaining(AC_OUTPUT_STDERR, stderr_end, e, fd); close(fd); stderr_end = e; }
-      fd = open_log_at(dir, "terminal.log", terminal_end, &e);
-      if (fd >= 0) { emit_log_remaining(AC_OUTPUT_TERMINAL, terminal_end, e, fd); close(fd); terminal_end = e; }
+      int fd = open_retained_log_at(dir, "stdout.log", stdout_end, durable_stdout_end, &e);
+      if (fd < 0) {
+        free(q.buf);
+        emit_jsonf(AC_E_ERROR, "{\"command_id\":\"%s\",\"message\":\"attach-output-lost\"}", command_id);
+        return;
+      }
+      emit_log_remaining(AC_OUTPUT_STDOUT, stdout_end, e, fd);
+      close(fd);
+      stdout_end = e;
+      fd = open_retained_log_at(dir, "stderr.log", stderr_end, durable_stderr_end, &e);
+      if (fd < 0) {
+        free(q.buf);
+        emit_jsonf(AC_E_ERROR, "{\"command_id\":\"%s\",\"message\":\"attach-output-lost\"}", command_id);
+        return;
+      }
+      emit_log_remaining(AC_OUTPUT_STDERR, stderr_end, e, fd);
+      close(fd);
+      stderr_end = e;
+      fd = open_retained_log_at(dir, "terminal.log", terminal_end, durable_terminal_end, &e);
+      if (fd < 0) {
+        free(q.buf);
+        emit_jsonf(AC_E_ERROR, "{\"command_id\":\"%s\",\"message\":\"attach-output-lost\"}", command_id);
+        return;
+      }
+      emit_log_remaining(AC_OUTPUT_TERMINAL, terminal_end, e, fd);
+      close(fd);
+      terminal_end = e;
       int wstatus = 0;
       if (waitpid(run.pid, &wstatus, WNOHANG) == run.pid) {
         int code = WIFEXITED(wstatus) ? WEXITSTATUS(wstatus) : (WIFSIGNALED(wstatus) ? 128 + WTERMSIG(wstatus) : 1);
