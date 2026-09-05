@@ -16,6 +16,7 @@ import {
   type RemoteHelperBootstrapDependencies,
 } from '../src/codespaces-helper.js';
 import { HELPER_PROTOCOL_VERSION } from '../src/codespaces-protocol.js';
+import { decodedRemoteSshArgv } from './transport-fixtures.js';
 
 const WORKSPACE_NAME = 'issue-9';
 const WORKSPACE_ID = '00000000-0000-4000-8000-000000000001';
@@ -68,14 +69,15 @@ function bootstrapProcess(options: { overrides?: SshOverrides; onArgs?: (args: s
   return {
     async run(command, args, runOptions) {
       assert.equal(command, 'gh');
-      options.onArgs?.(args, runOptions);
+      const decodedArgs = [...args.slice(0, args.indexOf('--') + 1), ...decodedRemoteSshArgv(args)];
+      options.onArgs?.(decodedArgs, runOptions);
       const trailing = args.join(' ');
       if (!trailing.startsWith('codespace ssh -c bookish-space-parakeet -- ')) throw new Error(`unrouted ssh argv: ${JSON.stringify(args)}`);
       if (options.mutateSsh) {
-        const mutated = options.mutateSsh(args);
+        const mutated = options.mutateSsh(decodedArgs);
         if (mutated !== undefined) return { code: mutated.code, stdout: mutated.stdout ?? '', stderr: mutated.stderr ?? '' };
       }
-      const remote = args.slice(args.indexOf('--') + 1);
+      const remote = decodedRemoteSshArgv(args);
       const argv = remote.join(' ');
       if (argv === 'uname -m') return { code: 0, stdout: `${overrides.uname ?? 'x86_64'}\n`, stderr: '' };
       if (argv === 'id -u') return { code: 0, stdout: `${overrides.uid ?? '1000'}\n`, stderr: '' };

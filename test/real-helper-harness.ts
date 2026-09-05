@@ -11,6 +11,7 @@ import {
   type HelperFrame, type OutputStreamName,
 } from '../src/codespaces-protocol.js';
 import type { FramedChildProcess, SshSpawner } from '../src/codespaces-transport.js';
+import { decodedRemoteSshArgv } from './transport-fixtures.js';
 
 /**
  * Real-binary harness (N2): drives the committed static helper artifact over
@@ -207,7 +208,7 @@ export function realBootstrapRunner(binPath: string, remoteDigest: string): Code
     async run(command, args, runOptions) {
       assert.equal(command, 'gh');
       if (!args.join(' ').startsWith('codespace ssh -c ')) throw new Error(`unrouted bootstrap argv: ${JSON.stringify(args)}`);
-      const remote = args.slice(args.indexOf('--') + 1);
+      const remote = decodedRemoteSshArgv(args);
       const argv = remote.join(' ');
       if (argv === 'uname -m') return { code: 0, stdout: `${realHelperBinaryPath()?.includes('arm64') ? 'aarch64' : 'x86_64'}\n`, stderr: '' };
       if (argv === 'id -u') return { code: 0, stdout: '1000\n', stderr: '' };

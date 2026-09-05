@@ -91,6 +91,32 @@ export function recordedWorkspace(): CodespacesWorkspaceMetadata {
   };
 }
 
+export function decodedRemoteSshArgv(args: readonly string[]): string[] {
+  const separator = args.indexOf('--');
+  if (separator < 0) throw new Error('SSH fixture argv is missing its separator.');
+  const remote = args.slice(separator + 1);
+  if (remote.length !== 1) return [...remote];
+  const encoded = remote[0] ?? '';
+  const values: string[] = [];
+  let index = 0;
+  while (index < encoded.length) {
+    if (encoded[index] !== "'") throw new Error(`SSH fixture command is not POSIX-quoted: ${encoded}`);
+    index += 1;
+    let value = '';
+    while (index < encoded.length) {
+      if (encoded.startsWith("'\"'\"'", index)) { value += "'"; index += 5; continue; }
+      if (encoded[index] === "'") { index += 1; break; }
+      value += encoded[index] ?? '';
+      index += 1;
+    }
+    values.push(value);
+    if (index === encoded.length) break;
+    if (encoded[index] !== ' ') throw new Error(`SSH fixture command has an invalid separator: ${encoded}`);
+    index += 1;
+  }
+  return values;
+}
+
 /** Provider runner that serves every fixed helper bootstrap probe for a fixture root. */
 export function helperBootstrapRunner(overrides: { uname?: string; sha256For?: (path: string) => string; statFor?: (path: string) => string; handshake?: string } = {}): CodespacesProviderProcess {
   const x64Digest = digest(FIXTURE_X64);
@@ -98,7 +124,7 @@ export function helperBootstrapRunner(overrides: { uname?: string; sha256For?: (
     async run(command, args, runOptions) {
       assert.equal(command, 'gh');
       if (!args.join(' ').startsWith(`codespace ssh -c ${REMOTE_NAME} -- `)) throw new Error(`unrouted bootstrap argv: ${JSON.stringify(args)}`);
-      const remote = args.slice(args.indexOf('--') + 1);
+      const remote = decodedRemoteSshArgv(args);
       const argv = remote.join(' ');
       if (argv === 'uname -m') return { code: 0, stdout: `${overrides.uname ?? 'x86_64'}\n`, stderr: '' };
       if (argv === 'id -u') return { code: 0, stdout: '1000\n', stderr: '' };

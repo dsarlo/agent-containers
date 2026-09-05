@@ -204,10 +204,12 @@ export class GhCodespacesProvider {
   }
 
   /**
-   * Bounded, argv-framed `gh codespace ssh` transport for a package-owned
-   * remote command. An optional binary stdin payload (for example the helper
-   * copy stream) is written before the child closes; stdout is returned as the
-   * bounded result. No user argv is ever concatenated into a remote shell.
+   * Bounded `gh codespace ssh` transport for a package-owned remote command.
+   * GitHub CLI ultimately passes a remote command through SSH's shell boundary,
+   * so serialize validated argv as one POSIX-quoted command token. An optional
+   * binary stdin payload (for example the helper copy stream) is written before
+   * the child closes; stdout is returned as the bounded result. User execution
+   * argv stays inside the helper's framed protocol, never in this shell form.
    */
   async remoteCommand(name: string, command: readonly string[], options: { timeoutMs?: number; signal?: AbortSignal; input?: Uint8Array; kind?: ProcessRunOptions['kind'] } = {}): Promise<string> {
     if (!safeName(name)) throw new Error('Invalid Codespaces name.');
@@ -219,7 +221,8 @@ export class GhCodespacesProvider {
     options.signal?.addEventListener('abort', () => controller.abort(), { once: true });
     if (options.signal?.aborted) controller.abort();
     try {
-      const result = await this.process.run('gh', ['codespace', 'ssh', '-c', name, '--', ...command], { ...runOptions, signal: controller.signal });
+      const remoteCommand = command.map(posixShellQuote).join(' ');
+      const result = await this.process.run('gh', ['codespace', 'ssh', '-c', name, '--', remoteCommand], { ...runOptions, signal: controller.signal });
       if (result.code !== 0) throw providerError('ssh', name, result);
       return result.stdout;
     } finally {
@@ -375,6 +378,8 @@ function losslessId(value: unknown): boolean { return (typeof value === 'number'
 function positiveInteger(value: unknown): value is number { return typeof value === 'number' && Number.isSafeInteger(value) && value > 0; }
 function nullablePositiveInteger(value: unknown): value is number | null { return value === null || positiveInteger(value); }
 function safeName(value: unknown): value is string { return typeof value === 'string' && /^[A-Za-z0-9-]+$/.test(value) && !secretShaped(value); }
+/** Serialize one validated argv token for the remote POSIX shell used by gh SSH. */
+function posixShellQuote(value: string): string { return `'${value.replaceAll("'", "'\"'\"'")}'`; }
 function oid(value: unknown): value is string { return typeof value === 'string' && /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(value); }
 function safeRef(value: string): boolean { return !secretShaped(value) && /^refs\/(?:heads|tags)\/(?:[A-Za-z0-9][A-Za-z0-9._-]*)(?:\/[A-Za-z0-9][A-Za-z0-9._-]*)*$/.test(value) && !value.includes('..') && !value.split('/').some((part) => part.endsWith('.') || part.endsWith('.lock')); }
 function safeRepositoryPath(value: unknown): value is string { return typeof value === 'string' && !secretShaped(value) && value.length > 0 && !/[\0\r\n]/.test(value) && !value.startsWith('/') && !value.split('/').some((part) => !part || part === '.' || part === '..'); }

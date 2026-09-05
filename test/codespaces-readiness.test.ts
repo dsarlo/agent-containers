@@ -9,6 +9,7 @@ import { GhCodespacesProvider } from '../src/codespaces.js';
 import { recordCreateIntent } from '../src/codespaces-ops.js';
 import { loadMetadata, saveMetadata, type CodespacesWorkspaceMetadata } from '../src/state.js';
 import type { CodespacesAgentContainersConfig, ProcessRunner } from '../src/types.js';
+import { decodedRemoteSshArgv } from './transport-fixtures.js';
 
 const OID = '0123456789abcdef0123456789abcdef01234567';
 const BLOB = '1234567890abcdef1234567890abcdef12345678';
@@ -82,7 +83,10 @@ async function probeContext(options: ProbeOptions = {}) {
   const dispatch: string[][] = [];
   const run: ProcessRunner['run'] = async (command, args) => {
     dispatch.push(args);
-    const key = ['gh', ...args].join(' ');
+    const separator = args.indexOf('--');
+    const key = command === 'gh' && args[0] === 'codespace' && args[1] === 'ssh'
+      ? ['gh', ...args.slice(0, separator + 1), ...decodedRemoteSshArgv(args)].join(' ')
+      : ['gh', ...args].join(' ');
     if (command === 'gh' && args[0] === 'codespace' && args[1] === 'ports') {
       return { code: 0, stdout: JSON.stringify(options.ports ?? []), stderr: '' };
     }

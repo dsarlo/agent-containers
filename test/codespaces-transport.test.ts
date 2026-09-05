@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { transportFixture, COMMAND_ID, collect, helperBootstrapRunner, type TransportFixture } from './transport-fixtures.js';
+import { transportFixture, COMMAND_ID, collect, helperBootstrapRunner, type TransportFixture, decodedRemoteSshArgv } from './transport-fixtures.js';
 import { executeRemoteCommand, attachRemoteCommand, cancelRemoteCommand, helperDeps } from '../src/codespaces-transport.js';
 import { bootstrapRemoteHelper } from '../src/codespaces-helper.js';
 import { loadCommandRequest, loadCommandOffsets, loadCommandStatus, loadCommandRecovery } from '../src/codespaces-command.js';
@@ -366,7 +366,7 @@ test('cancel proof inspection failure records a durable unknown outcome instead 
   let sha256Checks = 0;
   const runner = {
     async run(command: string, args: string[], options?: { signal?: AbortSignal }) {
-      const remote = args.slice(args.indexOf('--') + 1).join(' ');
+      const remote = decodedRemoteSshArgv(args).join(' ');
       if (remote.startsWith('sha256sum ') && ++sha256Checks >= 3) return { code: 1, stdout: '', stderr: 'forced proof inspection failure' };
       return base.run(command, args, options);
     },
@@ -422,7 +422,7 @@ test('a second interrupt aborts an in-flight helper inspection probe before canc
   let probeAborted = false;
   const runner = {
     async run(command: string, args: string[], options?: { signal?: AbortSignal }) {
-      const remote = args.slice(args.indexOf('--') + 1).join(' ');
+      const remote = decodedRemoteSshArgv(args).join(' ');
       if (stallInspection && remote.startsWith('sha256sum ')) {
         return await new Promise<never>((_, reject) => {
           const onAbort = () => {
