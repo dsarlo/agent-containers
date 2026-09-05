@@ -126,18 +126,17 @@ export class GhCodespacesProvider {
     if (!losslessId(payload.repositoryId) || !safeRef(payload.ref) || !safeRepositoryPath(payload.devcontainerPath) || !safeDisplay(payload.machine) || !positiveInteger(payload.idleTimeoutMinutes) || !positiveInteger(payload.retentionPeriodMinutes)) throw new Error('Codespaces create request fields are unsafe.');
     if (payload.geo !== undefined && !safeLocation(payload.geo)) throw new Error('Codespaces create geo field is unsafe.');
     if (payload.displayName !== undefined && !safeDisplay(payload.displayName)) throw new Error('Codespaces create display-name hint is unsafe.');
-    const fields = [
-      'repository_id', payload.repositoryId,
-      'ref', payload.ref,
-      'devcontainer_path', payload.devcontainerPath,
-      'machine', payload.machine,
-      'idle_timeout_minutes', String(payload.idleTimeoutMinutes),
-      'retention_period_minutes', String(payload.retentionPeriodMinutes),
+    const args = [
+      'api', '--method', 'POST', '-H', `X-GitHub-Api-Version: ${API_VERSION}`,
+      '-F', `repository_id=${payload.repositoryId}`,
+      '-f', `ref=${payload.ref}`,
+      '-f', `devcontainer_path=${payload.devcontainerPath}`,
+      '-f', `machine=${payload.machine}`,
+      '-F', `idle_timeout_minutes=${payload.idleTimeoutMinutes}`,
+      '-F', `retention_period_minutes=${payload.retentionPeriodMinutes}`,
     ];
-    if (payload.geo) fields.push('geo', payload.geo);
-    if (payload.displayName) fields.push('display_name', payload.displayName);
-    const args = ['api', '--method', 'POST', '-H', `X-GitHub-Api-Version: ${API_VERSION}`];
-    for (let index = 0; index < fields.length; index += 2) args.push('-f', `${fields[index]}=${fields[index + 1] ?? ''}`);
+    if (payload.geo) args.push('-f', `geo=${payload.geo}`);
+    if (payload.displayName) args.push('-f', `display_name=${payload.displayName}`);
     args.push('/user/codespaces');
     const controller = new AbortController();
     const relayed = options.signal;
