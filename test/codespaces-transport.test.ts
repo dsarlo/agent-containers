@@ -87,7 +87,7 @@ test('execute preserves the exhaustive argv corpus end to end without a host she
   assert.ok(record, 'the remote helper must receive the framed argv');
   assert.deepEqual(record.argv, [...argv]);
   assert.deepEqual(fixture.spawnerCalls, fixture.spawnerCalls.map(() => [
-    'gh', 'codespace', 'ssh', '-c', 'bookish-space-parakeet', '--',
+    'codespace', 'ssh', '-c', 'bookish-space-parakeet', '--',
     "'/workspaces/.agent-containers/00000000-0000-4000-8000-000000000001/bin/agent-containers-helper-linux-x64' 'serve'",
   ]), 'every helper session must use one POSIX-quoted remote command');
   // The recorded request hash binds the exact corpus (idempotency).
