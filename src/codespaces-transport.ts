@@ -611,7 +611,7 @@ async function acknowledgeStarted(deps: RemoteTransportDependencies, session: He
 
 async function openSession(deps: RemoteTransportDependencies, binPath: string, signal = deps.signal): Promise<HelperSession> {
   const remoteCommand = [binPath, 'serve'].map(posixShellQuote).join(' ');
-  const child = deps.spawner(['gh', 'codespace', 'ssh', '-c', deps.metadata.remote.name, '--', remoteCommand], { signal });
+  const child = deps.spawner(['codespace', 'ssh', '-c', deps.metadata.remote.name, '--', remoteCommand], { signal });
   drainStderr(child);
   return new HelperSession(child);
 }
