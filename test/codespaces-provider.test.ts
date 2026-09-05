@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
+import { resolve } from 'node:path';
 import test from 'node:test';
 import { GhCodespacesProvider, type CodespacesProviderProcess, type CodespacesCreatePayload, type CodespacesResource } from '../src/codespaces.js';
 
@@ -9,15 +11,13 @@ function resourceFixture(overrides: Partial<Record<string, unknown>> = {}): Reco
     name: 'bookish-space-parakeet',
     environment_id: '8f1c1f0e-8e5f-4c2e-9b0a-1234567890ab',
     owner: { id: 1, login: 'octo' },
-    repository_id: 42,
     repository: { id: 42, name: 'agent-containers', owner: { id: 1, login: 'octo' } },
-    billing_owner: { id: 1, login: 'octo' },
-    machine_name: 'basicLinux32gb',
-    location: 'East US',
-    geo: 'EastUs',
+    billable_owner: { id: 1, login: 'octo' },
+    machine: { name: 'basicLinux32gb' },
+    location: 'EastUs',
     created_at: '2026-09-02T12:00:00Z',
     state: 'Running',
-    git_status: { sha: '0123456789012345678901234567890123456789', ref: 'main' },
+    git_status: { ref: 'main' },
     devcontainer_path: '.devcontainer/devcontainer.json',
     idle_timeout_minutes: 30,
     retention_period_minutes: 10080,
@@ -45,6 +45,11 @@ function respondingProcess(onArgs: (args: string[]) => void, responseFor: ((args
     },
   };
 }
+
+test('committed Codespaces devcontainer includes the official SSHD feature required by gh codespace ssh', async () => {
+  const config = JSON.parse(await readFile(resolve('.devcontainer/devcontainer.json'), 'utf8')) as { features?: Record<string, { version?: unknown }> };
+  assert.equal(config.features?.['ghcr.io/devcontainers/features/sshd:1']?.version, 'latest');
+});
 
 test('provider create dispatches the documented POST argv with explicit body fields and no shell', async () => {
   const calls: string[][] = [];
@@ -82,6 +87,60 @@ test('provider create includes display_name and enforced policy fields only when
   ]]);
 });
 
+test('provider create accepts a documented complete identity when operational response fields are null', async () => {
+  const provider = new GhCodespacesProvider(respondingProcess(
+    () => undefined,
+    resourceFixture({ display_name: null, environment_id: null, machine: null, devcontainer_path: null, idle_timeout_minutes: null }),
+  ));
+  const resource = await provider.create(validPayload);
+  assert.equal(resource.id, '9876543210');
+  assert.equal(resource.environmentId, null);
+  assert.equal(resource.machineName, null);
+  assert.equal(resource.devcontainerPath, null);
+  assert.equal(resource.idleTimeoutMinutes, null);
+});
+
+test('provider create accepts a provisional receipt only by reading back the exact returned Codespace name', async () => {
+  const calls: string[][] = [];
+  let readbacks = 0;
+  let sleeps = 0;
+  const provider = new GhCodespacesProvider(respondingProcess((args) => calls.push(args), (args) => {
+    if (args.at(-1) === '/user/codespaces') return { id: '9876543210', name: 'bookish-space-parakeet', state: 'Provisioning' };
+    if (args.at(-1) === '/user/codespaces/bookish-space-parakeet' && readbacks++ === 0) return { id: '9876543210', name: 'bookish-space-parakeet' };
+    if (args.at(-1) === '/user/codespaces/bookish-space-parakeet') return resourceFixture();
+    throw new Error(`unexpected provider call: ${JSON.stringify(args)}`);
+  }), async () => { sleeps += 1; });
+  const resource = await provider.create(validPayload);
+  assert.equal(resource.id, '9876543210');
+  assert.equal(resource.name, 'bookish-space-parakeet');
+  assert.equal(sleeps, 1);
+  assert.deepEqual(calls.map((args) => args.at(-1)), ['/user/codespaces', '/user/codespaces/bookish-space-parakeet', '/user/codespaces/bookish-space-parakeet']);
+});
+
+test('provider create bounds and aborts a hung provisional exact readback', async () => {
+  let readbackSignal: AbortSignal | undefined;
+  const provider = new GhCodespacesProvider({
+    async run(_command, args, options) {
+      if (args.at(-1) === '/user/codespaces') return { code: 0, stdout: JSON.stringify({ id: '9876543210', name: 'bookish-space-parakeet', state: 'Provisioning' }), stderr: '' };
+      if (args.at(-1) === '/user/codespaces/bookish-space-parakeet') {
+        readbackSignal = options?.signal;
+        return await new Promise<never>(() => {});
+      }
+      throw new Error(`unexpected provider call: ${JSON.stringify(args)}`);
+    },
+  });
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    await assert.rejects(() => Promise.race([
+      provider.create(validPayload, { timeoutMs: 20 }),
+      new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error('test guard elapsed')), 200); }),
+    ]), /readback exceeded its bounded deadline/);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+  assert.equal(readbackSignal?.aborted, true);
+});
+
 test('provider create rejects truncated or incomplete responses without adopting a hint', async () => {
   const provider = new GhCodespacesProvider(respondingProcess(
     () => undefined,
@@ -89,7 +148,7 @@ test('provider create rejects truncated or incomplete responses without adopting
   ));
   await assert.rejects(() => provider.create(validPayload), /truncated or invalid JSON/);
   const incomplete = new GhCodespacesProvider(respondingProcess(() => undefined, resourceFixture({ state: undefined })));
-  await assert.rejects(() => incomplete.create(validPayload), /complete Codespaces identity/);
+  await assert.rejects(() => incomplete.create(validPayload), /safe Codespaces receipt/);
 });
 
 test('provider GET readback returns the complete identity and refuses a name mismatch', async () => {
@@ -97,7 +156,8 @@ test('provider GET readback returns the complete identity and refuses a name mis
   const readback = await provider.get('bookish-space-parakeet');
   assert.equal(readback.name, 'bookish-space-parakeet');
   assert.equal(readback.owner.login, 'octo');
-  assert.equal(readback.geo, 'EastUs');
+  assert.equal(readback.geo, null);
+  assert.equal(readback.location, 'EastUs');
 
   const wrong = new GhCodespacesProvider(respondingProcess(() => undefined, resourceFixture({ name: 'other' })));
   await assert.rejects(() => wrong.get('bookish-space-parakeet'), /requested Codespaces name/);
@@ -184,12 +244,14 @@ test('provider repository record reads the immutable repository database identit
   assert.deepEqual(calls, [['api', '--method', 'GET', '-H', 'X-GitHub-Api-Version: 2022-11-28', '/repos/octo/agent-containers']]);
 });
 
-test('provider rejects secret-shaped values in every new resource field before they can be recorded', async () => {
+test('provider rejects secret-shaped values in every documented mapped resource field before they can be recorded', async () => {
   const hidden = 'sk-' + 'x'.repeat(24);
   const hostile = new GhCodespacesProvider(respondingProcess(() => undefined, resourceFixture({ display_name: hidden })));
   await assert.rejects(() => hostile.get('bookish-space-parakeet'), (error: Error) => !error.message.includes(hidden));
-  const geo = new GhCodespacesProvider(respondingProcess(() => undefined, resourceFixture({ geo: hidden })));
-  await assert.rejects(() => geo.get('bookish-space-parakeet'), (error: Error) => !error.message.includes(hidden));
+  const machine = new GhCodespacesProvider(respondingProcess(() => undefined, resourceFixture({ machine: { name: hidden } })));
+  await assert.rejects(() => machine.get('bookish-space-parakeet'), (error: Error) => !error.message.includes(hidden));
+  const billableOwner = new GhCodespacesProvider(respondingProcess(() => undefined, resourceFixture({ billable_owner: { id: 1, login: hidden } })));
+  await assert.rejects(() => billableOwner.get('bookish-space-parakeet'), (error: Error) => !error.message.includes(hidden));
 });
 
 test('provider resource carries lossless identity fields for fail-closed ownership', async () => {

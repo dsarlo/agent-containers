@@ -3,6 +3,7 @@ import { redactSecretDiagnostic, secretShaped } from './secrets.js';
 
 const API_VERSION = '2022-11-28';
 const DEFAULT_CREATE_TIMEOUT_MS = 5 * 60 * 1000;
+const CREATE_READBACK_RETRY_MS = 1_000;
 
 export type CodespacesProviderProcess = Pick<ProcessRunner, 'run'>;
 export interface GithubActor { id: string; login: string }
@@ -12,27 +13,27 @@ export interface RepositorySourceEvidence { repository: string; requestedRef: st
 export interface CodespacesMachineInventory { machines: readonly { name: string; displayName: string; operatingSystem: string; storageInBytes: number; memoryInBytes: number; cpus: number; prebuildAvailability: 'none' | 'ready' | 'in_progress' | null }[] }
 export interface CodespacesDefaults { billableOwner: GithubActor; location: string; devcontainerPath: string | null }
 export interface RepositoryRecordIdentity { id: string; owner: string; name: string }
-export interface CodespacesGitStatus { sha: string; ref: string }
+export interface CodespacesGitStatus { ref: string; sha?: string }
 export interface CodespacesRemoteGitRisk { branch: string; dirty: boolean; unpushed: boolean }
 
 /** Every field required for fail-closed Codespace ownership from the documented resource object. */
 export interface CodespacesResource {
   id: string;
   name: string;
-  displayName: string;
-  environmentId: string;
+  displayName: string | null;
+  environmentId: string | null;
   owner: GithubActor;
   repositoryId: string;
   repository: { owner: string; name: string };
   billingOwner: GithubActor;
-  devcontainerPath: string;
-  machineName: string;
+  devcontainerPath: string | null;
+  machineName: string | null;
   location: string;
   geo: string | null;
   createdAt: string;
   state: string;
   gitStatus: CodespacesGitStatus;
-  idleTimeoutMinutes: number;
+  idleTimeoutMinutes: number | null;
 }
 
 export interface CodespacesCreatePayload {
@@ -46,9 +47,15 @@ export interface CodespacesCreatePayload {
   displayName?: string;
 }
 
+/** Minimal identity emitted by GitHub while a new Codespace is still provisioning. */
+interface CodespacesCreateReceipt { id: string; name: string }
+
 /** Thin, replaceable adapter. It intentionally exposes no token or auth operation. */
 export class GhCodespacesProvider {
-  constructor(private readonly process: CodespacesProviderProcess) {}
+  constructor(
+    private readonly process: CodespacesProviderProcess,
+    private readonly sleep: (milliseconds: number) => Promise<void> = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
+  ) {}
 
   async actor(): Promise<GithubActor> {
     const value = await this.api('/user');
@@ -56,9 +63,9 @@ export class GhCodespacesProvider {
     return { id: String(value.id), login: value.login };
   }
 
-  async get(name: string): Promise<CodespacesResource> {
+  async get(name: string, options: { signal?: AbortSignal } = {}): Promise<CodespacesResource> {
     if (!safeName(name)) throw new Error('Invalid Codespaces name.');
-    const value = await this.api(`/user/codespaces/${encodeURIComponent(name)}`);
+    const value = await this.api(`/user/codespaces/${encodeURIComponent(name)}`, options);
     if (!isRecord(value) || value.name !== name) throw new Error('GitHub response name does not equal the exact requested Codespaces name; refusing adoption.');
     return parseCodespacesResource(value, `readback of ${name}`);
   }
@@ -141,12 +148,40 @@ export class GhCodespacesProvider {
     const controller = new AbortController();
     const relayed = options.signal;
     relayed?.addEventListener('abort', () => controller.abort(), { once: true });
+    const timeoutMs = options.timeoutMs ?? DEFAULT_CREATE_TIMEOUT_MS;
+    const deadline = Date.now() + timeoutMs;
     try {
-      const result = await raceBoundedCreate(this.process.run('gh', args, { kind: 'lifecycle', signal: controller.signal }), options.timeoutMs ?? DEFAULT_CREATE_TIMEOUT_MS, controller);
+      const result = await raceBoundedCreate(this.process.run('gh', args, { kind: 'lifecycle', signal: controller.signal }), timeoutMs, controller);
       if (result.code !== 0) throw providerError('POST', '/user/codespaces', result);
-      return parseCodespacesResource(parseJson(result.stdout, 'POST /user/codespaces'), 'create response');
+      const body = parseJson(result.stdout, 'POST /user/codespaces');
+      try {
+        return parseCodespacesResource(body, 'create response');
+      } catch {
+        const receipt = parseCodespacesCreateReceipt(body);
+        return await this.readCreatedCodespace(receipt, deadline, controller);
+      }
     } finally {
       controller.abort();
+    }
+  }
+
+  /** Poll only exact GET readback for the receipt name until GitHub publishes full identity. */
+  private async readCreatedCodespace(receipt: CodespacesCreateReceipt, deadline: number, controller: AbortController): Promise<CodespacesResource> {
+    const signal = controller.signal;
+    while (true) {
+      if (signal.aborted) throw createDeadlineError();
+      try {
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) throw createReadbackDeadlineError();
+        const resource = await raceBoundedReadback(this.get(receipt.name, { signal }), remaining, controller);
+        if (resource.id !== receipt.id) throw new Error('GitHub create readback identity does not match the exact create receipt; refusing adoption.');
+        return resource;
+      } catch (error: unknown) {
+        if (!isProvisionalIdentityError(error)) throw error;
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) throw new Error('GitHub create receipt remained provisional past the bounded identity-readback deadline; refusing adoption.', { cause: error });
+        await this.sleep(Math.min(CREATE_READBACK_RETRY_MS, remaining));
+      }
     }
   }
 
@@ -232,11 +267,11 @@ export class GhCodespacesProvider {
     return entry.sha;
   }
 
-  private async api(path: string): Promise<unknown> {
+  private async api(path: string, options: { signal?: AbortSignal } = {}): Promise<unknown> {
     if (!path.startsWith('/')) throw new Error('Provider API path must be absolute.');
     const args = ['api', '--method', 'GET', '-H', `X-GitHub-Api-Version: ${API_VERSION}`];
     args.push(path);
-    const result = await this.process.run('gh', args);
+    const result = await this.process.run('gh', args, { kind: 'readonly-probe', signal: options.signal });
     if (result.code !== 0) throw providerError('GET', path, result);
     try { return JSON.parse(result.stdout); } catch { throw new Error(`GitHub GET ${path} returned invalid JSON; refusing to infer remote state.`); }
   }
@@ -253,6 +288,13 @@ export function assertSafeExecuteRequest(request: SafeExecuteRequest): void {
 function providerError(method: string, path: string, result: ProcessResult): Error { return new Error(`GitHub ${method} ${path} failed: ${redactDiagnostic(result.stderr || result.stdout || `exit code ${result.code}`)}`); }
 function redactDiagnostic(value: string): string { return redactSecretDiagnostic(value); }
 function parseJson(stdout: string, context: string): unknown { try { return JSON.parse(stdout); } catch { throw new Error(`GitHub ${context} returned truncated or invalid JSON; refusing to infer remote state.`); } }
+function parseCodespacesCreateReceipt(value: unknown): CodespacesCreateReceipt {
+  if (!isRecord(value) || !losslessId(value.id) || !safeName(value.name) || typeof value.state !== 'string' || value.state.length === 0) throw new Error('GitHub create response did not contain a safe Codespaces receipt; refusing adoption.');
+  return { id: String(value.id), name: value.name };
+}
+function isProvisionalIdentityError(error: unknown): boolean {
+  return error instanceof Error && /did not contain a complete Codespaces identity; refusing adoption\.$/.test(error.message);
+}
 
 /**
  * Bound a create dispatch even when the child transport itself cannot observe
@@ -272,6 +314,21 @@ function raceBoundedCreate<T>(pending: Promise<T>, timeoutMs: number, controller
     );
   });
 }
+function raceBoundedReadback<T>(pending: Promise<T>, timeoutMs: number, controller: AbortController): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      controller.abort();
+      reject(createReadbackDeadlineError());
+    }, timeoutMs);
+    pending.then(
+      (value) => { clearTimeout(timer); resolve(value); },
+      (error: unknown) => { clearTimeout(timer); reject(error); },
+    );
+  });
+}
+function createReadbackDeadlineError(): Error {
+  return new Error('GitHub create readback exceeded its bounded deadline; the resource may exist but nothing was adopted.');
+}
 function createDeadlineError(): Error {
   const error = new Error('GitHub create POST exceeded its bounded deadline; the request may or may not have been dispatched and nothing was adopted.');
   error.name = 'AbortError';
@@ -280,15 +337,15 @@ function createDeadlineError(): Error {
 
 /** Parse and validate the complete documented Codespace resource without a wildcard field. */
 export function parseCodespacesResource(value: unknown, context: string): CodespacesResource {
-  if (!isRecord(value) || !losslessId(value.id) || !safeName(value.name) || !safeDisplay(value.display_name) || !safeDisplay(value.environment_id) ||
+  if (!isRecord(value) || !losslessId(value.id) || !safeName(value.name) || !safeNullableDisplay(value.display_name) || !safeNullableDisplay(value.environment_id) ||
     !isRecord(value.owner) || !losslessId(value.owner.id) || !safeDisplay(value.owner.login) ||
-    !losslessId(value.repository_id) || !isRecord(value.repository) || !safeIdentifier(value.repository.name) ||
+    !isRecord(value.repository) || !losslessId(value.repository.id) || !safeIdentifier(value.repository.name) ||
     !isRecord(value.repository.owner) || !losslessId(value.repository.owner.id) || !safeDisplay(value.repository.owner.login) ||
-    !isRecord(value.billing_owner) || !losslessId(value.billing_owner.id) || !safeDisplay(value.billing_owner.login) ||
-    !safeRepositoryPath(value.devcontainer_path) || !safeDisplay(value.machine_name) || !safeDisplay(value.location) ||
-    (value.geo !== null && !safeDisplay(value.geo)) || !safeDisplay(value.state) || !isTimestamp(value.created_at) ||
-    !isRecord(value.git_status) || !oid(value.git_status.sha) || (value.git_status.ref !== null && !safeDisplay(value.git_status.ref)) ||
-    !positiveInteger(value.idle_timeout_minutes)) {
+    !isRecord(value.billable_owner) || !losslessId(value.billable_owner.id) || !safeDisplay(value.billable_owner.login) ||
+    !safeNullableMachine(value.machine) || !safeNullableRepositoryPath(value.devcontainer_path) || !safeDisplay(value.location) ||
+    !safeDisplay(value.state) || !isTimestamp(value.created_at) ||
+    !isRecord(value.git_status) || (value.git_status.ref !== null && !safeDisplay(value.git_status.ref)) ||
+    !nullablePositiveInteger(value.idle_timeout_minutes)) {
     throw new Error(`GitHub ${context} did not contain a complete Codespaces identity; refusing adoption.`);
   }
   return {
@@ -297,16 +354,16 @@ export function parseCodespacesResource(value: unknown, context: string): Codesp
     displayName: value.display_name,
     environmentId: value.environment_id,
     owner: { id: String(value.owner.id), login: value.owner.login },
-    repositoryId: String(value.repository_id),
+    repositoryId: String(value.repository.id),
     repository: { owner: value.repository.owner.login, name: value.repository.name },
-    billingOwner: { id: String(value.billing_owner.id), login: value.billing_owner.login },
+    billingOwner: { id: String(value.billable_owner.id), login: value.billable_owner.login },
     devcontainerPath: value.devcontainer_path,
-    machineName: value.machine_name,
+    machineName: nullableMachineName(value.machine),
     location: value.location,
-    geo: value.geo === null ? null : value.geo,
+    geo: null,
     createdAt: value.created_at,
     state: value.state,
-    gitStatus: { sha: value.git_status.sha, ref: value.git_status.ref ?? '' },
+    gitStatus: { ref: value.git_status.ref ?? '' },
     idleTimeoutMinutes: value.idle_timeout_minutes,
   };
 }
@@ -314,11 +371,16 @@ export function parseCodespacesResource(value: unknown, context: string): Codesp
 function isRecord(value: unknown): value is Record<string, unknown> { return typeof value === 'object' && value !== null && !Array.isArray(value); }
 function losslessId(value: unknown): boolean { return (typeof value === 'number' && Number.isSafeInteger(value) && value > 0) || (typeof value === 'string' && /^[1-9][0-9]*$/.test(value)); }
 function positiveInteger(value: unknown): value is number { return typeof value === 'number' && Number.isSafeInteger(value) && value > 0; }
+function nullablePositiveInteger(value: unknown): value is number | null { return value === null || positiveInteger(value); }
 function safeName(value: unknown): value is string { return typeof value === 'string' && /^[A-Za-z0-9-]+$/.test(value) && !secretShaped(value); }
 function oid(value: unknown): value is string { return typeof value === 'string' && /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(value); }
 function safeRef(value: string): boolean { return !secretShaped(value) && /^refs\/(?:heads|tags)\/(?:[A-Za-z0-9][A-Za-z0-9._-]*)(?:\/[A-Za-z0-9][A-Za-z0-9._-]*)*$/.test(value) && !value.includes('..') && !value.split('/').some((part) => part.endsWith('.') || part.endsWith('.lock')); }
 function safeRepositoryPath(value: unknown): value is string { return typeof value === 'string' && !secretShaped(value) && value.length > 0 && !/[\0\r\n]/.test(value) && !value.startsWith('/') && !value.split('/').some((part) => !part || part === '.' || part === '..'); }
+function safeNullableRepositoryPath(value: unknown): value is string | null { return value === null || safeRepositoryPath(value); }
 function safeDisplay(value: unknown): value is string { return typeof value === 'string' && !secretShaped(value) && value.length > 0 && value.length <= 512 && !/[\0\r\n]/.test(value); }
+function safeNullableDisplay(value: unknown): value is string | null { return value === null || safeDisplay(value); }
+function safeNullableMachine(value: unknown): value is { name: string } | null { return value === null || (isRecord(value) && safeDisplay(value.name)); }
+function nullableMachineName(value: unknown): string | null { return value === null ? null : (value as { name: string }).name; }
 function safeIdentifier(value: unknown): value is string { return typeof value === 'string' && !secretShaped(value) && /^[A-Za-z0-9_.-]{1,128}$/.test(value); }
 function safeLocation(value: unknown): value is string { return typeof value === 'string' && !secretShaped(value) && /^[A-Za-z0-9._\- ]{1,64}$/.test(value); }
 function isTimestamp(value: unknown): value is string { return typeof value === 'string' && !Number.isNaN(Date.parse(value)); }

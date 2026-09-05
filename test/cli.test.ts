@@ -468,6 +468,34 @@ test('Codespaces exec returns nonzero for terminal unverified outcomes and prese
   }
 });
 
+test('Codespaces exec refuses a provisioning workspace before dispatching any remote command', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'agent-containers-cli-codespaces-provisioning-'));
+  const stateHome = await mkdtemp(join(tmpdir(), 'agent-containers-cli-codespaces-provisioning-state-'));
+  const stateDir = join(stateHome, 'agent-containers');
+  const previousStateHome = process.env.XDG_STATE_HOME;
+  const previousGate = process.env.AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES;
+  const { setStateDurabilityAdapterForTesting } = await import('../src/state.js');
+  setStateDurabilityAdapterForTesting({ publicationMode: async () => 'strict', assertStateWriteSupport: async () => undefined, syncFile: async () => undefined, syncDirectory: async () => undefined, moveFileWriteThrough: async () => undefined });
+  process.env.XDG_STATE_HOME = stateHome;
+  process.env.AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES = '1';
+  t.after(async () => {
+    setStateDurabilityAdapterForTesting(undefined);
+    if (previousStateHome === undefined) delete process.env.XDG_STATE_HOME; else process.env.XDG_STATE_HOME = previousStateHome;
+    if (previousGate === undefined) delete process.env.AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES; else process.env.AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES = previousGate;
+    await Promise.all([rm(root, { recursive: true, force: true }), rm(stateHome, { recursive: true, force: true })]);
+  });
+  assert.equal(spawnSync('git', ['init', '-b', 'main'], { cwd: root }).status, 0);
+  await writeFile(join(root, '.agent-containers.yml'), JSON.stringify(codespacesConfig()));
+  await saveMetadata(stateDir, codespacesMetadata('provisioning'));
+  let executes = 0;
+  const backend: ExecutionBackend = { kind: 'codespaces', async create() { throw new Error('unexpected'); }, async observe() { throw new Error('unexpected'); }, async *waitReady() { yield* []; throw new Error('unexpected'); }, async *execute() { executes += 1; yield { type: 'exit', commandId: 'remote-command', code: 0 }; }, async *attach() { yield* []; throw new Error('unexpected'); }, async cancel() { throw new Error('unexpected'); }, async recover() { throw new Error('unexpected'); }, async remove() { throw new Error('unexpected'); } };
+  const messages: string[] = [];
+  const code = await runCli(['exec', 'remote', '--', 'true'], root, (message) => messages.push(message), undefined, { createCodespacesBackend: () => backend });
+  assert.equal(code, 1);
+  assert.equal(executes, 0);
+  assert.match(messages.at(-1) ?? '', /wait.*ready/i);
+});
+
 test('Codespaces exec streams live remote output bytes to their CLI streams and returns the remote exit code', async (t) => {
   const root = await mkdtemp(join(tmpdir(), 'agent-containers-cli-codespaces-live-output-'));
   const stateHome = await mkdtemp(join(tmpdir(), 'agent-containers-cli-codespaces-live-output-state-'));
@@ -556,6 +584,6 @@ function codespacesConfig() {
   return { version: 2 as const, workspace: { worktreeRoot: 'worktrees', baseBranch: 'main' }, project: { repository: 'owner/repo', ref: 'refs/heads/main', expectedOid: '0123456789012345678901234567890123456789' }, environment: { devcontainerPath: '.devcontainer/devcontainer.json', devcontainerBlobOid: 'abcdefabcdefabcdefabcdefabcdefabcdefabcd' }, backends: { enabled: ['codespaces'] as const, default: 'codespaces' as const, local: {}, codespaces: { enabled: true, machine: null, geo: 'auto', idleTimeoutMinutes: 30, retentionPeriodMinutes: 1, maxTotal: 1, maxRunning: 1, maxCreating: 1, maxParallelCommandsPerWorkspace: 1, readiness: { providerTimeoutSeconds: 1, sshTimeoutSeconds: 1, command: [], commandTimeoutSeconds: 1 }, transport: { reconnectWindowSeconds: 1, cancelGraceSeconds: 1 }, ports: { allowVisibilityChanges: false, allowPublic: false }, secrets: { allowedRemoteSecretNames: [], allowCodespaceGitCredential: false } } } };
 }
 
-function codespacesMetadata() {
-  return { version: 2 as const, backend: 'codespaces' as const, name: 'remote', workspaceId: '00000000-0000-4000-8000-000000000001', createdAt: '2026-01-01T00:00:00.000Z', control: { githubHost: 'github.com', actorId: '1', actorLogin: 'actor', ghVersion: 'test' }, repository: { id: '1', owner: 'owner', name: 'repo' }, source: { requestedRef: 'refs/heads/main', expectedOid: '0123456789012345678901234567890123456789', effectiveBranch: 'agent-containers/remote', devcontainerPath: '.devcontainer/devcontainer.json', devcontainerBlobOid: 'abcdefabcdefabcdefabcdefabcdefabcdefabcd' }, remote: { codespaceId: '3', name: 'remote-name', environmentId: 'environment-id', ownerId: '1', ownerLogin: 'actor', billableOwnerId: '1', machine: 'basicLinux32gb', geo: 'auto', createdAt: '2026-01-01T00:00:00.000Z' }, lifecycle: { desired: 'ready' as const, normalized: 'available', providerRawState: 'Available', lastObservedAt: '2026-01-01T00:00:00.000Z', activeOperation: null }, recovery: null, cleanup: { remoteStopped: false, remoteDeleted: false, tombstoneWritten: false } };
+function codespacesMetadata(normalized: 'provisioning' | 'available' | 'ready' | 'ready-without-setup-proof' = 'ready-without-setup-proof') {
+  return { version: 2 as const, backend: 'codespaces' as const, name: 'remote', workspaceId: '00000000-0000-4000-8000-000000000001', createdAt: '2026-01-01T00:00:00.000Z', control: { githubHost: 'github.com', actorId: '1', actorLogin: 'actor', ghVersion: 'test' }, repository: { id: '1', owner: 'owner', name: 'repo' }, source: { requestedRef: 'refs/heads/main', expectedOid: '0123456789012345678901234567890123456789', effectiveBranch: 'agent-containers/remote', devcontainerPath: '.devcontainer/devcontainer.json', devcontainerBlobOid: 'abcdefabcdefabcdefabcdefabcdefabcdefabcd' }, remote: { codespaceId: '3', name: 'remote-name', environmentId: 'environment-id', ownerId: '1', ownerLogin: 'actor', billableOwnerId: '1', machine: 'basicLinux32gb', geo: 'auto', createdAt: '2026-01-01T00:00:00.000Z' }, lifecycle: { desired: 'ready' as const, normalized, providerRawState: normalized === 'provisioning' ? 'Provisioning' : 'Available', lastObservedAt: '2026-01-01T00:00:00.000Z', activeOperation: null }, recovery: null, cleanup: { remoteStopped: false, remoteDeleted: false, tombstoneWritten: false } };
 }

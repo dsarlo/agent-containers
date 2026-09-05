@@ -87,15 +87,13 @@ function resourceFixture(overrides: Record<string, unknown> = {}): Record<string
     name: 'bookish-space-parakeet',
     environment_id: 'env-8f1c1f0e',
     owner: { id: 1, login: 'octo' },
-    repository_id: 42,
     repository: { id: 42, name: 'agent-containers', owner: { id: 1, login: 'octo' } },
-    billing_owner: { id: 1, login: 'octo' },
-    machine_name: 'basicLinux32gb',
-    location: 'East US',
-    geo: 'EastUs',
+    billable_owner: { id: 1, login: 'octo' },
+    machine: { name: 'basicLinux32gb' },
+    location: 'EastUs',
     created_at: '2026-09-02T12:00:00Z',
     state: 'Running',
-    git_status: { sha: OID, ref: 'main' },
+    git_status: { ref: 'main' },
     devcontainer_path: '.devcontainer/devcontainer.json',
     idle_timeout_minutes: 30,
     ...overrides,
@@ -196,6 +194,18 @@ test('exact create performs an exact GET readback and refuses identity mismatch 
   assert.ok(gets.length >= 1, 'an exact GET readback must be issued');
 });
 
+test('create records a nullable operational response with an immutable local environment fallback', async () => {
+  const { deps, stateDir } = await harness({ create: () => resourceFixture({ display_name: null, environment_id: null, machine: null, devcontainer_path: null, idle_timeout_minutes: null }) } as unknown as RouteOverrides);
+  const outcome = await createCodespacesWorkspace(deps);
+  assert.equal(outcome.outcome, 'recorded', JSON.stringify(outcome));
+  const metadata = recordedMetadata(await loadMetadata(stateDir, 'issue-9'));
+  assert.ok(metadata);
+  if (!metadata) return;
+  assert.equal(metadata.remote.environmentId, metadata.remote.codespaceId);
+  assert.equal(metadata.remote.machine, 'basicLinux32gb');
+  assert.equal(metadata.source.devcontainerPath, '.devcontainer/devcontainer.json');
+});
+
 test('create response truncation fails closed into durable ambiguous recovery with read-only candidates', async () => {
   const { deps, stateDir } = await harness({ create: () => JSON.parse('{"id": 9') , candidates: () => ({ total_count: 1, codespaces: [{ id: 1, name: 'bookish-space-parakeet', state: 'Starting' }] }) } as unknown as RouteOverrides);
   const outcome = await createCodespacesWorkspace(deps);
@@ -218,6 +228,15 @@ test('provider timeout before creation is ambiguous and never retries the create
   assert.equal(postCount, 1, 'no hidden create retry after an ambiguous response');
   const intent = await loadCreateIntent(stateDir, deps.requestId);
   assert.equal(intent?.state, 'ambiguous-create');
+});
+
+test('readback deadline after a successful create POST is classified as post-dispatch ambiguity', async () => {
+  const { deps, stateDir } = await harness({ create: () => { throw new Error('GitHub create readback exceeded its bounded deadline; the resource may exist but nothing was adopted.'); } } as unknown as RouteOverrides);
+  const outcome = await createCodespacesWorkspace(deps);
+  assert.equal(outcome.outcome, 'ambiguous');
+  if (outcome.outcome !== 'ambiguous') return;
+  assert.equal(outcome.reason, 'provider-timeout-after-creation-possible');
+  assert.equal((await loadCreateIntent(stateDir, deps.requestId))?.recoveryContext?.reason, 'provider-timeout-after-creation-possible');
 });
 
 test('provider timeout after creation is ambiguous and never adopts or deletes a candidate', async () => {
@@ -384,16 +403,12 @@ test('readback identity verification treats a devcontainer path drift as a hard 
   assert.ok(mismatch.mismatches.some((entry) => /devcontainerPath/.test(entry)));
 });
 
-test('revision mismatch quarantines when the readback HEAD differs from the immutable expected OID', async () => {
+test('undocumented REST git_status SHA never substitutes for the fixed remote immutable-HEAD probe', async () => {
   const { deps, stateDir } = await harness({ get: () => resourceFixture({ git_status: { sha: 'ffffffffffffffffffffffffffffffffffffffff', ref: 'main' } }) });
   const outcome = await createCodespacesWorkspace(deps);
-  assert.equal(outcome.outcome, 'quarantined');
-  if (outcome.outcome !== 'quarantined') return;
-  assert.equal(outcome.reason, 'revision-mismatch');
-  const metadata = recordedMetadata(await loadMetadata(stateDir, 'issue-9'));
-  assert.ok(metadata, 'revision-mismatch quarantine must retain a durable record');
-  assert.equal(metadata.lifecycle.normalized, 'revision-mismatch');
-  assert.equal(metadata.source.expectedOid, OID);
+  assert.equal(outcome.outcome, 'recorded');
+  const intent = await loadCreateIntent(stateDir, deps.requestId);
+  assert.equal(intent?.state, 'identity-verified');
 });
 
 test('every ambiguous failure path leaves the durable record consistent and no unknown resource is deleted', async () => {

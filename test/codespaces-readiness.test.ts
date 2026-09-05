@@ -40,11 +40,11 @@ function configFixture(): CodespacesAgentContainersConfig {
 function resourceFixture(overrides: Partial<Record<string, unknown>> = {}): Record<string, unknown> {
   return {
     id: '9876543210', display_name: 'bookish-space-parakeet', name: 'bookish-space-parakeet', environment_id: 'env-8f1c1f0e',
-    owner: { id: 1, login: 'octo' }, repository_id: 42,
+    owner: { id: 1, login: 'octo' },
     repository: { id: 42, name: 'agent-containers', owner: { id: 1, login: 'octo' } },
-    billing_owner: { id: 1, login: 'octo' }, machine_name: 'basicLinux32gb', location: 'East US', geo: 'EastUs',
+    billable_owner: { id: 1, login: 'octo' }, machine: { name: 'basicLinux32gb' }, location: 'EastUs',
     created_at: '2026-09-02T12:00:00Z', state: 'Running',
-    git_status: { sha: OID, ref: 'main' }, devcontainer_path: '.devcontainer/devcontainer.json', idle_timeout_minutes: 30, ...overrides,
+    git_status: { ref: 'main' }, devcontainer_path: '.devcontainer/devcontainer.json', idle_timeout_minutes: 30, ...overrides,
   };
 }
 
@@ -111,6 +111,14 @@ async function probeContext(options: ProbeOptions = {}) {
   const deps: CodespacesReadinessDependencies = { stateDir, name: 'issue-9', provider: new GhCodespacesProvider({ run }), config: configFixture() };
   return { deps, dispatch, metadata };
 }
+
+test('readiness tolerates a documented null devcontainer_path while retaining SSH immutable-head proof', async () => {
+  const { deps } = await probeContext({ get: () => resourceFixture({ devcontainer_path: null }) });
+  const report = await runReadinessProbes(deps);
+  assert.equal(report.terminal, 'ready-without-setup-proof');
+  assert.equal(report.gates.find((gate) => gate.id === 'readback-facts')?.state, 'passed');
+  assert.equal(report.gates.find((gate) => gate.id === 'repository-identity')?.state, 'passed');
+});
 
 test('readiness passes every gate and reports ready-without-setup-proof when no command is configured', async () => {
   const { deps } = await probeContext();

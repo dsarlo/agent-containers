@@ -210,6 +210,10 @@ export async function runCli(args: string[], cwd = process.cwd(), write: (messag
           const root = await findGitRoot(cwd, nodeProcessRunner);
           const config = await loadConfig(join(root, '.agent-containers.yml'));
           if (config.version !== 2 || !config.backends.enabled.includes('codespaces')) throw new Error('The recorded workspace requires an enabled Codespaces backend configuration.');
+          if (recorded.lifecycle.normalized !== 'ready' && recorded.lifecycle.normalized !== 'ready-without-setup-proof') {
+            write(`Codespaces workspace ${name} has not passed immutable readiness (${recorded.lifecycle.normalized}); run agent-containers wait ${name} --for ready before executing a remote command.`);
+            return 1;
+          }
           const backend = (dependencies.createCodespacesBackend ?? createCodespacesExecutionBackend)({ stateDir, config, runner: nodeProcessRunner, root });
           const request: RemoteCommandRequest = { commandId: `cli-${randomUUID()}`, argv: [rest[separator + 1] ?? 'true', ...rest.slice(separator + 2)] };
           for await (const event of executeWithInterruptRelay(backend, { kind: 'codespaces', id: recorded.workspaceId, name: recorded.name, environmentId: recorded.remote.environmentId }, request)) {
