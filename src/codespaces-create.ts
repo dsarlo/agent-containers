@@ -338,7 +338,13 @@ function classifyCreateAmbiguity(error: unknown): CodespacesRecoveryReason {
 
 function redactedDetail(error: unknown): string {
   const detail = error instanceof Error ? error.message : String(error);
-  return detail.replace(/\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|glpat-[A-Za-z0-9_-]{20,}|sk-[A-Za-z0-9_-]{20,})\b/g, '[credential redacted]').slice(0, 512);
+  const normalized = detail
+    .replace(/\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|glpat-[A-Za-z0-9_-]{20,}|sk-[A-Za-z0-9_-]{20,})\b/g, '[credential redacted]')
+    .replace(/[\r\n]+/g, ' ')
+    .replace(/\s{2,}/g, ' ')
+    .trim()
+    .slice(0, 512);
+  return normalized || 'provider failure';
 }
 
 async function requireIntent(stateDir: string, requestId: string): Promise<CodespacesCreateIntent> {
