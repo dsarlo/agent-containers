@@ -13,9 +13,9 @@ import { assertBackendAvailable, createCodespacesExecutionBackend, resolveExecut
 import { reconcileCodespacesWorkspace, removeCodespacesWorkspace, startCodespacesWorkspace, stopCodespacesWorkspace } from './codespaces-lifecycle.js';
 import { GhCodespacesProvider } from './codespaces.js';
 
-export interface CliIo { input: NodeJS.ReadableStream; output: NodeJS.WritableStream; isTTY: boolean }
+export interface CliIo { input: NodeJS.ReadableStream; output: NodeJS.WritableStream; error: NodeJS.WritableStream; isTTY: boolean }
 export interface CliDependencies { createCodespacesBackend?: typeof createCodespacesExecutionBackend }
-const processIo: CliIo = { input: process.stdin, output: process.stdout, isTTY: Boolean(process.stdin.isTTY) };
+const processIo: CliIo = { input: process.stdin, output: process.stdout, error: process.stderr, isTTY: Boolean(process.stdin.isTTY) };
 
 export async function runCli(args: string[], cwd = process.cwd(), write: (message: string) => void = console.log, io: CliIo = processIo, dependencies: CliDependencies = {}): Promise<number> {
   if (args.length === 1 && (args[0] === '--help' || args[0] === '-h')) {
@@ -213,6 +213,14 @@ export async function runCli(args: string[], cwd = process.cwd(), write: (messag
           const backend = (dependencies.createCodespacesBackend ?? createCodespacesExecutionBackend)({ stateDir, config, runner: nodeProcessRunner, root });
           const request: RemoteCommandRequest = { commandId: `cli-${randomUUID()}`, argv: [rest[separator + 1] ?? 'true', ...rest.slice(separator + 2)] };
           for await (const event of executeWithInterruptRelay(backend, { kind: 'codespaces', id: recorded.workspaceId, name: recorded.name, environmentId: recorded.remote.environmentId }, request)) {
+            if (event.type === 'stdout' || event.type === 'terminal') {
+              io.output.write(event.bytes);
+              continue;
+            }
+            if (event.type === 'stderr') {
+              io.error.write(event.bytes);
+              continue;
+            }
             if (event.type === 'exit') return event.code ?? 1;
             if (event.type === 'rejected') {
               write('Remote command was rejected; no successful remote outcome was reported.');
