@@ -152,6 +152,7 @@ export class HelperSession {
       // A terminal helper outcome can race an in-flight stdin write; send()
       // converts that closed transport into a fail-closed transport error.
     });
+    child.once('error', (error: unknown) => this.fail(error instanceof Error ? error : new Error(String(error))));
     child.stdout.on('data', (chunk: string | Uint8Array) => {
       const bytes = typeof chunk === 'string' ? new TextEncoder().encode(chunk) : new Uint8Array(chunk);
       let frames: HelperFrame[];
