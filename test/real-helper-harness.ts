@@ -11,6 +11,7 @@ import {
   type HelperFrame, type OutputStreamName,
 } from '../src/codespaces-protocol.js';
 import type { FramedChildProcess, SshSpawner } from '../src/codespaces-transport.js';
+import { decodedRemoteSshArgv } from './transport-fixtures.js';
 
 /**
  * Real-binary harness (N2): drives the committed static helper artifact over
@@ -207,7 +208,7 @@ export function realBootstrapRunner(binPath: string, remoteDigest: string): Code
     async run(command, args, runOptions) {
       assert.equal(command, 'gh');
       if (!args.join(' ').startsWith('codespace ssh -c ')) throw new Error(`unrouted bootstrap argv: ${JSON.stringify(args)}`);
-      const remote = args.slice(args.indexOf('--') + 1);
+      const remote = decodedRemoteSshArgv(args);
       const argv = remote.join(' ');
       if (argv === 'uname -m') return { code: 0, stdout: `${realHelperBinaryPath()?.includes('arm64') ? 'aarch64' : 'x86_64'}\n`, stderr: '' };
       if (argv === 'id -u') return { code: 0, stdout: '1000\n', stderr: '' };
@@ -233,8 +234,8 @@ export function realBootstrapRunner(binPath: string, remoteDigest: string): Code
   };
 }
 
-/** Real-binary SshSpawner: spawns the actual host artifact with the serve
- * subcommand and the test data root, regardless of the remote ssh argv shape. */
+/** Real-binary SshSpawner: accepts only the encoded package-owned helper serve
+ * command, then runs the actual host artifact against the test data root. */
 const spawnedRelays = new Set<ChildProcess>();
 export function killSpawnedRelays(): void {
   for (const child of spawnedRelays) {
@@ -246,8 +247,11 @@ export function killSpawnedRelays(): void {
 
 export function createRealHelperSpawner(binPath: string, dataDir: string): SshSpawner {
   return (argv) => {
-    const serve = argv.some((value) => value === 'serve');
-    const child = spawn(binPath, serve ? ['serve'] : argv, {
+    const remote = decodedRemoteSshArgv(argv);
+    if (remote.length !== 2 || remote[1] !== 'serve' || !remote[0]?.startsWith('/workspaces/.agent-containers/')) {
+      throw new Error(`unrouted real helper SSH argv: ${JSON.stringify(argv)}`);
+    }
+    const child = spawn(binPath, ['serve'], {
       stdio: ['pipe', 'pipe', 'pipe'],
       env: { ...process.env, AC_HELPER_DATA_DIR: dataDir },
     });

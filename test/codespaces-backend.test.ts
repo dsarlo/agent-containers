@@ -16,7 +16,7 @@ import { runCli } from '../src/cli.js';
 import { nodeProcessRunner } from '../src/workspaces.js';
 import { reconcileCodespacesWorkspace, removeCodespacesWorkspace, startCodespacesWorkspace, stopCodespacesWorkspace } from '../src/codespaces-lifecycle.js';
 import type { CodespacesAgentContainersConfig, ProcessRunner } from '../src/types.js';
-import { transportFixture, COMMAND_ID } from './transport-fixtures.js';
+import { transportFixture, COMMAND_ID, decodedRemoteSshArgv } from './transport-fixtures.js';
 
 const OID = '0123456789abcdef0123456789abcdef01234567';
 const BLOB = '1234567890abcdef1234567890abcdef12345678';
@@ -64,7 +64,8 @@ function resourceFixture(overrides: Partial<Record<string, unknown>> = {}): Reco
 function readinessRunner(): ProcessRunner {
   return {
     async run(command, args) {
-      const key = ['gh', ...args].join(' ');
+      const remote = command === 'gh' && args[0] === 'codespace' && args[1] === 'ssh' ? decodedRemoteSshArgv(args) : [];
+      const key = ['gh', ...(remote.length ? remote : args)].join(' ');
       const path = args.at(-1) as string;
       const method = args[args.indexOf('--method') + 1];
       if (command === 'git') return { code: 0, stdout: `${OID}\n`, stderr: '' };
@@ -507,7 +508,8 @@ test('Codespaces removal reads remote dirty and unpushed Git risk before deletio
   const deps = { stateDir, name: 'issue-9', config: configFixture(), provider: new GhCodespacesProvider(runner) };
   await assert.rejects(() => removeCodespacesWorkspace(deps, false), /--force-remote-data-loss/);
   await assert.rejects(() => removeCodespacesWorkspace(deps, true), /octo\/agent-containers.*agent-containers\/issue-9.*dirty.*unpushed/i);
-  assert.ok(calls.some((args) => args.join(' ').includes('git status --porcelain=v1 --branch')), 'remote Git state must be observed before deletion');
+  assert.ok(calls.some(([command, ...args]) => command === 'gh' && args[0] === 'codespace' && args[1] === 'ssh'
+    && decodedRemoteSshArgv(args).join(' ') === 'git status --porcelain=v1 --branch'), 'remote Git state must be observed before deletion');
   assert.equal(calls.some((args) => args.includes('DELETE')), false, 'remote risk refusal must not delete');
 });
 

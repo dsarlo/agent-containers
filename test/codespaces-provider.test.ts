@@ -218,7 +218,24 @@ test('provider SSH probe dispatches a fixed package-owned command through gh cod
   });
   const output = await provider.remoteSshProbe('bookish-space-parakeet', ['git', '-C', '/workspaces/agent-containers', 'rev-parse', '--show-toplevel'], { timeoutMs: 5000 });
   assert.equal(output.startsWith('/workspaces/agent-containers'), true);
-  assert.deepEqual(calls, [['gh', 'codespace', 'ssh', '-c', 'bookish-space-parakeet', '--', 'git', '-C', '/workspaces/agent-containers', 'rev-parse', '--show-toplevel']]);
+  assert.deepEqual(calls, [['gh', 'codespace', 'ssh', '-c', 'bookish-space-parakeet', '--', "'git' '-C' '/workspaces/agent-containers' 'rev-parse' '--show-toplevel'"]]);
+});
+
+test('provider SSH transport serializes hostile argv as one shell-safe remote command', async () => {
+  const calls: string[][] = [];
+  const provider = new GhCodespacesProvider({
+    async run(command, args) {
+      calls.push([command, ...args]);
+      return { code: 0, stdout: 'ok\n', stderr: '' };
+    },
+  });
+  await provider.remoteSshProbe('bookish-space-parakeet', [
+    'printf', '%s\\n', 'two words', '$(touch /tmp/injected)', '; echo injected', '$HOME', '"double"', "single'quote", '*',
+  ]);
+  assert.deepEqual(calls, [[
+    'gh', 'codespace', 'ssh', '-c', 'bookish-space-parakeet', '--',
+    "'printf' '%s\\n' 'two words' '$(touch /tmp/injected)' '; echo injected' '$HOME' '\"double\"' 'single'\"'\"'quote' '*'",
+  ]]);
 });
 
 test('provider SSH probe applies a bounded deadline and rejects on timeout without a shell', async () => {

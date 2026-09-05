@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { transportFixture, COMMAND_ID, collect, helperBootstrapRunner, type TransportFixture } from './transport-fixtures.js';
+import { transportFixture, COMMAND_ID, collect, helperBootstrapRunner, type TransportFixture, decodedRemoteSshArgv } from './transport-fixtures.js';
 import { executeRemoteCommand, attachRemoteCommand, cancelRemoteCommand, helperDeps } from '../src/codespaces-transport.js';
 import { bootstrapRemoteHelper } from '../src/codespaces-helper.js';
 import { loadCommandRequest, loadCommandOffsets, loadCommandStatus, loadCommandRecovery } from '../src/codespaces-command.js';
@@ -48,6 +48,13 @@ function reassemble(chunks: readonly { bytes: Uint8Array }[]): Buffer {
   return Buffer.concat(chunks.map((chunk) => Buffer.from(chunk.bytes)));
 }
 
+test('SSH fixture decoder rejects raw, empty, and malformed encoded remote commands', () => {
+  assert.throws(() => decodedRemoteSshArgv(['codespace', 'ssh', '--', 'uname', '-m']), /exactly one encoded/i);
+  assert.throws(() => decodedRemoteSshArgv(['codespace', 'ssh', '--', '']), /empty/i);
+  assert.throws(() => decodedRemoteSshArgv(['codespace', 'ssh', '--', "'unterminated"]), /unterminated/i);
+  assert.throws(() => decodedRemoteSshArgv(['codespace', 'ssh', '--', "'trailing' "]), /trailing separator/i);
+});
+
 test('execute rejects credential-shaped argv before recording or dispatching it (SEC-2)', async () => {
   const fixture = await transportFixture();
   const token = 'ghp_' + 'abcdefghijklmnopqrstuvwxyz123456';
@@ -79,7 +86,10 @@ test('execute preserves the exhaustive argv corpus end to end without a host she
   const record = fixture.helper.records.get(COMMAND_ID);
   assert.ok(record, 'the remote helper must receive the framed argv');
   assert.deepEqual(record.argv, [...argv]);
-  assert.ok(fixture.spawnerCalls.every((args) => args.every((value) => value === 'gh' || value.startsWith('codespace') || value.startsWith('ssh') || value.startsWith('-c') || value === COMMAND_ID || value === '--' || value.startsWith('bookish-') || value.startsWith('/workspaces/.agent-containers/') || value === 'serve' || value.startsWith('agent-containers-helper')), 'only fixed package-owned serve argv may reach the remote'));
+  assert.deepEqual(fixture.spawnerCalls, fixture.spawnerCalls.map(() => [
+    'gh', 'codespace', 'ssh', '-c', 'bookish-space-parakeet', '--',
+    "'/workspaces/.agent-containers/00000000-0000-4000-8000-000000000001/bin/agent-containers-helper-linux-x64' 'serve'",
+  ]), 'every helper session must use one POSIX-quoted remote command');
   // The recorded request hash binds the exact corpus (idempotency).
   const request = await loadCommandRequest(fixture.stateDir, COMMAND_ID);
   assert.ok(request && request.argvCount === argv.length);
@@ -366,7 +376,7 @@ test('cancel proof inspection failure records a durable unknown outcome instead 
   let sha256Checks = 0;
   const runner = {
     async run(command: string, args: string[], options?: { signal?: AbortSignal }) {
-      const remote = args.slice(args.indexOf('--') + 1).join(' ');
+      const remote = decodedRemoteSshArgv(args).join(' ');
       if (remote.startsWith('sha256sum ') && ++sha256Checks >= 3) return { code: 1, stdout: '', stderr: 'forced proof inspection failure' };
       return base.run(command, args, options);
     },
@@ -422,7 +432,7 @@ test('a second interrupt aborts an in-flight helper inspection probe before canc
   let probeAborted = false;
   const runner = {
     async run(command: string, args: string[], options?: { signal?: AbortSignal }) {
-      const remote = args.slice(args.indexOf('--') + 1).join(' ');
+      const remote = decodedRemoteSshArgv(args).join(' ');
       if (stallInspection && remote.startsWith('sha256sum ')) {
         return await new Promise<never>((_, reject) => {
           const onAbort = () => {
