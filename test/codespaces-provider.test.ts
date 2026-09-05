@@ -54,12 +54,12 @@ test('provider create dispatches the documented POST argv with explicit body fie
   assert.equal(resource.state, 'Running');
   assert.deepEqual(calls, [[
     'api', '--method', 'POST', '-H', 'X-GitHub-Api-Version: 2022-11-28',
-    '-f', 'repository_id=42',
+    '-F', 'repository_id=42',
     '-f', 'ref=refs/heads/main',
     '-f', 'devcontainer_path=.devcontainer/devcontainer.json',
     '-f', 'machine=basicLinux32gb',
-    '-f', 'idle_timeout_minutes=30',
-    '-f', 'retention_period_minutes=10080',
+    '-F', 'idle_timeout_minutes=30',
+    '-F', 'retention_period_minutes=10080',
     '-f', 'geo=EastUs',
     '/user/codespaces',
   ]]);
@@ -71,12 +71,12 @@ test('provider create includes display_name and enforced policy fields only when
   await provider.create({ ...validPayload, geo: undefined, displayName: 'agent-containers/issue-9-shell' });
   assert.deepEqual(calls, [[
     'api', '--method', 'POST', '-H', 'X-GitHub-Api-Version: 2022-11-28',
-    '-f', 'repository_id=42',
+    '-F', 'repository_id=42',
     '-f', 'ref=refs/heads/main',
     '-f', 'devcontainer_path=.devcontainer/devcontainer.json',
     '-f', 'machine=basicLinux32gb',
-    '-f', 'idle_timeout_minutes=30',
-    '-f', 'retention_period_minutes=10080',
+    '-F', 'idle_timeout_minutes=30',
+    '-F', 'retention_period_minutes=10080',
     '-f', 'display_name=agent-containers/issue-9-shell',
     '/user/codespaces',
   ]]);
