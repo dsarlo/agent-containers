@@ -89,7 +89,7 @@ test('CLI stdin YAML syntax failures expose only a generic sanitized location', 
     ['init', '--non-interactive', '--stdin', '--yes'],
     root,
     (message) => messages.push(message),
-    { input: Readable.from([`commands:\n  ${sentinel}: [\n`]), output: new Writable({ write(_chunk, _encoding, callback) { callback(); } }), isTTY: false },
+    { input: Readable.from([`commands:\n  ${sentinel}: [\n`]), output: new Writable({ write(_chunk, _encoding, callback) { callback(); } }), error: new Writable({ write(_chunk, _encoding, callback) { callback(); } }), isTTY: false },
   );
   assert.equal(code, 1);
   assert.match(messages.at(-1) ?? '', /^agent-containers: Invalid Codespaces setup draft syntax at line \d+, column \d+\.$/);
@@ -466,6 +466,90 @@ test('Codespaces exec returns nonzero for terminal unverified outcomes and prese
     if (event.type !== 'exit') assert.match(messages.at(-1) ?? '', /Remote command/i);
     assert.doesNotMatch(messages.join('\n'), /ghp_012345678901234567890123456789012345/);
   }
+});
+
+test('Codespaces exec streams live remote output bytes to their CLI streams and returns the remote exit code', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'agent-containers-cli-codespaces-live-output-'));
+  const stateHome = await mkdtemp(join(tmpdir(), 'agent-containers-cli-codespaces-live-output-state-'));
+  const stateDir = join(stateHome, 'agent-containers');
+  const previousStateHome = process.env.XDG_STATE_HOME;
+  const previousGate = process.env.AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES;
+  const { setStateDurabilityAdapterForTesting } = await import('../src/state.js');
+  setStateDurabilityAdapterForTesting({ publicationMode: async () => 'strict', assertStateWriteSupport: async () => undefined, syncFile: async () => undefined, syncDirectory: async () => undefined, moveFileWriteThrough: async () => undefined });
+  process.env.XDG_STATE_HOME = stateHome;
+  process.env.AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES = '1';
+  t.after(async () => {
+    setStateDurabilityAdapterForTesting(undefined);
+    if (previousStateHome === undefined) delete process.env.XDG_STATE_HOME; else process.env.XDG_STATE_HOME = previousStateHome;
+    if (previousGate === undefined) delete process.env.AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES; else process.env.AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES = previousGate;
+    await Promise.all([rm(root, { recursive: true, force: true }), rm(stateHome, { recursive: true, force: true })]);
+  });
+  assert.equal(spawnSync('git', ['init', '-b', 'main'], { cwd: root }).status, 0);
+  await writeFile(join(root, '.agent-containers.yml'), JSON.stringify(codespacesConfig()));
+  await saveMetadata(stateDir, codespacesMetadata());
+  const writes: Array<{ stream: 'output' | 'error'; bytes: Buffer }> = [];
+  const output = new Writable({ write(chunk, _encoding, callback) { writes.push({ stream: 'output', bytes: Buffer.from(chunk) }); callback(); } });
+  const error = new Writable({ write(chunk, _encoding, callback) { writes.push({ stream: 'error', bytes: Buffer.from(chunk) }); callback(); } });
+  const backend: ExecutionBackend = {
+    kind: 'codespaces', async create() { throw new Error('unexpected'); }, async observe() { throw new Error('unexpected'); }, async *waitReady() { yield* []; throw new Error('unexpected'); },
+    async *execute() {
+      yield { type: 'stdout', commandId: 'remote-command', offset: 0n, bytes: Buffer.from([0, 255]) };
+      yield { type: 'stderr', commandId: 'remote-command', offset: 0n, bytes: Buffer.from([1, 254]) };
+      yield { type: 'terminal', commandId: 'remote-command', offset: 0n, bytes: Buffer.from([2, 253]) };
+      yield { type: 'exit', commandId: 'remote-command', code: 42 };
+    },
+    async *attach() { yield* []; throw new Error('unexpected'); }, async cancel() { throw new Error('unexpected'); }, async recover() { throw new Error('unexpected'); }, async remove() { throw new Error('unexpected'); },
+  };
+
+  const code = await runCli(['exec', 'remote', '--', 'true'], root, () => undefined, { input: Readable.from([]), output, error, isTTY: false }, { createCodespacesBackend: () => backend });
+
+  assert.equal(code, 42);
+  assert.deepEqual(writes, [
+    { stream: 'output', bytes: Buffer.from([0, 255]) },
+    { stream: 'error', bytes: Buffer.from([1, 254]) },
+    { stream: 'output', bytes: Buffer.from([2, 253]) },
+  ]);
+});
+
+test('Codespaces exec detached status does not fabricate output or success', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'agent-containers-cli-codespaces-detached-'));
+  const stateHome = await mkdtemp(join(tmpdir(), 'agent-containers-cli-codespaces-detached-state-'));
+  const stateDir = join(stateHome, 'agent-containers');
+  const previousStateHome = process.env.XDG_STATE_HOME;
+  const previousGate = process.env.AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES;
+  const { setStateDurabilityAdapterForTesting } = await import('../src/state.js');
+  setStateDurabilityAdapterForTesting({ publicationMode: async () => 'strict', assertStateWriteSupport: async () => undefined, syncFile: async () => undefined, syncDirectory: async () => undefined, moveFileWriteThrough: async () => undefined });
+  process.env.XDG_STATE_HOME = stateHome;
+  process.env.AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES = '1';
+  t.after(async () => {
+    setStateDurabilityAdapterForTesting(undefined);
+    if (previousStateHome === undefined) delete process.env.XDG_STATE_HOME; else process.env.XDG_STATE_HOME = previousStateHome;
+    if (previousGate === undefined) delete process.env.AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES; else process.env.AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES = previousGate;
+    await Promise.all([rm(root, { recursive: true, force: true }), rm(stateHome, { recursive: true, force: true })]);
+  });
+  assert.equal(spawnSync('git', ['init', '-b', 'main'], { cwd: root }).status, 0);
+  await writeFile(join(root, '.agent-containers.yml'), JSON.stringify(codespacesConfig()));
+  await saveMetadata(stateDir, codespacesMetadata());
+  const output: Buffer[] = [];
+  const error: Buffer[] = [];
+  const backend: ExecutionBackend = {
+    kind: 'codespaces', async create() { throw new Error('unexpected'); }, async observe() { throw new Error('unexpected'); }, async *waitReady() { yield* []; throw new Error('unexpected'); },
+    async *execute() { yield { type: 'detached', commandId: 'remote-command', offsets: { stdout: 0n, stderr: 0n, terminal: 0n } }; },
+    async *attach() { yield { type: 'exit', commandId: 'remote-command', code: 0 }; }, async cancel() { throw new Error('unexpected'); }, async recover() { throw new Error('unexpected'); }, async remove() { throw new Error('unexpected'); },
+  };
+  const messages: string[] = [];
+
+  const code = await runCli(['exec', 'remote', '--', 'true'], root, (message) => messages.push(message), {
+    input: Readable.from([]),
+    output: new Writable({ write(chunk, _encoding, callback) { output.push(Buffer.from(chunk)); callback(); } }),
+    error: new Writable({ write(chunk, _encoding, callback) { error.push(Buffer.from(chunk)); callback(); } }),
+    isTTY: false,
+  }, { createCodespacesBackend: () => backend });
+
+  assert.equal(code, 1);
+  assert.deepEqual(output, []);
+  assert.deepEqual(error, []);
+  assert.match(messages.at(-1) ?? '', /detached.*outcome was known/i);
 });
 
 function codespacesConfig() {
