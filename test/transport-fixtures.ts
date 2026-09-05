@@ -95,20 +95,23 @@ export function decodedRemoteSshArgv(args: readonly string[]): string[] {
   const separator = args.indexOf('--');
   if (separator < 0) throw new Error('SSH fixture argv is missing its separator.');
   const remote = args.slice(separator + 1);
-  if (remote.length !== 1) return [...remote];
-  const encoded = remote[0] ?? '';
+  if (remote.length !== 1) throw new Error('SSH fixture argv must contain exactly one encoded remote command.');
+  const encoded = remote[0];
+  if (!encoded) throw new Error('SSH fixture encoded remote command is empty.');
   const values: string[] = [];
   let index = 0;
   while (index < encoded.length) {
     if (encoded[index] !== "'") throw new Error(`SSH fixture command is not POSIX-quoted: ${encoded}`);
     index += 1;
     let value = '';
+    let terminated = false;
     while (index < encoded.length) {
       if (encoded.startsWith("'\"'\"'", index)) { value += "'"; index += 5; continue; }
-      if (encoded[index] === "'") { index += 1; break; }
+      if (encoded[index] === "'") { index += 1; terminated = true; break; }
       value += encoded[index] ?? '';
       index += 1;
     }
+    if (!terminated) throw new Error(`SSH fixture command has an unterminated quote: ${encoded}`);
     values.push(value);
     if (index === encoded.length) break;
     if (encoded[index] !== ' ') throw new Error(`SSH fixture command has an invalid separator: ${encoded}`);

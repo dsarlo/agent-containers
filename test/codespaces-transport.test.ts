@@ -48,6 +48,12 @@ function reassemble(chunks: readonly { bytes: Uint8Array }[]): Buffer {
   return Buffer.concat(chunks.map((chunk) => Buffer.from(chunk.bytes)));
 }
 
+test('SSH fixture decoder rejects raw, empty, and malformed encoded remote commands', () => {
+  assert.throws(() => decodedRemoteSshArgv(['codespace', 'ssh', '--', 'uname', '-m']), /exactly one encoded/i);
+  assert.throws(() => decodedRemoteSshArgv(['codespace', 'ssh', '--', '']), /empty/i);
+  assert.throws(() => decodedRemoteSshArgv(['codespace', 'ssh', '--', "'unterminated"]), /unterminated/i);
+});
+
 test('execute rejects credential-shaped argv before recording or dispatching it (SEC-2)', async () => {
   const fixture = await transportFixture();
   const token = 'ghp_' + 'abcdefghijklmnopqrstuvwxyz123456';
