@@ -234,8 +234,8 @@ export function realBootstrapRunner(binPath: string, remoteDigest: string): Code
   };
 }
 
-/** Real-binary SshSpawner: spawns the actual host artifact with the serve
- * subcommand and the test data root, regardless of the remote ssh argv shape. */
+/** Real-binary SshSpawner: accepts only the encoded package-owned helper serve
+ * command, then runs the actual host artifact against the test data root. */
 const spawnedRelays = new Set<ChildProcess>();
 export function killSpawnedRelays(): void {
   for (const child of spawnedRelays) {
@@ -247,8 +247,11 @@ export function killSpawnedRelays(): void {
 
 export function createRealHelperSpawner(binPath: string, dataDir: string): SshSpawner {
   return (argv) => {
-    const serve = argv.some((value) => value === 'serve');
-    const child = spawn(binPath, serve ? ['serve'] : argv, {
+    const remote = decodedRemoteSshArgv(argv);
+    if (remote.length !== 2 || remote[1] !== 'serve' || !remote[0]?.startsWith('/workspaces/.agent-containers/')) {
+      throw new Error(`unrouted real helper SSH argv: ${JSON.stringify(argv)}`);
+    }
+    const child = spawn(binPath, ['serve'], {
       stdio: ['pipe', 'pipe', 'pipe'],
       env: { ...process.env, AC_HELPER_DATA_DIR: dataDir },
     });

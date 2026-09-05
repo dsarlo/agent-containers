@@ -379,7 +379,7 @@ function positiveInteger(value: unknown): value is number { return typeof value 
 function nullablePositiveInteger(value: unknown): value is number | null { return value === null || positiveInteger(value); }
 function safeName(value: unknown): value is string { return typeof value === 'string' && /^[A-Za-z0-9-]+$/.test(value) && !secretShaped(value); }
 /** Serialize one validated argv token for the remote POSIX shell used by gh SSH. */
-function posixShellQuote(value: string): string { return `'${value.replaceAll("'", "'\"'\"'")}'`; }
+export function posixShellQuote(value: string): string { return `'${value.replaceAll("'", "'\"'\"'")}'`; }
 function oid(value: unknown): value is string { return typeof value === 'string' && /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(value); }
 function safeRef(value: string): boolean { return !secretShaped(value) && /^refs\/(?:heads|tags)\/(?:[A-Za-z0-9][A-Za-z0-9._-]*)(?:\/[A-Za-z0-9][A-Za-z0-9._-]*)*$/.test(value) && !value.includes('..') && !value.split('/').some((part) => part.endsWith('.') || part.endsWith('.lock')); }
 function safeRepositoryPath(value: unknown): value is string { return typeof value === 'string' && !secretShaped(value) && value.length > 0 && !/[\0\r\n]/.test(value) && !value.startsWith('/') && !value.split('/').some((part) => !part || part === '.' || part === '..'); }

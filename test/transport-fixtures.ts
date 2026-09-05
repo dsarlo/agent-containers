@@ -116,6 +116,7 @@ export function decodedRemoteSshArgv(args: readonly string[]): string[] {
     if (index === encoded.length) break;
     if (encoded[index] !== ' ') throw new Error(`SSH fixture command has an invalid separator: ${encoded}`);
     index += 1;
+    if (index === encoded.length) throw new Error(`SSH fixture command has a trailing separator: ${encoded}`);
   }
   return values;
 }

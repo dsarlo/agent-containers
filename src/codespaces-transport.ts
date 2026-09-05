@@ -5,7 +5,7 @@ import {
   computeRequestHash, decodeFramedJson, encodeFrame, encodeJsonFrame, encodeOutputEvent, decodeOutputEvent,
   HelperFrameDecoder, HelperFrameType, HELPER_PROTOCOL_VERSION, type HelperFrame, type OutputStreamName,
 } from './codespaces-protocol.js';
-import type { GhCodespacesProvider } from './codespaces.js';
+import { posixShellQuote, type GhCodespacesProvider } from './codespaces.js';
 import { loadMetadata, metadataGeneration, saveMetadata, type CodespacesWorkspaceMetadata } from './state.js';
 import {
   loadCommandOffsets, loadCommandRequest, loadCommandStatus, recordCommandRecovery, recordCommandRequest, resolveCommandIdempotency,
@@ -610,7 +610,8 @@ async function acknowledgeStarted(deps: RemoteTransportDependencies, session: He
 }
 
 async function openSession(deps: RemoteTransportDependencies, binPath: string, signal = deps.signal): Promise<HelperSession> {
-  const child = deps.spawner(['gh', 'codespace', 'ssh', '-c', deps.metadata.remote.name, '--', binPath, 'serve'], { signal });
+  const remoteCommand = [binPath, 'serve'].map(posixShellQuote).join(' ');
+  const child = deps.spawner(['gh', 'codespace', 'ssh', '-c', deps.metadata.remote.name, '--', remoteCommand], { signal });
   drainStderr(child);
   return new HelperSession(child);
 }
