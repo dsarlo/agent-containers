@@ -311,6 +311,21 @@ test('billing/policy/machine rejection preserves the create intent and never cho
   assert.ok(fallback >= 1, 'only the explicit machine is ever submitted');
 });
 
+test('multiline provider failure is normalized before durable ambiguous-create recovery', async () => {
+  const { deps, stateDir, dispatch } = await harness({
+    create: () => ({ code: 422, stderr: 'validation failed\nrequest was rejected\n' }),
+  } as unknown as RouteOverrides);
+  const outcome = await createCodespacesWorkspace(deps);
+  assert.equal(outcome.outcome, 'ambiguous');
+  if (outcome.outcome !== 'ambiguous') return;
+  assert.equal(outcome.reason, 'create-response-truncated-or-invalid');
+  const intent = await loadCreateIntent(stateDir, deps.requestId);
+  assert.equal(intent?.state, 'ambiguous-create');
+  assert.equal(intent?.providerError?.includes('\n'), false);
+  assert.match(intent?.providerError ?? '', /validation failed request was rejected/);
+  assert.equal(dispatch.filter((entry) => entry.args.includes('/user/codespaces') && entry.args.includes('POST')).length, 1);
+});
+
 test('capacity exhaustion blocks create before dispatch (1 creating / 2 running / 4 total)', async () => {
   const { deps, stateDir, dispatch } = await harness();
   deps.now = () => '2026-09-02T12:00:00.000Z';
