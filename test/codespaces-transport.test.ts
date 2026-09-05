@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
+import { PassThrough } from 'node:stream';
 import test from 'node:test';
 import { transportFixture, COMMAND_ID, collect, helperBootstrapRunner, type TransportFixture, decodedRemoteSshArgv } from './transport-fixtures.js';
-import { executeRemoteCommand, attachRemoteCommand, cancelRemoteCommand, helperDeps } from '../src/codespaces-transport.js';
+import { executeRemoteCommand, attachRemoteCommand, cancelRemoteCommand, helperDeps, HelperSession, type FramedChildProcess } from '../src/codespaces-transport.js';
 import { bootstrapRemoteHelper } from '../src/codespaces-helper.js';
 import { loadCommandRequest, loadCommandOffsets, loadCommandStatus, loadCommandRecovery } from '../src/codespaces-command.js';
 import { loadMetadata } from '../src/state.js';
@@ -53,6 +55,26 @@ test('SSH fixture decoder rejects raw, empty, and malformed encoded remote comma
   assert.throws(() => decodedRemoteSshArgv(['codespace', 'ssh', '--', '']), /empty/i);
   assert.throws(() => decodedRemoteSshArgv(['codespace', 'ssh', '--', "'unterminated"]), /unterminated/i);
   assert.throws(() => decodedRemoteSshArgv(['codespace', 'ssh', '--', "'trailing' "]), /trailing separator/i);
+});
+
+test('a child-process ABORT_ERR fails the helper session instead of becoming an unhandled error', async () => {
+  const events = new EventEmitter();
+  const child = {
+    stdin: new PassThrough(),
+    stdout: new PassThrough(),
+    stderr: new PassThrough(),
+    pid: 4242,
+    kill: () => true,
+    once: (event: 'close' | 'error', listener: (...args: unknown[]) => void) => {
+      events.once(event, listener);
+      return child;
+    },
+  } as FramedChildProcess;
+  const session = new HelperSession(child);
+  const error = Object.assign(new Error('The operation was aborted'), { code: 'ABORT_ERR' });
+  const next = session.nextEvent();
+  assert.doesNotThrow(() => events.emit('error', error));
+  await assert.rejects(next, error);
 });
 
 test('execute rejects credential-shaped argv before recording or dispatching it (SEC-2)', async () => {
