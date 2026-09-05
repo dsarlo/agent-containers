@@ -265,7 +265,7 @@ test('provider lifecycle operations use exact documented argv and port observati
   const provider = new GhCodespacesProvider({
     async run(_command, args) {
       calls.push(args);
-      if (args.at(-1)?.endsWith('/ports')) return { code: 0, stdout: JSON.stringify([{ port: 3000, visibility: 'private' }]), stderr: '' };
+      if (args[0] === 'codespace' && args[1] === 'ports') return { code: 0, stdout: JSON.stringify([{ sourcePort: 3000, visibility: 'private' }]), stderr: '' };
       return { code: 0, stdout: '', stderr: '' };
     },
   });
@@ -277,6 +277,6 @@ test('provider lifecycle operations use exact documented argv and port observati
     ['api', '--method', 'PATCH', '-H', 'X-GitHub-Api-Version: 2022-11-28', '-f', 'state=Shutdown', '/user/codespaces/bookish-space-parakeet'],
     ['api', '--method', 'PATCH', '-H', 'X-GitHub-Api-Version: 2022-11-28', '-f', 'state=Running', '/user/codespaces/bookish-space-parakeet'],
     ['api', '--method', 'DELETE', '-H', 'X-GitHub-Api-Version: 2022-11-28', '/user/codespaces/bookish-space-parakeet'],
-    ['api', '--method', 'GET', '-H', 'X-GitHub-Api-Version: 2022-11-28', '/user/codespaces/bookish-space-parakeet/ports'],
+    ['codespace', 'ports', '--codespace', 'bookish-space-parakeet', '--json', 'sourcePort,visibility'],
   ]);
 });

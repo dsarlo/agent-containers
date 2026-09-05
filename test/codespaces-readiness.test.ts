@@ -83,6 +83,9 @@ async function probeContext(options: ProbeOptions = {}) {
   const run: ProcessRunner['run'] = async (command, args) => {
     dispatch.push(args);
     const key = ['gh', ...args].join(' ');
+    if (command === 'gh' && args[0] === 'codespace' && args[1] === 'ports') {
+      return { code: 0, stdout: JSON.stringify(options.ports ?? []), stderr: '' };
+    }
     if (command === 'gh' && /\/ports$/.test(args.at(-1) ?? '')) {
       return { code: 0, stdout: JSON.stringify(options.ports ?? []), stderr: '' };
     }

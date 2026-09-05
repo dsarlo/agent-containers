@@ -15,6 +15,8 @@ export interface CodespacesLifecycleDependencies {
   provider: GhCodespacesProvider;
   config: CodespacesAgentContainersConfig;
   now?: () => string;
+  /** Test seam for bounded asynchronous provider lifecycle transitions. */
+  sleep?: (milliseconds: number) => Promise<void>;
 }
 
 export type ReconcileOutcome = 'matched' | 'missing' | 'mismatch' | 'unreachable' | 'ambiguous';
@@ -38,8 +40,7 @@ export async function stopCodespacesWorkspace(deps: CodespacesLifecycleDependenc
   await mutate(deps, metadata, 'stop', 'stop-requested', async () => {
     await verifyBeforeMutation(deps, metadata);
     await deps.provider.setState(metadata.remote.name, 'Shutdown');
-    const readback = await deps.provider.get(metadata.remote.name);
-    if (!verifyCodespacesIdentity(metadata, readback).ok || !/stopp|shutdown/i.test(readback.state)) throw new Error('Stop readback did not prove the exact recorded Codespace is stopped.');
+    const readback = await waitForLifecycleState(deps, metadata, (state) => /stopp|shutdown/i.test(state), 'Stop');
     await markStoppedCommands(deps.stateDir);
     return { normalized: 'stopped', providerRawState: readback.state, cleanup: { ...metadata.cleanup, remoteStopped: true } };
   });
@@ -53,8 +54,7 @@ export async function startCodespacesWorkspace(deps: CodespacesLifecycleDependen
     await mutate(deps, metadata, 'start', 'start-requested', async () => {
       await verifyBeforeMutation(deps, metadata);
       await deps.provider.setState(metadata.remote.name, 'Running');
-      const readback = await deps.provider.get(metadata.remote.name);
-      if (!verifyCodespacesIdentity(metadata, readback).ok || !/running|available|starting/i.test(readback.state)) throw new Error('Start readback did not prove the exact recorded Codespace is running.');
+      const readback = await waitForLifecycleState(deps, metadata, (state) => /running|available|starting/i.test(state), 'Start');
       return { normalized: 'starting', providerRawState: readback.state, cleanup: metadata.cleanup };
     });
   });
@@ -102,6 +102,24 @@ async function verifyBeforeMutation(deps: CodespacesLifecycleDependencies, metad
   if (actor.id !== metadata.control.actorId) throw new Error('Authenticated actor drifted from the recorded owner; lifecycle is BLOCKED.');
   const resource = await deps.provider.get(metadata.remote.name);
   if (!verifyCodespacesIdentity(metadata, resource).ok) throw new Error('Exact Codespace identity drifted; lifecycle is BLOCKED.');
+}
+
+async function waitForLifecycleState(
+  deps: CodespacesLifecycleDependencies,
+  metadata: CodespacesWorkspaceMetadata,
+  accepts: (state: string) => boolean,
+  operation: 'Start' | 'Stop',
+): Promise<Awaited<ReturnType<GhCodespacesProvider['get']>>> {
+  const deadline = Date.now() + (deps.config.backends.codespaces.readiness.providerTimeoutSeconds * 1000);
+  const sleep = deps.sleep ?? ((milliseconds: number) => new Promise<void>((resolve) => setTimeout(resolve, milliseconds)));
+  while (true) {
+    const readback = await deps.provider.get(metadata.remote.name);
+    if (!verifyCodespacesIdentity(metadata, readback).ok) throw new Error(`${operation} readback did not prove the exact recorded Codespace identity.`);
+    if (accepts(readback.state)) return readback;
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) throw new Error(`${operation} readback did not reach the requested provider state before the bounded deadline.`);
+    await sleep(Math.min(1_000, remaining));
+  }
 }
 
 async function mutate(deps: CodespacesLifecycleDependencies, metadata: CodespacesWorkspaceMetadata, kind: 'stop' | 'start' | 'remove', event: 'stop-requested' | 'start-requested' | 'remove-requested', action: () => Promise<{ normalized: string; providerRawState: string; cleanup: CodespacesWorkspaceMetadata['cleanup'] }>): Promise<void> {
