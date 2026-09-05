@@ -75,6 +75,7 @@ function readinessRunner(): ProcessRunner {
       if (command === 'gh' && path === '/user/codespaces' && method === 'POST') return { code: 0, stdout: JSON.stringify(resourceFixture()), stderr: '' };
       if (command === 'gh' && /^\/user\/codespaces(?:\?|$)/.test(path) && method === 'GET') return { code: 0, stdout: JSON.stringify({ total_count: 0, codespaces: [] }), stderr: '' };
       if (command === 'gh' && /^\/user\/codespaces\/[A-Za-z0-9-]+$/.test(path)) return { code: 0, stdout: JSON.stringify(resourceFixture()), stderr: '' };
+      if (command === 'gh' && args[0] === 'codespace' && args[1] === 'ports') return { code: 0, stdout: '[]', stderr: '' };
       if (command === 'gh' && /^\/user\/codespaces\/[A-Za-z0-9-]+\/ports$/.test(path)) return { code: 0, stdout: '[]', stderr: '' };
       if (command === 'gh' && args[0] === 'codespace' && args[1] === 'logs') return { code: 0, stdout: `build line token ${TOKEN_FIXTURE}\n`, stderr: '' };
       if (command === 'gh' && args[0] === 'codespace' && args[1] === 'ssh') {
@@ -465,6 +466,29 @@ test('lifecycle stop/start uses exact identity, blocks active commands, and reco
   assert.equal(startedRecord.lifecycle.normalized, 'starting');
   assert.ok(calls.some((args) => args.includes('state=Shutdown')));
   assert.ok(calls.some((args) => args.includes('state=Running')));
+});
+
+test('stop waits through an asynchronous ShuttingDown readback before recording the exact workspace stopped', async () => {
+  const stateDir = join(await mkdtemp(join(tmpdir(), 'agent-containers-lifecycle-stop-poll-')), 'state');
+  await saveMetadata(stateDir, recordedWorkspace(), { expectedGeneration: null });
+  let state = 'Running';
+  let shuttingDownReads = 0;
+  const runner: ProcessRunner = { async run(_command, args) {
+    if (args.includes('/user')) return { code: 0, stdout: JSON.stringify({ id: 1, login: 'octo' }), stderr: '' };
+    if (args.includes('state=Shutdown')) { state = 'ShuttingDown'; return { code: 0, stdout: '', stderr: '' }; }
+    if (/^\/user\/codespaces\//.test(args.at(-1) ?? '')) {
+      if (state === 'ShuttingDown' && ++shuttingDownReads === 2) state = 'Shutdown';
+      return { code: 0, stdout: JSON.stringify(resourceFixture({ state })), stderr: '' };
+    }
+    throw new Error(`unexpected lifecycle call ${JSON.stringify(args)}`);
+  } };
+  let sleeps = 0;
+  await stopCodespacesWorkspace({ stateDir, name: 'issue-9', config: configFixture(), provider: new GhCodespacesProvider(runner), sleep: async () => { sleeps += 1; } });
+  const stopped = await loadMetadata(stateDir, 'issue-9');
+  assert.ok(stopped && stopped.version === 2 && stopped.backend === 'codespaces');
+  assert.equal(stopped.lifecycle.normalized, 'stopped');
+  assert.equal(stopped.recovery, null);
+  assert.equal(sleeps, 1);
 });
 
 test('Codespaces removal reads remote dirty and unpushed Git risk before deletion and requires its own data-loss acknowledgement', async () => {

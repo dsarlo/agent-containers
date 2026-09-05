@@ -96,14 +96,16 @@ export class GhCodespacesProvider {
     return { branch, dirty: lines.some((line) => !line.startsWith('## ')), unpushed: /\[ahead(?: \d+)?(?:, behind \d+)?\]/.test(header) };
   }
 
-  /** Read-only port observation. This phase never changes visibility. */
+  /** Read-only port observation through GitHub CLI's documented JSON surface. */
   async ports(name: string): Promise<ReadonlyArray<{ port: number; visibility: string }>> {
     if (!safeName(name)) throw new Error('Invalid Codespaces name.');
-    const value = await this.api(`/user/codespaces/${encodeURIComponent(name)}/ports`);
+    const result = await this.process.run('gh', ['codespace', 'ports', '--codespace', name, '--json', 'sourcePort,visibility'], { kind: 'readonly-probe' });
+    if (result.code !== 0) throw providerError('ports', name, result);
+    const value = parseJson(result.stdout, `codespace ports for ${name}`);
     if (!Array.isArray(value)) throw new Error('Codespaces port observation is incomplete.');
     return value.map((entry) => {
-      if (!isRecord(entry) || !positiveInteger(entry.port) || !safeDisplay(entry.visibility)) throw new Error('Codespaces port observation contains an invalid entry.');
-      return { port: entry.port, visibility: entry.visibility };
+      if (!isRecord(entry) || !positiveInteger(entry.sourcePort) || !safeDisplay(entry.visibility)) throw new Error('Codespaces port observation contains an invalid entry.');
+      return { port: entry.sourcePort, visibility: entry.visibility };
     });
   }
 
