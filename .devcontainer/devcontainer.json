@@ -2,5 +2,10 @@
   "name": "Agent Containers Development",
   "image": "mcr.microsoft.com/devcontainers/javascript-node:22-bookworm",
   "remoteUser": "node",
+  "features": {
+    "ghcr.io/devcontainers/features/sshd:1": {
+      "version": "latest"
+    }
+  },
   "postCreateCommand": "npm ci --ignore-scripts"
 }

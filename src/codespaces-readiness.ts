@@ -246,7 +246,7 @@ async function freshReadback(deps: CodespacesReadinessDependencies, metadata: Co
   observed.state = readback.state;
   const verification = verifyCodespacesIdentity(metadata, readback);
   if (!verification.ok) return { id: 'readback-facts', state: 'blocked', observedAt: now(), detail: `readback identity mismatch: ${verification.mismatches.join(', ')}.`, timeoutMs };
-  if (readback.devcontainerPath !== metadata.source.devcontainerPath) return { id: 'readback-facts', state: 'blocked', observedAt: now(), detail: `readback devcontainer_path ${readback.devcontainerPath} does not match the recorded committed path ${metadata.source.devcontainerPath}.`, timeoutMs };
+  if (readback.devcontainerPath !== null && readback.devcontainerPath !== metadata.source.devcontainerPath) return { id: 'readback-facts', state: 'blocked', observedAt: now(), detail: `readback devcontainer_path ${readback.devcontainerPath} does not match the recorded committed path ${metadata.source.devcontainerPath}.`, timeoutMs };
   return { id: 'readback-facts', state: 'passed', observedAt: now(), detail: 'readback facts match the recorded immutable identity.', timeoutMs };
 }
 

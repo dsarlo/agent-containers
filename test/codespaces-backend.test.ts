@@ -53,11 +53,11 @@ function configFixture(): CodespacesAgentContainersConfig {
 function resourceFixture(overrides: Partial<Record<string, unknown>> = {}): Record<string, unknown> {
   return {
     id: '9876543210', display_name: 'bookish-space-parakeet', name: 'bookish-space-parakeet', environment_id: 'env-8f1c1f0e',
-    owner: { id: 1, login: 'octo' }, repository_id: 42,
+    owner: { id: 1, login: 'octo' },
     repository: { id: 42, name: 'agent-containers', owner: { id: 1, login: 'octo' } },
-    billing_owner: { id: 1, login: 'octo' }, machine_name: 'basicLinux32gb', location: 'East US', geo: 'EastUs',
+    billable_owner: { id: 1, login: 'octo' }, machine: { name: 'basicLinux32gb' }, location: 'EastUs',
     created_at: '2026-09-02T12:00:00Z', state: 'Running',
-    git_status: { sha: OID, ref: 'main' }, devcontainer_path: '.devcontainer/devcontainer.json', idle_timeout_minutes: 30, ...overrides,
+    git_status: { ref: 'main' }, devcontainer_path: '.devcontainer/devcontainer.json', idle_timeout_minutes: 30, ...overrides,
   };
 }
 
@@ -321,6 +321,24 @@ test('the Codespaces backend rejects credential-shaped argv before it reaches th
       }
     }, /credential-shaped argv/i);
     assert.equal(fixture.helper.records.has('cmd-secret'), false, 'credential-shaped argv must not reach the remote helper');
+  } finally {
+    if (previous === undefined) delete process.env.AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES;
+    else process.env.AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES = previous;
+  }
+});
+
+test('the Codespaces backend refuses provisioning metadata before spawning a remote command', async () => {
+  const fixture = await transportFixture();
+  const previous = process.env.AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES;
+  try {
+    process.env.AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES = '1';
+    await saveMetadata(fixture.stateDir, { ...fixture.metadata, lifecycle: { ...fixture.metadata.lifecycle, normalized: 'provisioning', providerRawState: 'Provisioning' } });
+    const backend = createCodespacesExecutionBackend({ stateDir: fixture.stateDir, config: fixture.deps.config, runner: fixture.runner, root: fixture.fixture.root, spawner: fixture.deps.spawner });
+    const handle = { kind: 'codespaces' as const, id: fixture.metadata.workspaceId, name: fixture.metadata.remote.name, environmentId: fixture.metadata.remote.environmentId };
+    await assert.rejects(async () => {
+      for await (const event of backend.execute(handle, { commandId: 'cmd-before-ready', argv: ['true'], mode: 'pipe' })) void event;
+    }, /wait.*ready/i);
+    assert.equal(fixture.helper.records.has('cmd-before-ready'), false);
   } finally {
     if (previous === undefined) delete process.env.AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES;
     else process.env.AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES = previous;

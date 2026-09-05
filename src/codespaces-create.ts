@@ -310,7 +310,7 @@ function buildMetadata(deps: CodespacesCreateDependencies, preflight: Codespaces
     control: { githubHost: 'github.com', actorId: preflight.actor.id, actorLogin: preflight.actor.login, ghVersion: deps.ghVersion },
     repository: preflight.repository,
     source: { requestedRef: preflight.requestedRef, expectedOid: preflight.expectedOid, effectiveBranch: preflight.effectiveBranch, devcontainerPath: preflight.devcontainerPath, devcontainerBlobOid: preflight.devcontainerBlobOid },
-    remote: { codespaceId: resource.id, name: resource.name, environmentId: resource.environmentId, ownerId: resource.owner.id, ownerLogin: resource.owner.login, billableOwnerId: resource.billingOwner.id, machine: resource.machineName, geo: resource.geo ?? resource.location, createdAt: resource.createdAt },
+    remote: { codespaceId: resource.id, name: resource.name, environmentId: resource.environmentId ?? resource.id, ownerId: resource.owner.id, ownerLogin: resource.owner.login, billableOwnerId: resource.billingOwner.id, machine: resource.machineName ?? explicitMachine(deps.config), geo: resource.geo ?? resource.location, createdAt: resource.createdAt },
     lifecycle: { desired: 'ready', normalized: 'provisioning', providerRawState: resource.state, lastObservedAt: now(), activeOperation: { id: operationId, kind: 'create', startedAt: now(), checkpoint: 'resource-recorded' } },
     recovery: null,
     cleanup: { remoteStopped: false, remoteDeleted: false, tombstoneWritten: false },
@@ -331,7 +331,7 @@ async function persistMetadata(deps: CodespacesCreateDependencies, next: Codespa
 function classifyCreateAmbiguity(error: unknown): CodespacesRecoveryReason {
   if (error instanceof Error && error.name === 'AbortError') return 'provider-timeout-before-dispatch';
   const detail = error instanceof Error ? error.message : String(error);
-  if (/tim(e|ed)? ?out|timeout|ETIMEDOUT|ESOCKETTIMEDOUT/i.test(detail)) return 'provider-timeout-after-creation-possible';
+  if (/tim(e|ed)? ?out|timeout|deadline|ETIMEDOUT|ESOCKETTIMEDOUT/i.test(detail)) return 'provider-timeout-after-creation-possible';
   if (/billing|policy|machine|402|403|422/i.test(detail)) return 'billing-policy-machine-rejected';
   return 'create-response-truncated-or-invalid';
 }
@@ -381,17 +381,19 @@ export function verifyIdenticalResources(left: CodespacesResource, right: Codesp
   const check = (label: string, leftValue: string | number | null, rightValue: string | number | null): void => {
     if (String(leftValue) !== String(rightValue)) mismatches.push(label);
   };
+  const checkOptional = (label: string, leftValue: string | number | null, rightValue: string | number | null): void => {
+    if (leftValue !== null && rightValue !== null) check(label, leftValue, rightValue);
+  };
   check('id', left.id, right.id);
   check('name', left.name, right.name);
-  check('environment_id', left.environmentId, right.environmentId);
+  checkOptional('environment_id', left.environmentId, right.environmentId);
   check('owner', left.owner.id, right.owner.id);
   check('repository_id', left.repositoryId, right.repositoryId);
   check('billing_owner', left.billingOwner.id, right.billingOwner.id);
-  check('machine', left.machineName, right.machineName);
+  checkOptional('machine', left.machineName, right.machineName);
   check('geo/location', left.geo ?? left.location, right.geo ?? right.location);
   check('created_at', left.createdAt, right.createdAt);
-  check('devcontainer_path', left.devcontainerPath, right.devcontainerPath);
-  check('git_status.sha', left.gitStatus.sha, right.gitStatus.sha);
+  checkOptional('devcontainer_path', left.devcontainerPath, right.devcontainerPath);
   return { ok: mismatches.length === 0, mismatches };
 }
 
@@ -400,17 +402,16 @@ export function verifyCodespacesIdentity(record: CodespacesWorkspaceMetadata, re
   const mismatches: string[] = [];
   if (resource.id !== record.remote.codespaceId) mismatches.push(`codespaceId ${resource.id}`);
   if (resource.name !== record.remote.name) mismatches.push(`name ${resource.name}`);
-  if (resource.environmentId !== record.remote.environmentId) mismatches.push(`environmentId ${resource.environmentId}`);
   if (resource.owner.id !== record.remote.ownerId || resource.owner.id !== record.control.actorId) mismatches.push(`creator actor ${resource.owner.id}`);
   if (resource.owner.login !== record.remote.ownerLogin || resource.owner.login !== record.control.actorLogin) mismatches.push(`creator login ${resource.owner.login}`);
   if (resource.repositoryId !== record.repository.id) mismatches.push(`repositoryId ${resource.repositoryId}`);
   if (resource.repository.owner !== record.repository.owner || resource.repository.name !== record.repository.name) mismatches.push(`repository ${resource.repository.owner}/${resource.repository.name}`);
   if (resource.billingOwner.id !== record.remote.billableOwnerId) mismatches.push(`billable owner ${resource.billingOwner.id}`);
-  if (resource.machineName !== record.remote.machine) mismatches.push(`machine ${resource.machineName}`);
+  if (resource.machineName !== null && resource.machineName !== record.remote.machine) mismatches.push(`machine ${resource.machineName}`);
   if ((resource.geo ?? resource.location) !== record.remote.geo) mismatches.push(`geo/location ${resource.geo ?? resource.location}`);
   if (resource.createdAt !== record.remote.createdAt) mismatches.push(`createdAt ${resource.createdAt}`);
-  if (resource.devcontainerPath !== record.source.devcontainerPath) mismatches.push(`devcontainerPath ${resource.devcontainerPath}`);
-  if (resource.gitStatus.sha !== record.source.expectedOid) return { ok: false, reason: 'revision-mismatch', mismatches: [`HEAD ${resource.gitStatus.sha}`, ...mismatches] };
+  if (resource.devcontainerPath !== null && resource.devcontainerPath !== record.source.devcontainerPath) mismatches.push(`devcontainerPath ${resource.devcontainerPath}`);
+  // GitHub's Codespaces REST schema reports the selected ref but not HEAD; readiness probes HEAD over the fixed remote command before execution.
   if (resource.gitStatus.ref && resource.gitStatus.ref !== requestedBranchShort(record.source.requestedRef) && resource.gitStatus.ref !== record.source.requestedRef) mismatches.push(`effective ref ${resource.gitStatus.ref}`);
   return { ok: mismatches.length === 0, reason: 'identity-mismatch', mismatches };
 }

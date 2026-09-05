@@ -110,6 +110,9 @@ export function createCodespacesExecutionBackend(deps: CodespacesExecutionBacken
       if (handle.kind !== 'codespaces') throw new Error('Backend handle mismatch: expected codespaces.');
       assertRemoteRequest(request);
       const metadata = await loadCodespacesHandleRecord(deps.stateDir, handle);
+      if (metadata.lifecycle.normalized !== 'ready' && metadata.lifecycle.normalized !== 'ready-without-setup-proof') {
+        throw new Error(`Codespaces workspace ${metadata.name} has not passed immutable readiness (${metadata.lifecycle.normalized}); run agent-containers wait ${metadata.name} --for ready before executing a remote command.`);
+      }
       const logger = (input: Parameters<typeof recordCodespacesEvent>[1]) => recordCodespacesEvent(deps.stateDir, input);
       yield* executeRemoteCommand({
         stateDir: deps.stateDir, metadata, provider, root: deps.root, config: deps.config,
