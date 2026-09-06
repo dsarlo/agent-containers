@@ -103,7 +103,11 @@ async function* readinessProbeSequence(deps: CodespacesReadinessDependencies): A
       try {
         const current = await (deps.loadMetadata ?? loadMetadata)(deps.stateDir, deps.name);
         if (current && current.version === 2 && current.backend === 'codespaces') {
-          const next = { ...current, lifecycle: { ...current.lifecycle, desired: current.lifecycle.desired, normalized, providerRawState: observed.state, lastObservedAt: now() } };
+          const completedCreate = (terminal === 'ready' || terminal === 'ready-without-setup-proof') &&
+            metadata.lifecycle.activeOperation?.kind === 'create' &&
+            current.lifecycle.activeOperation?.kind === 'create' &&
+            current.lifecycle.activeOperation.id === metadata.lifecycle.activeOperation.id;
+          const next = { ...current, lifecycle: { ...current.lifecycle, desired: current.lifecycle.desired, normalized, providerRawState: observed.state, lastObservedAt: now(), activeOperation: completedCreate ? null : current.lifecycle.activeOperation } };
           await saveMetadata(deps.stateDir, next, { expectedGeneration: metadataGeneration(current) });
         }
       } catch {
