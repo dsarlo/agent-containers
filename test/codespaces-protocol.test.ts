@@ -6,12 +6,10 @@ import {
   HelperFrameType,
   MAX_HELPER_FRAME_PAYLOAD,
   OutputStream,
-  computeRequestHash,
   decodeFramedJson,
   decodeOutputEvent,
   encodeFrame,
   encodeOutputEvent,
-  isValidRequestHash,
 } from '../src/codespaces-protocol.js';
 
 test('frame round-trip preserves every byte for binary payloads', () => {
@@ -77,14 +75,4 @@ test('JSON frames reject malformed or unbounded payloads', () => {
   const json = decodeFramedJson<{ protocol: number }>(encodeFrame(HelperFrameType.helloOk, new TextEncoder().encode('{"protocol":1}')).subarray(5));
   assert.equal(json.protocol, HELPER_PROTOCOL_VERSION);
   assert.throws(() => decodeFramedJson(encodeFrame(HelperFrameType.helloOk, new TextEncoder().encode('{broken')).subarray(5)), /invalid JSON/);
-});
-
-test('the request hash is a stable syntactically valid SHA-256 and differs per argv', () => {
-  const argv: readonly [string, ...string[]] = ['echo', 'a b', '', 'Ünicode\tline'];
-  const hash = computeRequestHash(argv, '/workspaces/project', 'pipe');
-  assert.equal(isValidRequestHash(hash), true);
-  assert.equal(computeRequestHash(argv, '/workspaces/project', 'pipe'), hash);
-  assert.notEqual(computeRequestHash(['echo', 'a b'], '/workspaces/project', 'pipe'), hash);
-  assert.notEqual(computeRequestHash(argv, '/workspaces/other', 'pipe'), hash);
-  assert.equal(isValidRequestHash('not-a-hash'), false);
 });

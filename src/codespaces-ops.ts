@@ -94,8 +94,6 @@ export interface CodespacesJournalEvent {
   codespaceId: string | null;
   /** Stable remote command ID for command-lifecycle events; null otherwise. */
   commandId: string | null;
-  /** Non-secret argv hash only; argv plaintext is never written to the audit log. */
-  requestHash: string | null;
   previous: string | null;
   next: string | null;
   occurredAt: string;
@@ -103,7 +101,7 @@ export interface CodespacesJournalEvent {
   detail: string | null;
 }
 
-export type CodespacesJournalEventInput = Omit<CodespacesJournalEvent, 'schemaVersion' | 'eventId' | 'occurredAt' | 'commandId' | 'requestHash'> & { commandId?: string | null; requestHash?: string | null };
+export type CodespacesJournalEventInput = Omit<CodespacesJournalEvent, 'schemaVersion' | 'eventId' | 'occurredAt' | 'commandId'> & { commandId?: string | null };
 
 interface CheckedCodespacesJournalEvent extends CodespacesJournalEvent {
   checksum: string;
@@ -193,7 +191,6 @@ export async function recordCodespacesEvent(stateDir: string, input: CodespacesJ
     eventId: randomUUID(),
     occurredAt: new Date().toISOString(),
     commandId: input.commandId ?? null,
-    requestHash: input.requestHash ?? null,
     workspaceName: input.workspaceName,
     operationId: input.operationId,
     requestId: input.requestId,
@@ -260,11 +257,12 @@ function journalChecksum(event: CodespacesJournalEvent): string {
 }
 
 function validateEvent(event: CodespacesJournalEvent): void {
-  if (event.schemaVersion !== 1 || !isJournalKind(event.event) || !isUuid(event.eventId) || !isValidWorkspaceName(event.workspaceName)
+  if (!Object.keys(event).every((key) => ['schemaVersion', 'event', 'eventId', 'workspaceName', 'operationId', 'requestId', 'actorId', 'repositoryId', 'codespaceId', 'commandId', 'previous', 'next', 'occurredAt', 'detail'].includes(key))
+    || event.schemaVersion !== 1 || !isJournalKind(event.event) || !isUuid(event.eventId) || !isValidWorkspaceName(event.workspaceName)
     || !isUuid(event.operationId) || (event.requestId !== null && !isUuid(event.requestId))
     || (event.actorId !== null && !losslessId(event.actorId)) || (event.repositoryId !== null && !losslessId(event.repositoryId))
     || (event.codespaceId !== null && !losslessId(event.codespaceId))
-    || (event.commandId != null && !isCommandId(event.commandId)) || (event.requestHash != null && !isRequestHash(event.requestHash))
+    || (event.commandId != null && !isCommandId(event.commandId))
     || (event.previous !== null && !safeDetail(event.previous)) || (event.next !== null && !safeDetail(event.next))
     || !isTimestamp(event.occurredAt)) throw new Error('Codespaces journal event fields are invalid.');
   if (event.detail !== null && !safeDetail(event.detail)) throw new Error('Codespaces journal detail must be nonsecret and bounded.');
@@ -363,5 +361,4 @@ function safeRef(value: unknown): value is string { return typeof value === 'str
 function isOperationState(value: unknown): value is CodespacesOperationState { return typeof value === 'string' && ['intent-recorded', 'create-dispatched', 'resource-recorded', 'identity-verified', 'identity-mismatch', 'revision-mismatch', 'provider-error', 'ambiguous-create', 'recovery-required', 'recovery-cleared'].includes(value); }
 function isJournalKind(value: unknown): value is CodespacesJournalKind { return typeof value === 'string' && ['operation-created', 'provider-request-dispatched', 'provider-response-recorded', 'identity-verified', 'identity-mismatch', 'readiness-transition', 'recovery-set', 'recovery-cleared', 'ambiguous-create', 'provider-error', 'command-accepted', 'command-started', 'command-detached', 'command-terminal', 'cancel-requested', 'cancel-verified', 'cancel-unknown', 'stop-requested', 'stop-verified', 'start-requested', 'start-verified', 'remove-requested', 'remove-verified', 'tombstone-written'].includes(value); }
 function isCommandId(value: unknown): value is string { return typeof value === 'string' && /^[0-9A-Za-z-]{1,128}$/.test(value) && !secretShaped(value); }
-function isRequestHash(value: unknown): value is string { return typeof value === 'string' && /^[0-9a-f]{64}$/.test(value); }
 function isNodeError(error: unknown, code: string): error is NodeJS.ErrnoException { return typeof error === 'object' && error !== null && 'code' in error && error.code === code; }

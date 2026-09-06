@@ -2,7 +2,7 @@ import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import type { CommandEvent, CodespacesAgentContainersConfig } from './types.js';
 import {
-  computeRequestHash, decodeFramedJson, encodeFrame, encodeJsonFrame, encodeOutputEvent, decodeOutputEvent,
+  decodeFramedJson, encodeFrame, encodeJsonFrame, encodeOutputEvent, decodeOutputEvent,
   HelperFrameDecoder, HelperFrameType, HELPER_PROTOCOL_VERSION, type HelperFrame, type OutputStreamName,
 } from './codespaces-protocol.js';
 import { posixShellQuote, type GhCodespacesProvider } from './codespaces.js';
@@ -314,18 +314,17 @@ export async function* executeRemoteCommand(deps: RemoteTransportDependencies, i
   if (credentialArgvShaped(input.argv) || input.argv.some(secretShaped)) throw new Error('Remote execution rejects credential-shaped argv. Pass secrets only through approved remote secret configuration.');
   const now = deps.now ?? (() => new Date().toISOString());
   const commandId = input.commandId;
-  const requestHash = computeRequestHash(input.argv, input.cwd, input.mode);
-  const idempotency = await resolveCommandIdempotency(deps.stateDir, commandId, requestHash);
+  const idempotency = await resolveCommandIdempotency(deps.stateDir, commandId);
   if (idempotency === 'attach') {
     yield { type: 'accepted', commandId };
     yield* attachRemoteCommand(deps, commandId);
     return;
   }
   await recordCommandRequest(deps.stateDir, {
-    schemaVersion: 1, commandId, requestHash, workspaceName: deps.metadata.name, workspaceId: deps.metadata.workspaceId,
+    schemaVersion: 1, commandId, workspaceName: deps.metadata.name, workspaceId: deps.metadata.workspaceId,
     argvCount: input.argv.length, mode: input.mode, cwd: input.cwd ?? null, createdAt: now(),
   }, { expectAbsent: true });
-  await journal(deps.logger, deps.metadata, { event: 'command-accepted', operationId: randomUUID(), requestId: null, codespaceId: deps.metadata.remote.codespaceId, commandId, requestHash, previous: null, next: 'accepted', detail: null });
+  await journal(deps.logger, deps.metadata, { event: 'command-accepted', operationId: randomUUID(), requestId: null, codespaceId: deps.metadata.remote.codespaceId, commandId, previous: null, next: 'accepted', detail: null });
   yield { type: 'accepted', commandId };
 
   let savedStatus = (await loadCommandStatus(deps.stateDir, commandId)) ?? statusRecord(commandId, now, 'accepted');
@@ -339,7 +338,7 @@ export async function* executeRemoteCommand(deps: RemoteTransportDependencies, i
   const onAbort = () => {
     if (cancelRequested) return;
     cancelRequested = true;
-    void journal(deps.logger, deps.metadata, { event: 'cancel-requested', operationId: randomUUID(), requestId: null, codespaceId: deps.metadata.remote.codespaceId, commandId, requestHash, previous: 'running', next: 'cancelling', detail: null });
+    void journal(deps.logger, deps.metadata, { event: 'cancel-requested', operationId: randomUUID(), requestId: null, codespaceId: deps.metadata.remote.codespaceId, commandId, previous: 'running', next: 'cancelling', detail: null });
     session?.close();
   };
   deps.signal?.addEventListener('abort', onAbort, { once: true });
@@ -360,14 +359,14 @@ export async function* executeRemoteCommand(deps: RemoteTransportDependencies, i
     let attachNext = false;
     while (true) {
       if (cancelRequested) {
-        const proof = await requestRemoteCancelProof(deps, commandId, requestHash, now);
+        const proof = await requestRemoteCancelProof(deps, commandId, now);
         if (proof === 'verified') {
           await saveStatus(deps, statusRecord(commandId, now, 'cancelled', await loadCommandStatus(deps.stateDir, commandId) ?? savedStatus));
           await saveOffsets(deps, offsets, now);
-          await journal(deps.logger, deps.metadata, { event: 'cancel-verified', operationId: randomUUID(), requestId: null, codespaceId: deps.metadata.remote.codespaceId, commandId, requestHash, previous: 'cancelling', next: 'cancelled', detail: null });
+          await journal(deps.logger, deps.metadata, { event: 'cancel-verified', operationId: randomUUID(), requestId: null, codespaceId: deps.metadata.remote.codespaceId, commandId, previous: 'cancelling', next: 'cancelled', detail: null });
           yield { type: 'cancelled', commandId };
         } else {
-          await recordUnknownOutcome(deps, commandId, requestHash, offsets, now, savedStatus, 'cancel-outcome-unknown');
+          await recordUnknownOutcome(deps, commandId, offsets, now, savedStatus, 'cancel-outcome-unknown');
           yield { type: 'cancel-unknown', commandId };
         }
         return;
@@ -377,7 +376,7 @@ export async function* executeRemoteCommand(deps: RemoteTransportDependencies, i
       const connect = attachNext ? openAttachSession : openExecSession;
       let stdinFailure: unknown;
       try {
-        const opened = await connect(deps, helper, commandId, requestHash, input, offsets, now);
+        const opened = await connect(deps, helper, commandId, input, offsets, now);
         attachNext = true;
         if (opened.kind === 'aborted') {
           throw new TransportLostError('The remote helper session was aborted before its handshake settled.');
@@ -403,7 +402,7 @@ export async function* executeRemoteCommand(deps: RemoteTransportDependencies, i
                 if (chunk.length > MAX_STDIN_FRAME_BYTES) throw new Error('A user stdin chunk exceeded the bounded frame size; refusing the oversized chunk.');
                 await session.send(HelperFrameType.stdin, chunk);
               }
-              await session.send(HelperFrameType.stdinEof, { command_id: commandId, request_hash: requestHash });
+              await session.send(HelperFrameType.stdinEof, { command_id: commandId });
             } catch (error) {
               stdinFailure = error;
               void session.close();
@@ -411,7 +410,7 @@ export async function* executeRemoteCommand(deps: RemoteTransportDependencies, i
           })();
         } else {
           try {
-            await session.send(HelperFrameType.stdinEof, { command_id: commandId, request_hash: requestHash });
+            await session.send(HelperFrameType.stdinEof, { command_id: commandId });
           } catch (error) {
             if (!(error instanceof TransportLostError)) throw error;
           }
@@ -419,7 +418,7 @@ export async function* executeRemoteCommand(deps: RemoteTransportDependencies, i
         if (input.mode === 'pty' && input.resizeSource) {
           void forwardResizes(session, commandId, input.resizeSource);
         }
-        const streaming = yield* streamSession(deps, now, commandId, requestHash, session, offsets);
+        const streaming = yield* streamSession(deps, now, commandId, session, offsets);
         // A verified terminal frame settles this SSH invocation. Explicitly
         // half-close and reap it instead of leaving a completed gh session alive.
         session.endStdin();
@@ -428,7 +427,7 @@ export async function* executeRemoteCommand(deps: RemoteTransportDependencies, i
         offsets = streaming.offsets;
         await saveOffsets(deps, offsets, now);
         if (streaming.outcome === 'exited') {
-          await journal(deps.logger, deps.metadata, { event: 'command-terminal', operationId: randomUUID(), requestId: null, codespaceId: deps.metadata.remote.codespaceId, commandId, requestHash, previous: 'running', next: `exited(${streaming.exitCode ?? 'null'})`, detail: null });
+          await journal(deps.logger, deps.metadata, { event: 'command-terminal', operationId: randomUUID(), requestId: null, codespaceId: deps.metadata.remote.codespaceId, commandId, previous: 'running', next: `exited(${streaming.exitCode ?? 'null'})`, detail: null });
           yield { type: 'exit', commandId, code: streaming.exitCode };
           return;
         }
@@ -454,11 +453,11 @@ export async function* executeRemoteCommand(deps: RemoteTransportDependencies, i
     }
   } catch (error: unknown) {
     if (error instanceof StdinOverflowError) {
-      await recordUnknownOutcome(deps, commandId, requestHash, offsets, now, savedStatus, 'outcome-unknown');
+      await recordUnknownOutcome(deps, commandId, offsets, now, savedStatus, 'outcome-unknown');
       throw error;
     }
     if (!cancelRequested) throw error;
-    await recordUnknownOutcome(deps, commandId, requestHash, offsets, now, savedStatus, 'cancel-outcome-unknown');
+    await recordUnknownOutcome(deps, commandId, offsets, now, savedStatus, 'cancel-outcome-unknown');
     yield { type: 'cancel-unknown', commandId };
     return;
   } finally {
@@ -467,7 +466,7 @@ export async function* executeRemoteCommand(deps: RemoteTransportDependencies, i
 
   await saveOffsets(deps, offsets, now);
   await saveStatus(deps, statusRecord(commandId, now, 'detached', await loadCommandStatus(deps.stateDir, commandId) ?? savedStatus));
-  await journal(deps.logger, deps.metadata, { event: 'command-detached', operationId: randomUUID(), requestId: null, codespaceId: deps.metadata.remote.codespaceId, commandId, requestHash, previous: 'running', next: 'detached', detail: 'reconnect budget exhausted; the remote command may still be running.' });
+  await journal(deps.logger, deps.metadata, { event: 'command-detached', operationId: randomUUID(), requestId: null, codespaceId: deps.metadata.remote.codespaceId, commandId, previous: 'running', next: 'detached', detail: 'reconnect budget exhausted; the remote command may still be running.' });
   await recordCommandRecovery(deps.stateDir, { commandId, workspaceName: deps.metadata.name, reason: 'transport-lost' });
   await setMetadataRecovery(deps, 'remote-exec-interrupted');
   yield { type: 'detached', commandId, offsets: offsetsBigint(offsets) };
@@ -477,7 +476,6 @@ export async function* attachRemoteCommand(deps: RemoteTransportDependencies, co
   const now = deps.now ?? (() => new Date().toISOString());
   const request = await loadCommandRequest(deps.stateDir, commandId);
   if (!request) throw new Error(`No recorded remote command "${commandId}" exists to attach to.`);
-  const requestHash = request.requestHash;
   const savedStatus = await loadCommandStatus(deps.stateDir, commandId);
   if (!savedStatus) throw new Error(`Remote command status for "${commandId}" is missing; refusing to attach to an unknown lifecycle.`);
   const transportBudget = deps.reconnectBudgetMs ?? deps.config.backends.codespaces.transport.reconnectWindowSeconds * 1000;
@@ -492,8 +490,8 @@ export async function* attachRemoteCommand(deps: RemoteTransportDependencies, co
     try {
       session = await openSession(deps, helper.binPath);
       await helloHandshake(deps, session, helper.arch);
-      await session.send(HelperFrameType.attach, { command_id: commandId, request_hash: requestHash, stdout_offset: offsets.stdout, stderr_offset: offsets.stderr, terminal_offset: offsets.terminal, workspace_id: deps.metadata.workspaceId, grace_ms: deps.cancelGraceMs ?? deps.config.backends.codespaces.transport.cancelGraceSeconds * 1000 });
-      const streaming = yield* streamSession(deps, now, commandId, requestHash, session, offsets);
+      await session.send(HelperFrameType.attach, { command_id: commandId, stdout_offset: offsets.stdout, stderr_offset: offsets.stderr, terminal_offset: offsets.terminal, workspace_id: deps.metadata.workspaceId, grace_ms: deps.cancelGraceMs ?? deps.config.backends.codespaces.transport.cancelGraceSeconds * 1000 });
+      const streaming = yield* streamSession(deps, now, commandId, session, offsets);
       // Attach has the same terminal ownership boundary as execute.
       session.endStdin();
       await session.close();
@@ -501,7 +499,7 @@ export async function* attachRemoteCommand(deps: RemoteTransportDependencies, co
       offsets = streaming.offsets;
       await saveOffsets(deps, offsets, now);
       if (streaming.outcome === 'exited') {
-        await journal(deps.logger, deps.metadata, { event: 'command-terminal', operationId: randomUUID(), requestId: null, codespaceId: deps.metadata.remote.codespaceId, commandId, requestHash, previous: savedStatus.state, next: `exited(${streaming.exitCode ?? 'null'})`, detail: null });
+        await journal(deps.logger, deps.metadata, { event: 'command-terminal', operationId: randomUUID(), requestId: null, codespaceId: deps.metadata.remote.codespaceId, commandId, previous: savedStatus.state, next: `exited(${streaming.exitCode ?? 'null'})`, detail: null });
         yield { type: 'exit', commandId, code: streaming.exitCode };
         return;
       }
@@ -526,20 +524,19 @@ export async function cancelRemoteCommand(deps: RemoteTransportDependencies, com
   const now = deps.now ?? (() => new Date().toISOString());
   const request = await loadCommandRequest(deps.stateDir, commandId);
   if (!request) throw new Error(`No recorded remote command "${commandId}" exists to cancel.`);
-  const requestHash = request.requestHash;
   const savedStatus = await loadCommandStatus(deps.stateDir, commandId);
   if (!savedStatus) throw new Error(`Remote command status for "${commandId}" is missing; refusing to cancel an unknown lifecycle.`);
   if (savedStatus.state === 'exited' || savedStatus.state === 'cancelled') return { outcome: 'cancelled', recordedAt: savedStatus.exitedAt ?? now() };
   const offsets = (await loadCommandOffsets(deps.stateDir, commandId)) ?? await zeroOffsets(deps, commandId, now);
-  await journal(deps.logger, deps.metadata, { event: 'cancel-requested', operationId: randomUUID(), requestId: null, codespaceId: deps.metadata.remote.codespaceId, commandId, requestHash, previous: savedStatus.state, next: 'cancelling', detail: null });
-  const proof = await requestRemoteCancelProof(deps, commandId, requestHash, now);
+  await journal(deps.logger, deps.metadata, { event: 'cancel-requested', operationId: randomUUID(), requestId: null, codespaceId: deps.metadata.remote.codespaceId, commandId, previous: savedStatus.state, next: 'cancelling', detail: null });
+  const proof = await requestRemoteCancelProof(deps, commandId, now);
   await saveOffsets(deps, offsets, now);
   if (proof === 'verified') {
     await saveStatus(deps, statusRecord(commandId, now, 'cancelled', savedStatus));
-    await journal(deps.logger, deps.metadata, { event: 'cancel-verified', operationId: randomUUID(), requestId: null, codespaceId: deps.metadata.remote.codespaceId, commandId, requestHash, previous: 'cancelling', next: 'cancelled', detail: null });
+    await journal(deps.logger, deps.metadata, { event: 'cancel-verified', operationId: randomUUID(), requestId: null, codespaceId: deps.metadata.remote.codespaceId, commandId, previous: 'cancelling', next: 'cancelled', detail: null });
     return { outcome: 'cancelled', recordedAt: now() };
   }
-  await recordUnknownOutcome(deps, commandId, requestHash, offsets, now, savedStatus, 'cancel-outcome-unknown');
+  await recordUnknownOutcome(deps, commandId, offsets, now, savedStatus, 'cancel-outcome-unknown');
   return { outcome: 'cancel-outcome-unknown', recordedAt: now() };
 }
 
@@ -549,13 +546,12 @@ interface OpenExecSessionResult {
   reason?: string;
 }
 
-async function openExecSession(deps: RemoteTransportDependencies, helper: RemoteHelperBootstrapResult, commandId: string, requestHash: string, input: ExecuteTransportInput, _offsets: CodespacesCommandOffsets, now: () => string): Promise<OpenExecSessionResult> {
+async function openExecSession(deps: RemoteTransportDependencies, helper: RemoteHelperBootstrapResult, commandId: string, input: ExecuteTransportInput, _offsets: CodespacesCommandOffsets, now: () => string): Promise<OpenExecSessionResult> {
   if (deps.signal?.aborted) return { kind: 'aborted' };
   const session = await openSession(deps, helper.binPath);
   await helloHandshake(deps, session, helper.arch);
   await session.send(HelperFrameType.exec, {
     command_id: commandId,
-    request_hash: requestHash,
     argv: [...input.argv],
     cwd: input.cwd ?? null,
     mode: input.mode,
@@ -567,26 +563,25 @@ async function openExecSession(deps: RemoteTransportDependencies, helper: Remote
     // included in local state, audit records, or the framed request.
     secret_names: deps.config.backends.codespaces.secrets.allowedRemoteSecretNames,
   });
-  return acknowledgeStarted(deps, session, commandId, requestHash, now);
+  return acknowledgeStarted(deps, session, commandId, now);
 }
 
-async function openAttachSession(deps: RemoteTransportDependencies, helper: RemoteHelperBootstrapResult, commandId: string, requestHash: string, input: ExecuteTransportInput, offsets: CodespacesCommandOffsets, now: () => string): Promise<OpenExecSessionResult> {
+async function openAttachSession(deps: RemoteTransportDependencies, helper: RemoteHelperBootstrapResult, commandId: string, input: ExecuteTransportInput, offsets: CodespacesCommandOffsets, now: () => string): Promise<OpenExecSessionResult> {
   if (deps.signal?.aborted) return { kind: 'aborted' };
   const session = await openSession(deps, helper.binPath);
   await helloHandshake(deps, session, helper.arch);
   await session.send(HelperFrameType.attach, {
     command_id: commandId,
-    request_hash: requestHash,
     stdout_offset: offsets.stdout,
     stderr_offset: offsets.stderr,
     terminal_offset: offsets.terminal,
     workspace_id: deps.metadata.workspaceId,
     grace_ms: deps.cancelGraceMs ?? deps.config.backends.codespaces.transport.cancelGraceSeconds * 1000,
   });
-  return acknowledgeStarted(deps, session, commandId, requestHash, now, true);
+  return acknowledgeStarted(deps, session, commandId, now, true);
 }
 
-async function acknowledgeStarted(deps: RemoteTransportDependencies, session: HelperSession, commandId: string, requestHash: string, now: () => string, reattaching = false): Promise<OpenExecSessionResult> {
+async function acknowledgeStarted(deps: RemoteTransportDependencies, session: HelperSession, commandId: string, now: () => string, reattaching = false): Promise<OpenExecSessionResult> {
   const first = await session.nextEvent();
   if (first === null) {
     session.close();
@@ -605,7 +600,7 @@ async function acknowledgeStarted(deps: RemoteTransportDependencies, session: He
   }
   if (!reattaching) {
     await saveStatus(deps, statusRecord(commandId, now, 'running', await loadCommandStatus(deps.stateDir, commandId)));
-    await journal(deps.logger, deps.metadata, { event: 'command-started', operationId: randomUUID(), requestId: null, codespaceId: deps.metadata.remote.codespaceId, commandId, requestHash, previous: 'accepted', next: 'running', detail: null });
+    await journal(deps.logger, deps.metadata, { event: 'command-started', operationId: randomUUID(), requestId: null, codespaceId: deps.metadata.remote.codespaceId, commandId, previous: 'accepted', next: 'running', detail: null });
   }
   return { kind: 'session', session };
 }
@@ -646,7 +641,7 @@ interface StreamingOutcome {
   offsets: CodespacesCommandOffsets;
 }
 
-async function* streamSession(deps: RemoteTransportDependencies, now: () => string, commandId: string, requestHash: string, session: HelperSession, initial: CodespacesCommandOffsets): AsyncGenerator<CommandEvent, StreamingOutcome> {
+async function* streamSession(deps: RemoteTransportDependencies, now: () => string, commandId: string, session: HelperSession, initial: CodespacesCommandOffsets): AsyncGenerator<CommandEvent, StreamingOutcome> {
   const offsets = { ...initial };
   let stdoutCursor = BigInt(offsets.stdout);
   let stderrCursor = BigInt(offsets.stderr);
@@ -722,16 +717,16 @@ async function* streamSession(deps: RemoteTransportDependencies, now: () => stri
   }
 }
 
-async function recordUnknownOutcome(deps: RemoteTransportDependencies, commandId: string, requestHash: string, offsets: CodespacesCommandOffsets, now: () => string, base: CodespacesCommandStatus | undefined, state: CodespacesCommandStatus['state']): Promise<void> {
+async function recordUnknownOutcome(deps: RemoteTransportDependencies, commandId: string, offsets: CodespacesCommandOffsets, now: () => string, base: CodespacesCommandStatus | undefined, state: CodespacesCommandStatus['state']): Promise<void> {
   await saveOffsets(deps, offsets, now);
   await saveStatus(deps, statusRecord(commandId, now, state, base));
-  await journal(deps.logger, deps.metadata, { event: 'cancel-unknown', operationId: randomUUID(), requestId: null, codespaceId: deps.metadata.remote.codespaceId, commandId, requestHash, previous: 'cancelling', next: state, detail: 'The remote process group could not be proven stopped; the command may still run.' });
+  await journal(deps.logger, deps.metadata, { event: 'cancel-unknown', operationId: randomUUID(), requestId: null, codespaceId: deps.metadata.remote.codespaceId, commandId, previous: 'cancelling', next: state, detail: 'The remote process group could not be proven stopped; the command may still run.' });
   await recordCommandRecovery(deps.stateDir, { commandId, workspaceName: deps.metadata.name, reason: 'cancel-outcome-unknown' });
   await setMetadataRecovery(deps, 'remote-exec-interrupted');
 }
 
 /** First-interrupt behavior: request a verified remote cancel and only report success after remote proof. */
-async function requestRemoteCancelProof(deps: RemoteTransportDependencies, commandId: string, requestHash: string, now: () => string): Promise<'verified' | 'unknown'> {
+async function requestRemoteCancelProof(deps: RemoteTransportDependencies, commandId: string, now: () => string): Promise<'verified' | 'unknown'> {
   const grace = deps.cancelGraceMs ?? deps.config.backends.codespaces.transport.cancelGraceSeconds * 1000;
   const budget = deps.reconnectBudgetMs ?? deps.config.backends.codespaces.transport.reconnectWindowSeconds * 1000;
   const deadline = Date.now() + budget + grace;
@@ -747,7 +742,7 @@ async function requestRemoteCancelProof(deps: RemoteTransportDependencies, comma
     if (detached) return 'unknown';
     await helloHandshake(deps, session, helper.arch);
     if (detached) return 'unknown';
-    await session.send(HelperFrameType.cancel, { command_id: commandId, request_hash: requestHash, workspace_id: deps.metadata.workspaceId, grace_ms: deps.cancelGraceMs ?? deps.config.backends.codespaces.transport.cancelGraceSeconds * 1000 });
+    await session.send(HelperFrameType.cancel, { command_id: commandId, workspace_id: deps.metadata.workspaceId, grace_ms: deps.cancelGraceMs ?? deps.config.backends.codespaces.transport.cancelGraceSeconds * 1000 });
     if (detached) return 'unknown';
     const verified = await waitForCancelVerified(deps, session, commandId, deadline);
     if (verified && !detached) return 'verified';

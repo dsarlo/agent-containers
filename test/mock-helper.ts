@@ -32,7 +32,6 @@ export interface MockCommandBehavior {
 
 export interface MockCommandRecord {
   commandId: string;
-  hash: string;
   mode: 'pipe' | 'pty';
   argv: string[];
   logs: Record<MockStreamKind, Uint8Array[]>;
@@ -205,15 +204,12 @@ async function handleRequest(helper: MockRemoteHelper, session: MockSshSession, 
       await sendHello(session, helper.protocol, helper.helperArch);
       break;
     case HelperFrameType.exec: {
-      const request = parseJson<{ command_id: string; request_hash: string; argv: string[]; mode?: 'pipe' | 'pty' }>(frame.payload);
+      const request = parseJson<{ command_id: string; argv: string[]; mode?: 'pipe' | 'pty'; request_hash?: unknown }>(frame.payload);
+      rejectRequestHash(request);
       const behavior = helper.behaviors.get(request.command_id);
       let record = helper.records.get(request.command_id);
-      if (record && record.hash !== request.request_hash) {
-        await session.sendJson(HelperFrameType.rejected, { command_id: request.command_id, reason: 'id-hash-mismatch' });
-        return;
-      }
       if (!record) {
-        record = newRecord(request.command_id, request.request_hash, request.argv, behavior);
+        record = newRecord(request.command_id, request.argv, behavior);
         helper.begin(record);
       }
       if (behavior?.rejectReason) {
@@ -226,9 +222,10 @@ async function handleRequest(helper: MockRemoteHelper, session: MockSshSession, 
       break;
     }
     case HelperFrameType.attach: {
-      const request = parseJson<{ command_id: string; request_hash: string; stdout_offset?: string; stderr_offset?: string; terminal_offset?: string }>(frame.payload);
+      const request = parseJson<{ command_id: string; request_hash?: unknown; stdout_offset?: string; stderr_offset?: string; terminal_offset?: string }>(frame.payload);
+      rejectRequestHash(request);
       const record = helper.records.get(request.command_id);
-      if (!record || record.hash !== request.request_hash) {
+      if (!record) {
         await session.sendJson(HelperFrameType.rejected, { command_id: request.command_id, reason: 'unknown-command' });
         return;
       }
@@ -241,7 +238,8 @@ async function handleRequest(helper: MockRemoteHelper, session: MockSshSession, 
       break;
     }
     case HelperFrameType.cancel: {
-      const request = parseJson<{ command_id: string; request_hash: string }>(frame.payload);
+      const request = parseJson<{ command_id: string; request_hash?: unknown }>(frame.payload);
+      rejectRequestHash(request);
       helper.cancelRequests.push(request.command_id);
       const record = helper.records.get(request.command_id);
       if (!record) {
@@ -286,12 +284,16 @@ async function handleRequest(helper: MockRemoteHelper, session: MockSshSession, 
   }
 }
 
-function newRecord(commandId: string, hash: string, argv: string[], behavior: MockCommandBehavior | undefined): MockCommandRecord {
+function newRecord(commandId: string, argv: string[], behavior: MockCommandBehavior | undefined): MockCommandRecord {
   return {
-    commandId, hash, mode: 'pipe', argv,
+    commandId, mode: 'pipe', argv,
     logs: { stdout: [], stderr: [], terminal: [] }, totals: { stdout: 0n, stderr: 0n, terminal: 0n },
     exitCode: behavior?.exitCode ?? 0, exited: false, begin: new Date().toISOString(), logsAppended: false, dropTriggered: false,
   };
+}
+
+function rejectRequestHash(request: { request_hash?: unknown }): void {
+  if ('request_hash' in request) throw new Error('Mock helper rejects deprecated request_hash frames.');
 }
 
 async function pump(helper: MockRemoteHelper, session: MockSshSession, record: MockCommandRecord, behavior: MockCommandBehavior | undefined, from: { stdout: bigint; stderr: bigint; terminal: bigint }): Promise<void> {
