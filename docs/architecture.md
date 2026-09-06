@@ -1,27 +1,35 @@
 # Architecture
 
-Agent Containers has a deliberately small boundary surface:
+Agent Containers has two execution backends behind one CLI/configuration boundary:
 
 1. The CLI loads and validates `.agent-containers.yml`.
-2. `create` discovers the Git root, validates a workspace name, and runs `git worktree add --relative-paths -b agent-containers/<name> <path> <base>`.
-3. Metadata is atomically written beneath the user-local `agent-containers` state directory.
-4. `exec` and `run` reject unsupported v0.1 Dev Container modes, run `devcontainer up --mount-git-worktree-common-dir`, require a terminal JSON `containerId`, save it, then call `devcontainer exec` with the original argument array.
-5. `remove --yes` validates exact recorded worktree, branch, and container ownership; it checkpoints each completed destructive stage. A retry reconciles already-absent recorded resources instead of resurrecting stale metadata.
+2. Local `create` creates a Git worktree and local Dev Container record.
+3. Codespaces `create` records durable intent, creates one GitHub Codespace only after explicit cost acknowledgement, and adopts it only after exact identity readback.
+4. All metadata is atomically written beneath the user-local `agent-containers` state directory.
+5. `exec` and `run` dispatch an argument vector to the recorded backend. `remove --yes` checkpoints destructive cleanup and preserves a tombstone for already-absent or deleted resources.
 
-## Process boundary
+## Local backend
 
-Production uses Node `spawn` with `shell: false`. Captured stdout/stderr are bounded (with the terminal output retained) so Dev Containers terminal JSON parsing remains functional without unbounded memory growth. Interactive execution inherits stdio.
+The local backend uses `git worktree`, the Dev Containers CLI, and exact container/worktree ownership checks. See [Dev Container worktree requirements](devcontainer-worktrees.md) for its v0.1 limitations.
 
-## Metadata and lifecycle boundary
+## Codespaces v1 backend
 
-Legacy v1 metadata remains local-compatible. New local records are schema v2 and persist `backend: local` with a discriminated local handle. Persisted Codespaces handles fail closed because their lifecycle backend is not implemented. Local lifecycle operations use a per-name atomically-created lock.
+Codespaces is experimental and requires `AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES=1`. Schema-v2 configuration pins the GitHub repository/ref to an immutable commit OID and pins the committed Dev Container blob. Provider operations use fixed argv-framed `gh api`/`gh codespace ssh` invocations; Agent Containers does not retrieve or manage GitHub credentials.
+
+Create records durable intent before provider dispatch and verifies the authenticated actor, repository, requested name, IDs, and immutable source facts before a resource is accepted. Ambiguous responses, identity drift, capacity uncertainty, or persistence failure remain fail-closed rather than adopting a resource by name.
+
+`wait --for ready` observes provider availability, exact identity, allowed port visibility, repository root/HEAD/origin over SSH, SSH reachability, and optional configured runtime readiness argv. It promotes a matching completed create checkpoint only after terminal `ready` or `ready-without-setup-proof`; failed, timed-out, or unrelated lifecycle checkpoints remain barriers.
+
+After readiness, `exec`/`run` start a package-owned remote helper through `gh codespace ssh`. User argv is carried in framed stdin, not shell text. CLI commands receive connected stdout/stderr plus terminal status; backend integrations can select a merged PTY terminal stream. Durable command records retain status/cancellation only: they do not retain raw argv, output frames, request hashes, or command hashes. Later status recovery may report known state but never replays unavailable output. Unknown command or cancellation outcomes stay fail-closed.
+
+`start`, `stop`, and `remove` verify the recorded actor and exact Codespace identity before mutation and read state back afterward. `reconcile` is read-only. Removal requires both `--yes` and `--force-remote-data-loss`, refuses an active/unknown command or interrupted lifecycle checkpoint, runs a checkout-root Git dirty/ahead preflight, deletes the exact resource, verifies absence, and writes a tombstone.
+
+## Secret and process boundaries
+
+The local harness remains the agent orchestrator and keeps provider authentication. The configuration contains only a named-secret allowlist, never values. The helper clears its environment and restores only `PATH` plus allowlisted variables present in the Codespace; it redacts matching values from connected output frames. Target Dev Container/Codespace configuration is still not a sandbox: Agent Containers does not constrain repository-declared mounts, capabilities, network access, Git permissions, or the agent executable.
 
 ## Non-goals
 
-Agent Containers is not an agent scheduler, authorization layer, or container sandbox. It does not inspect agent output, select an agent, alter target Dev Container security settings, or mount Docker sockets, credentials, or host homes.
+Agent Containers is not an agent scheduler, authorization layer, or general container sandbox. It does not select an agent, inspect agent intent, manage GitHub secrets or authentication, retain/replay remote command output, or coordinate Codespaces capacity across separate local state roots.
 
-## Codespaces setup boundary
-
-Schema v2 has a strict backend selection and a provider adapter boundary. The adapter invokes `gh api` with fixed argument arrays and strictly parses documented Codespaces defaults and machine inventory fields. Configure snapshots the current configuration before prompting, resolves immutable source evidence before previewing the exact final candidate, and revalidates it after confirmation. Expected-generation replacement serializes cooperating Agent Containers writers in both strict POSIX and recoverable Windows modes and detects independent changes before its final replacement observation. Neither mode can prevent an arbitrary external replacement after that observation; expected-absence first publication remains a durable no-replace boundary. `doctor` is bounded and read-only and does not claim provisioned-runtime coverage without an implemented recorded-handle check. These paths do not create/start/stop/delete Codespaces, generate SSH keys, upload helpers, modify ports or secrets, or adopt an existing Codespace.
-
-The local harness remains the orchestrator and retains provider credentials and its agent loop. Any future Codespaces execution backend must send a framed argv protocol to a package-owned helper over a verified exact Codespace identity; it must not forward host files, environment, credentials, or use a shell command string.
+See [Codespaces v1](codespaces.md) for the operator workflow and recovery contract.
