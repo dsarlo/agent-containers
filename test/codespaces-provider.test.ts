@@ -221,6 +221,25 @@ test('provider SSH probe dispatches a fixed package-owned command through gh cod
   assert.deepEqual(calls, [['gh', 'codespace', 'ssh', '-c', 'bookish-space-parakeet', '--', "'git' '-C' '/workspaces/agent-containers' 'rev-parse' '--show-toplevel'"]]);
 });
 
+test('provider remote Git risk uses the validated immutable repository directory', async () => {
+  const calls: string[][] = [];
+  const provider = new GhCodespacesProvider({
+    async run(command, args) {
+      calls.push([command, ...args]);
+      return { code: 0, stdout: '## main...origin/main\n', stderr: '' };
+    },
+  });
+  await provider.remoteGitRisk('bookish-space-parakeet', 'agent-containers');
+  assert.deepEqual(calls, [['gh', 'codespace', 'ssh', '-c', 'bookish-space-parakeet', '--', "'git' '-C' '/workspaces/agent-containers' 'status' '--porcelain=v1' '--branch'"]]);
+});
+
+test('provider remote Git risk refuses an unsafe repository name before SSH dispatch', async () => {
+  let dispatched = false;
+  const provider = new GhCodespacesProvider({ async run() { dispatched = true; return { code: 0, stdout: '', stderr: '' }; } });
+  await assert.rejects(() => provider.remoteGitRisk('bookish-space-parakeet', '../unsafe'), /repository name/i);
+  assert.equal(dispatched, false);
+});
+
 test('provider SSH transport serializes hostile argv as one shell-safe remote command', async () => {
   const calls: string[][] = [];
   const provider = new GhCodespacesProvider({

@@ -112,7 +112,7 @@ test('execute preserves the exhaustive argv corpus end to end without a host she
     'codespace', 'ssh', '-c', 'bookish-space-parakeet', '--',
     "'/workspaces/.agent-containers/00000000-0000-4000-8000-000000000001/bin/agent-containers-helper-linux-x64' 'serve'",
   ]), 'every helper session must use one POSIX-quoted remote command');
-  // The recorded request hash binds the exact corpus (idempotency).
+  // The durable receipt records non-derived request metadata only.
   const request = await loadCommandRequest(fixture.stateDir, COMMAND_ID);
   assert.ok(request && request.argvCount === argv.length);
 });
@@ -240,7 +240,7 @@ test('disconnect/reconnect resumes by offsets and delivers the exact retained ex
   assert.equal(journal.filter((entry) => entry.event === 'command-started').length, 1);
 });
 
-test('a duplicate request with the same ID and hash attaches instead of replaying (N7)', async () => {
+test('a duplicate command ID attaches instead of replaying and never emits request_hash (N7)', async () => {
   const fixture = await transportFixture();
   fixture.helper.configure({ commandId: COMMAND_ID, outputs: [{ stream: 'stdout', bytes: bytes(1, 2) }], exitCode: 0 });
   await executeToEnd(fixture, pipeInput());
@@ -252,13 +252,14 @@ test('a duplicate request with the same ID and hash attaches instead of replayin
   assert.deepEqual(attachAgain.at(-1), { type: 'exit', commandId: COMMAND_ID, code: 0 });
 });
 
-test('reusing a command ID for a different argv hash is rejected before any session (N8)', async () => {
+test('reusing a command ID with different argv preserves the first command and never re-execs (N8)', async () => {
   const fixture = await transportFixture();
   fixture.helper.configure({ commandId: COMMAND_ID, outputs: [{ stream: 'stdout', bytes: bytes(1, 2) }], exitCode: 0 });
   await executeToEnd(fixture, pipeInput());
-  const before = fixture.spawnerCalls.length;
-  await assert.rejects(() => executeToEnd(fixture, pipeInput({ argv: ['different', 'argv'] })), /different argv hash/i);
-  assert.equal(fixture.spawnerCalls.length, before, 'a hash mismatch must block before any new remote session');
+  const events = await executeToEnd(fixture, pipeInput({ argv: ['different', 'argv'] }));
+  assert.ok(events.some((event) => event.type === 'accepted'));
+  assert.deepEqual(fixture.helper.records.get(COMMAND_ID)?.argv, ['sleep', '0'], 'the original exec remains authoritative');
+  assert.equal(events.filter((event) => event.type === 'started').length, 0, 'the duplicate only attaches to the original remote command');
 });
 
 test('attach from an interrupted session resumes retained output by offsets (N9)', async () => {

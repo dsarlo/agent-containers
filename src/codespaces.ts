@@ -86,8 +86,9 @@ export class GhCodespacesProvider {
   }
 
   /** Read the fixed porcelain form before a destructive lifecycle action. */
-  async remoteGitRisk(name: string): Promise<CodespacesRemoteGitRisk> {
-    const output = await this.remoteSshProbe(name, ['git', 'status', '--porcelain=v1', '--branch']);
+  async remoteGitRisk(name: string, repositoryName: string): Promise<CodespacesRemoteGitRisk> {
+    if (!safeIdentifier(repositoryName)) throw new Error('Repository name is invalid for the remote Git safety probe.');
+    const output = await this.remoteSshProbe(name, ['git', '-C', `/workspaces/${repositoryName}`, 'status', '--porcelain=v1', '--branch']);
     const lines = output.split(/\r?\n/).filter(Boolean);
     const header = lines.find((line) => line.startsWith('## '));
     if (!header) throw new Error('Remote Git status did not provide a branch header; deletion is blocked.');

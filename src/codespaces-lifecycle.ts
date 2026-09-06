@@ -69,7 +69,7 @@ export async function removeCodespacesWorkspace(deps: CodespacesLifecycleDepende
   await assertNoActiveCommand(deps.stateDir);
   await mutate(deps, metadata, 'remove', 'remove-requested', async () => {
     await verifyBeforeMutation(deps, metadata);
-    const risk = await deps.provider.remoteGitRisk(metadata.remote.name);
+    const risk = await deps.provider.remoteGitRisk(metadata.remote.name, metadata.repository.name);
     if (risk.dirty || risk.unpushed) {
       const detail = [risk.dirty ? 'dirty' : null, risk.unpushed ? 'unpushed' : null].filter(Boolean).join(' and ');
       throw new KnownSafePreflightRefusal(`Remote deletion is refused: ${metadata.repository.owner}/${metadata.repository.name} branch ${risk.branch} is ${detail}; preserve or explicitly resolve the remote Git state before data loss.`);

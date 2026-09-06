@@ -1,4 +1,3 @@
-import { createHash } from 'node:crypto';
 
 /**
  * Wire protocol for the package-owned remote execution helper. Every frame is
@@ -145,14 +144,4 @@ function writeUint64BE(bytes: Uint8Array, offset: number, value: bigint): void {
     bytes[offset + index] = Number(remaining & 0xffn);
     remaining >>= 8n;
   }
-}
-
-/** Canonical, optimistic-concurrency-safe idempotency hash for an argv request. */
-export function computeRequestHash(argv: readonly string[], cwd: string | undefined, mode: 'pipe' | 'pty'): string {
-  const canonical = JSON.stringify({ argv: [...argv], cwd: cwd ?? null, mode });
-  return createHash('sha256').update(canonical, 'utf8').digest('hex');
-}
-
-export function isValidRequestHash(value: string): boolean {
-  return /^[0-9a-f]{64}$/.test(value);
 }

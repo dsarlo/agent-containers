@@ -509,7 +509,7 @@ test('Codespaces removal reads remote dirty and unpushed Git risk before deletio
   await assert.rejects(() => removeCodespacesWorkspace(deps, false), /--force-remote-data-loss/);
   await assert.rejects(() => removeCodespacesWorkspace(deps, true), /octo\/agent-containers.*agent-containers\/issue-9.*dirty.*unpushed/i);
   assert.ok(calls.some(([command, ...args]) => command === 'gh' && args[0] === 'codespace' && args[1] === 'ssh'
-    && decodedRemoteSshArgv(args).join(' ') === 'git status --porcelain=v1 --branch'), 'remote Git state must be observed before deletion');
+    && decodedRemoteSshArgv(args).join(' ') === 'git -C /workspaces/agent-containers status --porcelain=v1 --branch'), 'remote Git state must be observed before deletion');
   assert.equal(calls.some((args) => args.includes('DELETE')), false, 'remote risk refusal must not delete');
 });
 

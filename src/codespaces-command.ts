@@ -2,7 +2,6 @@ import { mkdir, lstat, readFile, rename, rm, open, type FileHandle } from 'node:
 import { basename, dirname, join } from 'node:path';
 import { randomUUID, createHash } from 'node:crypto';
 import { getProductionStateDurabilityAdapter, type StateDurabilityAdapter } from './durability.js';
-import { isValidRequestHash } from './codespaces-protocol.js';
 
 /**
  * Local durable record for one remote command. Output bytes are never
@@ -26,7 +25,6 @@ export type CodespacesCommandMode = 'pipe' | 'pty';
 export interface CodespacesCommandRequest {
   schemaVersion: 1;
   commandId: string;
-  requestHash: string;
   workspaceName: string;
   workspaceId: string;
   argvCount: number;
@@ -162,13 +160,10 @@ export async function loadCommandOffsets(stateDir: string, commandId: string): P
 
 export type CommandIdempotency = 'created' | 'attach';
 
-/** Bind commandId + requestHash. Replaying the same pair attaches; reusing the ID with a different hash fails. */
-export async function resolveCommandIdempotency(stateDir: string, commandId: string, requestHash: string): Promise<CommandIdempotency> {
+/** An existing durable receipt means the original command owns this ID. */
+export async function resolveCommandIdempotency(stateDir: string, commandId: string): Promise<CommandIdempotency> {
   const request = await loadCommandRequest(stateDir, commandId);
   if (!request) return 'created';
-  if (request.requestHash !== requestHash) {
-    throw new Error(`Remote command ID ${commandId} was requested with a different argv hash; reusing an ID for a new argv is refused.`);
-  }
   return 'attach';
 }
 
@@ -218,7 +213,8 @@ export function commandRecoveryDigest(recovery: CodespacesCommandRecovery): stri
 function isValidCommandRequest(value: unknown): value is CodespacesCommandRequest {
   if (typeof value !== 'object' || value === null) return false;
   const request = value as Partial<CodespacesCommandRequest>;
-  return request.schemaVersion === 1 && isValidCommandId(request.commandId) && isValidRequestHash(request.requestHash ?? '')
+  return Object.keys(request).every((key) => ['schemaVersion', 'commandId', 'workspaceName', 'workspaceId', 'argvCount', 'mode', 'cwd', 'createdAt'].includes(key))
+    && request.schemaVersion === 1 && isValidCommandId(request.commandId)
     && typeof request.workspaceName === 'string' && isValidCommandId(request.workspaceId)
     && typeof request.argvCount === 'number' && Number.isSafeInteger(request.argvCount) && request.argvCount > 0
     && (request.mode === 'pipe' || request.mode === 'pty')
