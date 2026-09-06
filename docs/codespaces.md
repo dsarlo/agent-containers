@@ -109,10 +109,10 @@ Removal has two separate acknowledgements because it deletes remote data. Before
 
 Treat an allowlisted name as a capability grant. Keep the allowlist minimal, never place a secret value in `.agent-containers.yml`, a command argument, or a diagnostic, and verify GitHub's own secret-scoping behavior in your environment.
 
-## Recovery and limits
+## Proposed warm pools
 
-- A provider/SSH timeout or identity mismatch is not success. The record remains fail-closed; inspect it with `ac doctor --backend codespaces --workspace NAME` and `ac status NAME --probe` before taking further action.
-- A record with a Codespaces lifecycle recovery barrier is intentionally blocked from `start`, `stop`, `reconcile`, and `remove`. `ac recover` and `ac unlock` are local-Dev-Container commands and do not clear it. v1 has no supported in-tool clearance for this barrier: do not edit state files to bypass it; preserve the exact remote/state evidence and resolve the incident outside the CLI. If the record remains normalized `ready`, command execution can still be possible, but lifecycle mutation remains blocked.
-- Creation-log collection is diagnostic-only. If GitHub CLI does not support the log option used by the installed package, immutable readiness can still pass through the authoritative provider and SSH checks.
-- Codespaces capacity is local-state-root scoped. Separate hosts cannot share an exact quota.
-- This is not a sandbox. Review the target repository's Dev Container configuration, mounts, network access, and GitHub permissions before running an agent.
+[Codespaces warm pools](codespaces-warm-pools.md) is the post-review design direction for later delivery phases. It is not implemented in v1.
+
+Current v1 creates and records one exact provider response/readback for a requested logical workspace and does not adopt ambiguous provider candidates. Later backend handle resolution is less strict: after the CLI loads the requested logical record, the backend scans logical-name-sorted metadata and accepts the first workspace-ID, remote-name, or Codespace-ID match. A cross-field name/ID collision can therefore select a different recorded workspace for affected observe, wait, run/exec, attach, or cancel operations. Do not treat later execution as exact-by-name until the proposed immutable registry-key selection and all-field AND match is implemented.
+
+Phase 1 proposes app-created, fully verified, single-use warm resources and requires the replacement complete Git-preservation proof before discard. Reset/reuse is a later opt-in phase with a separate hard-gated cleanup and trust-boundary contract.
