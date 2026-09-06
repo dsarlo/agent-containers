@@ -8,6 +8,7 @@ import { waitCodespacesReady, runReadinessProbes, readinessGateDoctorChecks, typ
 import { GhCodespacesProvider } from '../src/codespaces.js';
 import { recordCreateIntent } from '../src/codespaces-ops.js';
 import { loadMetadata, saveMetadata, type CodespacesWorkspaceMetadata } from '../src/state.js';
+import { removeCodespacesWorkspace } from '../src/codespaces-lifecycle.js';
 import type { CodespacesAgentContainersConfig, ProcessRunner } from '../src/types.js';
 import { decodedRemoteSshArgv } from './transport-fixtures.js';
 
@@ -284,6 +285,43 @@ test('readiness durably persists a settled ready-without-setup-proof observation
   assert.equal(settled.lifecycle.normalized, 'ready-without-setup-proof');
   assert.equal(settled.lifecycle.providerRawState, 'Running');
   assert.ok(Date.parse(settled.lifecycle.lastObservedAt) >= Date.parse('2026-09-02T12:00:00.000Z'), 'lastObservedAt advances when the terminal is observed');
+});
+
+test('successful readiness clears only a completed create checkpoint so remove reaches remote Git preflight', async () => {
+  const { deps } = await probeContext();
+  const report = await runReadinessProbes(deps);
+  assert.equal(report.terminal, 'ready-without-setup-proof');
+  const settled = codespacesRecord(await loadMetadata(deps.stateDir, 'issue-9'));
+  assert.ok(settled);
+  assert.equal(settled.lifecycle.activeOperation, null);
+
+  const calls: string[][] = [];
+  const runner: ProcessRunner = { async run(command, args) {
+    calls.push([command, ...args]);
+    if (args.includes('/user')) return { code: 0, stdout: JSON.stringify({ id: 1, login: 'octo' }), stderr: '' };
+    if (/^\/user\/codespaces\//.test(args.at(-1) ?? '') && args.includes('GET')) return { code: 0, stdout: JSON.stringify(resourceFixture()), stderr: '' };
+    if (command === 'gh' && args[0] === 'codespace' && args[1] === 'ssh') return { code: 0, stdout: '## agent-containers/issue-9...origin/agent-containers/issue-9 [ahead 1]\n M important.txt\n', stderr: '' };
+    throw new Error(`unexpected lifecycle dispatch: ${JSON.stringify(args)}`);
+  } };
+  await assert.rejects(
+    () => removeCodespacesWorkspace({ ...deps, provider: new GhCodespacesProvider(runner) }, true),
+    /dirty.*unpushed/i,
+  );
+  assert.ok(calls.some(([, ...args]) => args[0] === 'codespace' && args[1] === 'ssh'), 'remove must reach fixed remote Git preflight after readiness clears the completed checkpoint');
+});
+
+test('readiness failure and non-create checkpoints retain their durable operation barrier', async () => {
+  const failed = await probeContext({ ssh: { 'gh codespace ssh -c bookish-space-parakeet -- printf %s agent-containers-readiness-probe': { code: 255, stderr: 'connection refused' } } });
+  assert.equal((await runReadinessProbes(failed.deps)).terminal, 'blocked');
+  assert.ok(codespacesRecord(await loadMetadata(failed.deps.stateDir, 'issue-9'))?.lifecycle.activeOperation);
+
+  const other = await probeContext();
+  const initial = codespacesRecord(await loadMetadata(other.deps.stateDir, 'issue-9'));
+  assert.ok(initial);
+  const activeOperation = { ...initial.lifecycle.activeOperation!, kind: 'start' as const, checkpoint: 'identity-verifying' };
+  await saveMetadata(other.deps.stateDir, { ...initial, lifecycle: { ...initial.lifecycle, activeOperation } });
+  assert.equal((await runReadinessProbes(other.deps)).terminal, 'ready-without-setup-proof');
+  assert.deepEqual(codespacesRecord(await loadMetadata(other.deps.stateDir, 'issue-9'))?.lifecycle.activeOperation, activeOperation);
 });
 
 test('terminal provider block persists a conservative stopped observation (B1)', async () => {
