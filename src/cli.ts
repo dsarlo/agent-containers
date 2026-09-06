@@ -200,10 +200,9 @@ export async function runCli(args: string[], cwd = process.cwd(), write: (messag
         const separator = rest.indexOf('--');
         if (separator !== 1) throw new UsageError(`Usage: agent-containers ${command} <name> -- <command...>`);
         const name = rest[0];
-        // Workspace records created by this release are local-only. Dispatch
-        // from that durable identity so a later checkout/config change cannot
-        // strand an existing local workspace or select an unimplemented remote
-        // backend. Unknown future metadata is rejected by loadMetadata.
+        // Dispatch from durable identity so a later checkout/config change cannot
+        // strand an existing workspace or select a different backend. Unknown
+        // future metadata is rejected by loadMetadata.
         const recorded = await loadMetadata(stateDir, name);
         if (!recorded) throw new Error(`No Agent Containers workspace named "${name}".`);
         if (!('repoRoot' in recorded)) {
@@ -260,7 +259,7 @@ export async function runCli(args: string[], cwd = process.cwd(), write: (messag
           throw new UsageError('Usage: agent-containers recover <name> --yes --remote-command-stopped');
         }
         const recorded = await loadMetadata(stateDir, name);
-        if (recorded && !isLocalWorkspaceMetadata(recorded)) throw new Error(`Workspace "${name}" records the Codespaces backend, which is phase-gated and cannot be recovered by local cleanup.`);
+        if (recorded && !isLocalWorkspaceMetadata(recorded)) throw new Error(`Workspace "${name}" records the Codespaces backend and cannot be recovered by local cleanup.`);
         // Bind this acknowledgement to the exact barrier visible before waiting
         // behind another lifecycle. A later lifecycle must never be cleared by it.
         const acknowledged = await loadManualRecovery(stateDir, name);
@@ -278,7 +277,7 @@ export async function runCli(args: string[], cwd = process.cwd(), write: (messag
         ensureOnly(rest.slice(1), ['--yes']);
         if (!rest.includes('--yes')) throw new UsageError('Usage: agent-containers unlock <name> --yes');
         const recorded = await loadMetadata(stateDir, name);
-        if (recorded && !isLocalWorkspaceMetadata(recorded)) throw new Error(`Workspace "${name}" records the Codespaces backend, which is phase-gated and cannot be unlocked by local cleanup.`);
+        if (recorded && !isLocalWorkspaceMetadata(recorded)) throw new Error(`Workspace "${name}" records the Codespaces backend and cannot be unlocked by local cleanup.`);
         await releaseStaleWorkspaceLock(stateDir, name);
         write(`Released stale lifecycle lock for ${name}`);
         return 0;

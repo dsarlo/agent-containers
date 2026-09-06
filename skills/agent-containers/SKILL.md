@@ -52,7 +52,31 @@ ac status [task-name]
 ac remove <task-name> --yes [--force-worktree]
 ```
 
-Plain `ac init` creates safe schema-v2 local configuration. For experimental Codespaces configuration only, first set `AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES=1`, then use field-oriented `ac init --interactive` / `ac configure --interactive`, a noninteractive import, or `ac doctor --backend codespaces [--json]`. Configure snapshots current configuration before prompting, resolves immutable setup evidence before previewing the exact final candidate, revalidates after `yes`, and writes nothing for `cancel` or source drift. A Codespaces save read-only verifies canonical origin, remote ref, immutable commit OID, and committed Dev Container blob, then persists those nonsecret source facts. These commands do not create a Codespace or transport an agent; Codespaces lifecycle is not implemented in this release. Do not enter API keys, tokens, SSH keys, or secret values: Agent Containers never owns those credentials, and the local harness remains the orchestrator.
+Plain `ac init` creates safe schema-v2 local configuration. Codespaces v1 is experimental but implemented: first set `AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES=1`, then use field-oriented `ac init --interactive` / `ac configure --interactive` or a noninteractive nonsecret draft import. Setup resolves immutable repository/ref/commit/Dev Container evidence before previewing the final configuration and does not create a Codespace. Agent Containers never accepts, displays, stores, or edits API keys, tokens, SSH keys, GitHub authentication, or secret values; the local harness remains the orchestrator.
+
+## Codespaces-backed agent sessions
+
+Use this path when the target agent command must run in a GitHub Codespace rather than the local Dev Container:
+
+```sh
+export AGENT_CONTAINERS_EXPERIMENTAL_CODESPACES=1
+ac configure --interactive
+ac validate
+ac doctor --backend codespaces --json
+ac create <task-name> --backend codespaces --machine <machine> --geo auto --yes-cost
+ac wait <task-name> --for ready --timeout 20m
+ac run <task-name> -- <agent-command> [arguments...]
+```
+
+1. **Configure, validate, and preflight.** Use `terminal` to run configuration, validation, then `doctor`. Completion: `validate` accepts schema v2 with immutable repository and Dev Container evidence, and `doctor` has no required failed Codespaces preflight.
+2. **Create and establish readiness.** Use `terminal` to create with `--yes-cost`, then `wait`. Completion: `wait` reports `ready` or `ready-without-setup-proof`; do not execute when it reports blocked, timeout, or another state.
+3. **Run the agent.** Use `terminal` with `ac run <task-name> -- <agent-command> ...` (or `ac exec`). Completion: connected stdout/stderr and the remote exit status are observed. Backend integrations may instead select a merged PTY terminal stream. The command is sent as framed argv, not a remote shell string.
+4. **Inspect and control lifecycle.** `ac status <task-name> --probe` and `ac reconcile <task-name>` are observational. `ac stop <task-name> --yes` refuses a command that may still be active; after `ac start <task-name> --yes`, run `wait` again before execution.
+5. **Remove deliberately.** Preserve any remote work first. If the Codespace is stopped, use `ac start <task-name> --yes` and `ac wait <task-name> --for ready` before `ac remove <task-name> --yes --force-remote-data-loss`, because removal's remote Git preflight runs over SSH. Completion: a tombstone is recorded after exact resource absence. Removal refuses a dirty or unpushed remote checkout, unknown command, or interrupted lifecycle barrier.
+
+Output is connected-only: durable state retains command status/cancellation but never remote stdout, stderr, terminal bytes, raw argv, request hashes, or command hashes. Later status recovery reports only known state and never replays unavailable output. Verified Ctrl-C returns `130`; an unknown cancellation remains fail-closed.
+
+`backends.codespaces.secrets.allowedRemoteSecretNames` accepts only environment-variable names. Configure secret values outside Agent Containers, keep the allowlist minimal, and never put a value in configuration or argv. The helper supplies only `PATH` plus allowlisted variables present in the Codespace and redacts matching values in connected frames. A Codespaces lifecycle recovery barrier blocks lifecycle mutations; `ac recover` and `ac unlock` cannot clear it, and v1 has no supported in-tool clearance. Preserve exact remote/state evidence rather than editing state files. See [`docs/codespaces.md`](../../docs/codespaces.md) for the complete operator and recovery contract.
 
 `agent-containers` is the full executable name and is interchangeable with `ac`.
 
